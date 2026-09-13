@@ -103,7 +103,16 @@ class BenchmarkSlot(Base):
 
 
 class AgentSession(Base):
-    """One row per consequential AI call (constitution §106)."""
+    """One row per consequential AI call (constitution §106).
+
+    Phase 3 lifecycle (ARCHITECTURE.md's "no DB transaction can span an
+    external network call" rule): a row is created `PENDING` — with its
+    inputs already registered via `agent_session_evidence_snapshots` —
+    and committed *before* the provider is ever called, so a crash
+    mid-call leaves a discoverable, recoverable row rather than nothing
+    at all. `raw_response` and `is_valid` are therefore nullable: they
+    aren't known until the call returns.
+    """
 
     __tablename__ = "agent_sessions"
 
@@ -116,12 +125,38 @@ class AgentSession(Base):
     schema_version: Mapped[str] = mapped_column(String, nullable=False)
     evidence_snapshot_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("evidence_snapshots.id"), nullable=True)
     market_snapshot_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("market_snapshots.id"), nullable=True)
-    raw_response: Mapped[dict] = mapped_column(JSONB, nullable=False)
+
+    # -- lifecycle (Phase 3) -----------------------------------------------
+    status: Mapped[str] = mapped_column(String, nullable=False, default="PENDING")
+    orchestration_key: Mapped[str] = mapped_column(String, nullable=False)
+    rendered_request: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    provider_request_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    usage_metadata: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    error_category: Mapped[str | None] = mapped_column(String, nullable=True)
+    error_message: Mapped[str | None] = mapped_column(String, nullable=True)
+    transport_retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    correction_retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    completed_at: Mapped[datetime | None] = mapped_column(nullable=True)
+
+    raw_response: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     validated_response: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
-    is_valid: Mapped[bool] = mapped_column(nullable=False)
+    is_valid: Mapped[bool | None] = mapped_column(nullable=True)
     retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     bankroll_at_decision_cents: Mapped[int] = mapped_column(BigInteger, nullable=False)
     timestamp: Mapped[datetime] = mapped_column(nullable=False)
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('PENDING','CALLING','VALID','INVALID','FAILED')", name="valid_status"
+        ),
+        CheckConstraint(
+            "error_category IS NULL OR error_category IN ("
+            "'AUTHENTICATION_ERROR','RATE_LIMITED','TIMEOUT','PROVIDER_UNAVAILABLE',"
+            "'INVALID_PROVIDER_RESPONSE','SCHEMA_VALIDATION_FAILED','CONTENT_REFUSAL','UNKNOWN_PROVIDER_ERROR')",
+            name="valid_error_category",
+        ),
+        UniqueConstraint("orchestration_key", name="one_session_per_orchestration_key"),
+    )
 
 
 class AgentSessionEvidenceSnapshot(Base):

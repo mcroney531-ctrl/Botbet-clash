@@ -1,9 +1,9 @@
-# Backend — Phase 1 domain + Phase 2 persistence & Forecast Lab core
+# Backend — Phase 1 domain, Phase 2 persistence & Forecast Lab core, Phase 3 AI adapter layer
 
 Implements constitution §117 **Phase 1** (`Season`, `SeasonRules`, `Week`,
 `Competitor`, the bankroll ledger, `Ticket`, `Wager`, `Settlement`,
-`CompetitionEvent` as plain Python domain objects), plus **Phase 2** split
-into two parts:
+`CompetitionEvent` as plain Python domain objects), **Phase 2** split
+into two parts, and **Phase 3**'s real model adapter layer:
 
 - **2A — persistence**: a PostgreSQL/SQLAlchemy layer underneath the
   Phase 1 rules. The domain dataclasses in `app/domain/` are unchanged and
@@ -17,11 +17,23 @@ into two parts:
   precommitted benchmark slate, `ForecastObservation` (benchmark +
   open-market, revisions as inserts), research settlement, and Brier/
   log-loss scoring — all under `app/forecast_lab/`.
+- **3 — AI adapter layer**: a provider-neutral `AIOrchestrator` that sends
+  identical `BENCHMARK_FORECASTING` requests to OpenAI, Anthropic, and
+  Gemini (plus a deterministic `MockAdapter` for tests), validates every
+  response, and permanently records exactly what each model saw and
+  returned via `AgentSession` + `ForecastObservation` — all under
+  `app/ai/`. The model layer is an adapter, not the competition engine:
+  it never touches bankroll, wagers, or settlement.
 
-No real AI provider or sports-data provider is wired in anywhere yet
-(constitution Phases 3 and 6) — Phase 2B runs entirely against
-caller-supplied fixture data. See `../RULES.md`, `../ARCHITECTURE.md`, and
-`../DATABASE.md` for the rules and design this code implements.
+No real odds/stats/news/weather provider is wired in anywhere yet
+(constitution Phase 6), and no autonomous wager placement exists — Phase 3
+only proves the model layer can be trusted to observe and report, nothing
+more. See `../RULES.md`, `../ARCHITECTURE.md`, and `../DATABASE.md` for the
+rules and design this code implements.
+
+This branch develops backend-only; a separate, independent workstream
+("Astra") owns `frontend/` (Next.js/React Three Fiber arena UI) and is not
+touched here — no `frontend/` directory exists on this branch as of Phase 3.
 
 ## Layout
 
@@ -48,10 +60,20 @@ app/
     research_settlement_service.py  stat-value-only settlement + derived outcome
     scoring.py                  Brier / log-loss
     cohort.py                   common-coverage cohort + coverage %
+  ai/
+    schemas/       pydantic request/response models (BENCHMARK_FORECASTING v1)
+    prompts/       neutral prompt template + frozen prompt/schema versions
+    providers/     base.py (Protocol/ProviderCallResult/ProviderError),
+                   mock.py, openai.py, anthropic.py, gemini.py
+    validation.py       provider-neutral response validation + quantization
+    session_service.py  AgentSession persistence + audit receipts
+    registry.py         provider string -> adapter factory (mock_registry / live_registry)
+    orchestrator.py      AIOrchestrator: the only caller of a provider adapter
   tests/
-    test_*.py             Phase 1 domain + Phase 2B pure-math unit tests (no DB)
-    integration/           Phase 2A/2B tests against real PostgreSQL
-alembic/                  migrations (one so far: the structural core)
+    test_*.py             Phase 1/2B pure-math + Phase 3 pure schema/validation tests (no DB)
+    integration/           Phase 2A/2B/3 tests against real PostgreSQL
+                            (test_live_providers.py additionally needs real API keys)
+alembic/                  migrations — one per phase's additive schema change
 ```
 
 ## Running the tests
@@ -72,6 +94,13 @@ export DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:5432/botbet
 alembic upgrade head
 pytest -q
 ```
+
+A `live_provider`-marked subset of the integration tests additionally
+needs real credentials (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
+`GEMINI_API_KEY` or `GOOGLE_API_KEY`) and makes real, billable calls to
+each provider; they skip individually per missing key and never run in
+routine CI. Everything else — including the entire mock-path AI
+orchestrator flow — requires no credentials at all.
 
 ## Phase 2 readout
 
@@ -282,3 +311,210 @@ weekly orchestration state machine wiring Forecast Lab checkpoints to
 Competition decisions end-to-end, attribution, the Show layer, and any
 FastAPI routes beyond what exists (none yet — no HTTP surface was needed
 to prove this phase).
+
+## Phase 3 readout
+
+**Central question this phase answers**: can BotBet Clash reliably send
+standardized forecasting tasks to three independent model providers and
+permanently record exactly what each model saw and returned? Yes — proven
+against MockAdapter end to end, and wired (not yet live-verified in this
+environment; no provider API keys are configured here) against real
+OpenAI/Anthropic/Gemini SDKs.
+
+**Files/modules added** — all new, nothing in `app/domain/`,
+`app/forecast_lab/`, or `app/services/` changed except the one additive
+`AgentSession` migration below:
+- `app/ai/schemas/common.py`, `benchmark_forecast.py` — pydantic v2
+  `BenchmarkForecastRequest`/`MarketInput`/`MarketContext`,
+  `BenchmarkForecastResponse`/`ForecastItem`, and
+  `benchmark_response_json_schema()` (a hand-written plain JSON Schema —
+  not derived from the pydantic models, whose `Decimal` fields would
+  otherwise surface as schema type `"string"` — used by all three real
+  adapters to constrain provider output).
+- `app/ai/prompts/versions.py` (`benchmark-v1` / `forecast-v1`),
+  `benchmark_forecasting.py` (the neutral system instruction, verbatim
+  from the brief, plus `render_benchmark_prompt()` which returns the
+  exact dict persisted as `AgentSession.rendered_request` — the rendered
+  request is stored directly rather than reconstructed later from
+  template + inputs, per the brief's "simpler and safer" guidance).
+- `app/ai/providers/base.py` — `CompetitorAdapter` Protocol,
+  `ProviderCallResult`/`ProviderError` dataclasses, the 8 normalized
+  `ErrorCategory` values, `TRANSPORT_ERROR_CATEGORIES` (the set that
+  means "no usable answer at all," as opposed to a validation-retryable
+  response), and a shared `error_result()` helper.
+- `app/ai/providers/mock.py` — deterministic `MockAdapter` + `MockOutcome`
+  scripting every failure simulation the brief lists.
+- `app/ai/providers/openai.py`, `anthropic.py`, `gemini.py` — real
+  adapters (Phase 3B), each importing only its own provider's SDK; no
+  provider SDK type crosses into `app/ai/orchestrator.py`,
+  `app/forecast_lab/`, or `app/domain/`.
+- `app/ai/validation.py` — provider-neutral content validation (pydantic
+  shape + market coverage: no missing/unknown/duplicate `market_id`) and
+  the single quantization policy (`PROBABILITY_PLACES` from
+  `market_math.py` for `probability_over`; a new `CONFIDENCE_PLACES =
+  Decimal("0.01")` matching `ForecastObservation.confidence`'s
+  `NUMERIC(4,2)`).
+- `app/ai/session_service.py` — `AgentSessionRepository` (PENDING →
+  CALLING → VALID/INVALID/FAILED persistence, `agent_session_evidence_snapshots`
+  as the authoritative multi-market input record), `build_orchestration_key()`,
+  and `build_audit_receipt()`.
+- `app/ai/registry.py` — `ProviderRegistry.for_competitor()` resolves an
+  adapter from `Competitor.provider` + `SeasonCompetitor.model_identifier`
+  only, never a display name; `mock_registry()` and `live_registry()` are
+  the only two places that actually name a provider string, so swapping
+  mock for real adapters never touches the orchestrator.
+- `app/ai/orchestrator.py` — `AIOrchestrator`, scoped to one `season_id`
+  like `SeasonCommissioner`. `run_benchmark_forecast()` and
+  `run_benchmark_round()` are the only two public entry points.
+
+**Database migration** — one additive migration,
+`a8d1acc96058_agent_session_lifecycle.py` (Phase 2 is closed, so this is
+a real `alembic revision --autogenerate` layered on top, not a
+regenerate-in-place). Adds to `agent_sessions`: `status` (CHECK-constrained
+to `PENDING`/`CALLING`/`VALID`/`INVALID`/`FAILED`), `orchestration_key`
+(`UNIQUE`, the idempotency key), `rendered_request` (JSONB),
+`provider_request_id`, `usage_metadata` (JSONB), `error_category`
+(CHECK-constrained to the 8 normalized categories), `error_message`,
+`transport_retry_count`, `correction_retry_count`, `completed_at`; makes
+`raw_response`/`is_valid` nullable (unknown until the call returns).
+`retry_count` (Phase 2's original column) is kept for back-compat and set
+to `transport_retry_count + correction_retry_count` on every terminal
+write — nothing reads it as the source of truth anymore.
+
+**Provider-neutral interface** — `CompetitorAdapter.forecast_benchmark(request)
+-> ProviderCallResult`. Zero provider conditionals exist in
+`orchestrator.py`, `validation.py`, or `session_service.py`; every branch
+that knows "which provider" lives inside that provider's own adapter
+module or inside `registry.py`'s two factory functions.
+
+**Provider adapters implemented**: OpenAI (Chat Completions +
+`response_format: json_schema`, `strict: true`), Anthropic (Claude's
+`output_config.format: json_schema`), Gemini (`response_mime_type:
+application/json` + `response_json_schema`) — one official SDK per
+provider (`openai`, `anthropic`, `google-genai`), each reading its own
+credential env var (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
+`GEMINI_API_KEY`/`GOOGLE_API_KEY`) via the SDK's own default behavior;
+no key is ever read, logged, or handled by adapter code directly.
+Exceptions from each SDK are mapped to the 8 normalized categories
+(auth → `AUTHENTICATION_ERROR`, rate limit → `RATE_LIMITED`, timeout →
+`TIMEOUT`, connection/5xx → `PROVIDER_UNAVAILABLE`, a
+safety/refusal finish reason → `CONTENT_REFUSAL`, unparseable/empty
+content → `INVALID_PROVIDER_RESPONSE`, anything else → `UNKNOWN_PROVIDER_ERROR`).
+
+**Prompt/schema versions**: `prompt_version = "benchmark-v1"`,
+`schema_version = "forecast-v1"`. Only `BENCHMARK_FORECASTING` exists;
+`OPEN_MARKET_RESEARCH`/`STAKE_SIZING`/`FINAL_DECISION`/etc. are not
+implemented. The system instruction is neutral and identical for all
+three competitors — no personality, no "be conservative"/"be aggressive"
+per-provider text anywhere.
+
+**Validation behavior**: pydantic shape (probability/confidence ranges,
+`uncertainty` enum, non-blank text, `key_factors` ≤ 5, `extra="forbid"`
+on every model) first, then market coverage (no missing, no unknown, no
+duplicate `market_id` — checked against the exact request, not just
+"is this valid JSON"), then quantization. A partial match (e.g. 2 of 3
+requested markets present) is rejected outright, not silently accepted
+as a smaller success.
+
+**Retry/correction behavior**: transport failures (no usable
+payload — timeout, auth, provider-unavailable, unknown) are terminal
+immediately and recorded as `FAILED`; they are tracked via
+`transport_retry_count`, which stays `0` in Phase 3A/3B since no
+automatic transport-level retry loop is implemented yet (a deliberate,
+documented scope boundary — the field exists so that behavior can be
+added later without another migration). Schema-invalid responses get
+exactly one bounded correction retry (`max_correction_retries=1` by
+default) using the same request; still-invalid after that retry is
+recorded as `INVALID` (not `FAILED` — the provider *did* respond).
+`transport_retry_count` and `correction_retry_count` are tracked as
+distinct columns, never collapsed into one generic counter, so "timed
+out three times" and "answered twice but failed validation twice" are
+never confused when auditing a session later.
+
+**AgentSession lifecycle**: `PENDING` (created and committed *before* any
+provider is contacted, together with its `agent_session_evidence_snapshots`
+input rows) → `CALLING` (committed in its own transaction just before the
+external call) → `VALID`/`INVALID`/`FAILED`. No DB transaction is ever
+held open across a network call. Idempotency: `orchestration_key =
+f"{season_competitor_id}:{checkpoint_run_id}:BENCHMARK_FORECASTING:benchmark-v1"`,
+`UNIQUE`-constrained; a rerun that already produced a `VALID` session for
+that key returns the existing session id without ever resolving an
+adapter or touching a provider — proven with a "poison" registry in the
+integration test that raises if it's ever asked to resolve an adapter.
+
+**MockAdapter failure simulations** (one test per simulation, all pure/no-DB
+in `app/tests/test_ai_validation.py`, plus a full-orchestrator failure
+round in the Postgres integration test): valid response; malformed JSON
+(never reaches validation — it's a transport-shaped `INVALID_PROVIDER_RESPONSE`);
+missing market; duplicate market; unrequested/unknown market; probability
+> 1; invalid confidence; invalid uncertainty; provider timeout; provider
+unavailable; valid result after one correction retry; still-invalid
+result after the correction retry is exhausted (rejected, zero
+`ForecastObservation`s created).
+
+**Test count**: 94 passed, 4 skipped (the 4 `live_provider` tests, no
+credentials configured in this environment) — up from 80 at the end of
+Phase 2. New: 13 pure tests (`test_ai_validation.py`), 1 mock-path
+integration test (`test_ai_orchestrator.py`, Postgres), 4 live-provider
+integration tests (`test_live_providers.py`, Postgres + real API keys,
+currently skipped). Zero regressions in any Phase 1/2 test.
+
+**Mock-path acceptance result** (`test_ai_orchestrator.py`): one season,
+three season-competitors (openai/anthropic/google), one captured OPENING
+checkpoint's `EvidenceSnapshot` run through `run_benchmark_round()` for
+all three — 3 distinct `AgentSession`s, all `VALID`, each pointing at the
+same evidence snapshot via `agent_session_evidence_snapshots`, each with
+its own provider/model_identifier/raw_response/validated_response, each
+producing exactly one `ForecastObservation` with the fixture's exact
+probability; a rerun against a poison registry proves idempotency without
+ever calling an adapter; audit receipts reconstructed from a fresh
+session match every field. A second game then exercises all three
+non-happy paths simultaneously: one competitor succeeds after exactly one
+correction retry, one is rejected after exhausting its correction retry
+(`INVALID`, zero `ForecastObservation`s), and one fails immediately on a
+simulated timeout (`FAILED`, `raw_response` is `None`, zero
+`ForecastObservation`s) — and the first competitor's success is
+unaffected by the other two's failures in the same round.
+
+**Real provider path status**: implemented and unit-import-clean
+(`OpenAIAdapter`/`AnthropicAdapter`/`GeminiAdapter` all construct and
+route through the same `AIOrchestrator`/`validation.py`/`session_service.py`
+as MockAdapter), but **not live-verified** — this environment has no
+`OPENAI_API_KEY`/`ANTHROPIC_API_KEY`/`GEMINI_API_KEY`/`GOOGLE_API_KEY`
+configured, so the 4 `live_provider` tests in `test_live_providers.py`
+skip rather than run. Whoever has credentials should run
+`pytest -q -m live_provider` (with `DATABASE_URL` set) to complete steps
+15–24 of the acceptance test for real; the code path exercising every
+one of those steps already exists and passes its mock-equivalent.
+
+**Do not read anything into forecast differences yet** — no live call has
+been made in this environment, and even once one is, three models
+forecasting one test market is a connectivity check, not a research
+result. Model comparison is explicitly out of scope for Phase 3.
+
+**Known Week 0 decisions still intentionally unresolved** (unchanged from
+Phase 2, plus the two Phase 3 added): `BATCH_10`/`BATCH_SMALL`/`ISOLATED`
+benchmark batching (the schema already supports 1..N markets per call —
+`AIOrchestrator._build_market_batch` takes an arbitrary list of
+`evidence_snapshot_ids` — but the production choice isn't frozen), and the
+exact production model roster/version per provider (the `live_provider`
+smoke tests use small/cheap models — `gpt-4o-mini`,
+`claude-3-5-haiku-20241022`, `gemini-2.0-flash` — deliberately not
+presented as the season's real roster). All the Phase 2 items
+(checkpoint window tuning, benchmark-slate game-order allocator, same-stat
+tiebreak, `kelly_fraction`, weekly decision deadline) remain open too.
+
+**Astra frontend coordination**: no `frontend/` directory exists on this
+branch as of Phase 3 — nothing needed to be preserved or avoided. All
+Phase 3 changes are confined to `backend/` (plus this README); no
+production arena/HTTP endpoints were added, and canonical backend event
+names (`POUNCE_ISSUED`, `BET_EXECUTED`, `PASS_DECLARED`, `PROP_WON`,
+`PROP_LOST`, `BANKRUPTCY`, `BANKROLL_CHANGED`) are untouched.
+
+Not started (by design — constitution Phases 4+, 6, 7+, and explicitly
+out of Phase 3's scope per its kickoff brief): real odds/stats/news/
+weather ingestion, automatic sportsbook execution, autonomous wager
+placement, the weekly production scheduler, `OPEN_MARKET_RESEARCH`/
+`STAKE_SIZING`/`FINAL_DECISION`/`POSTMORTEM`/`PUBLIC_COMMENTARY`/
+`TRASH_TALK` prompt families, the Show layer, and Astra/arena
+integration.
