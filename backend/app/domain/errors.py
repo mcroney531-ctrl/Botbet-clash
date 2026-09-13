@@ -84,3 +84,10 @@ class CrossSeasonReference(RuleViolation):
 class WeekNotOpen(InvalidStateTransition):
     """A real-money action was attempted against a week that isn't
     currently OPENED (not yet opened, or already closed)."""
+
+
+class MarketNotInWeek(RuleViolation):
+    """A market's game belongs to a different week_number than the week
+    it was referenced against — same-season id mixing across weeks
+    (e.g. a Week 1 ticket against a Week 12 prop) is a narrower version
+    of the CrossSeasonReference bug, not caught by a season-only check."""

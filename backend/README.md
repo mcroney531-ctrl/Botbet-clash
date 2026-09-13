@@ -168,7 +168,51 @@ Blocking ticket issuance on that flag would defeat Week 0's purpose
 rather than harden anything; flagging this back rather than
 implementing it silently.
 
-**Tests added** — 74 total (was 45 at the end of Phase 1):
+**Hardening pass 2 (relational-integrity round)** — three more gaps
+found by mixing valid-looking ids across weeks/markets rather than
+across seasons:
+- **`issue_ticket` didn't check the terminal decision state.** It
+  acquired the competitor/week lock but never called
+  `_has_weekly_decision`, so a new ticket could be issued after
+  `BET_EXECUTED` or `PASS_LOCKED` already applied — it would eventually
+  fail at `record_execution`, but in the meantime the derived state held
+  a terminal decision *and* a pending `ISSUED` ticket simultaneously,
+  contradicting the two-terminal-states model (ARCHITECTURE.md §4 Axis
+  2). Added the same `_has_weekly_decision` check `record_pass` and
+  `record_execution` already had, right after the advisory lock.
+- **Season membership wasn't the same as week membership.**
+  `_require_market_in_week` (renamed from `_require_market_in_season`)
+  now also checks `game.week_number == week.week_number`, raising the
+  new `MarketNotInWeek` — a Week 1 ticket against a Week 12 prop in the
+  same season used to pass the season-only check. Applied to both
+  `issue_ticket`'s market and `record_pass`'s optional
+  `best_available_candidate_market_id`, which wasn't validated at all
+  before.
+- **`create_forecast_observation` trusted two independently-supplied
+  arguments that were supposed to agree.** It accepted `evidence_snapshot_id`
+  and a `MarketSnapshot` object separately, so a caller bug could hand
+  three competitors the same `evidence_snapshot_id` while stamping each
+  observation's canonical line/prices from a *different* market
+  snapshot — invisible to the cohort's shared-evidence check (§forecast
+  cohort), which only ever compares the id, not what it points to. Fixed
+  by removing the `market_snapshot` parameter entirely: the function now
+  loads the `EvidenceSnapshot` by id and derives the market snapshot
+  from `evidence.market_snapshot_id` itself, and rejects outright if
+  `evidence.market_id != market_id`. The mismatch is now structurally
+  impossible rather than merely checked for.
+
+Also documented (no code change — explicitly deferred, doesn't block the
+model-adapter phase): `close_week`'s "every game is FINAL" check
+verifies *games are complete*, not that *research settlement is locked*.
+Those are different signals — `Game.status == FINAL` just means the
+football game ended; RULES.md §82's T+72h research lock
+(`research_settlements` / `weeks.research_locked_at`) is separate and
+unrelated. The eventual weekly orchestrator should split this into a
+real `GAMES_COMPLETE → SETTLED → CLOSED` sequence gated on the research
+lock, not on `Game.status` alone; `close_week`'s docstring now says this
+explicitly rather than implying `FINAL` is the finalization signal.
+
+**Tests added** — 80 total (was 45 at the end of Phase 1):
 - 12 pure unit tests (no DB): `test_market_math.py` (de-vig, consensus,
   quantization) plus a `Money.floor_to_increment` regression already
   covered under Phase 1's suite.
@@ -180,18 +224,22 @@ implementing it silently.
   constraint test.
 - 1 Phase 2B integration test (`test_forecast_lab_mocked_week.py`): the
   full 20-step mocked research week — see below.
-- 10 hardening tests (`test_commissioner_integrity.py`): cross-season
+- 16 hardening tests (`test_commissioner_integrity.py`): cross-season
   rejection (week/competitor/market/ticket), week-not-opened rejection
-  (issue + pass), close-week games-not-final rejection and success, and
-  Pounce expiry (expired doesn't block, unexpired still does).
+  (issue + pass), close-week games-not-final rejection and success,
+  Pounce expiry (expired doesn't block, unexpired still does),
+  market-not-in-week rejection (ticket market and pass candidate, plus
+  the same-week acceptance case), and a new ticket being rejected after
+  either terminal decision (`BET_EXECUTED` or `PASS_LOCKED`).
 - 2 concurrency tests (`test_concurrency.py`, 10 racing iterations each):
   simultaneous placements never both succeed, simultaneous Pounces never
   both succeed — both independently confirmed to fail reliably with the
   lock removed.
-- 5 forecast-data integrity tests (`test_forecast_lab_constraints.py`):
-  out-of-range probability/confidence rejected by the database, and the
+- 6 forecast-data integrity tests (`test_forecast_lab_constraints.py`):
+  out-of-range probability/confidence rejected by the database, the
   cohort evidence-snapshot-mismatch check (both the failure and the
-  matching-snapshot success case).
+  matching-snapshot success case), and `create_forecast_observation`
+  rejecting an evidence snapshot that belongs to a different market.
 
 **Mock week result** — `test_forecast_lab_mocked_week.py` passes end to
 end: three games with independent kickoffs; a benchmark slate plan

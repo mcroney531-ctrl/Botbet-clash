@@ -14,8 +14,10 @@ from sqlalchemy.orm import Session
 from app.db.models.forecast_lab import ForecastObservation
 from app.db.models.markets import MarketSnapshot
 from app.db.repositories.forecast_repository import ForecastRepository
+from app.db.repositories.market_repository import MarketRepository
 from app.domain.enums import Uncertainty
 from app.domain.lines import is_pushable_line
+from app.forecast_lab.evidence_service import get_evidence_snapshot
 
 
 def _research_eligibility(market_snapshot: MarketSnapshot) -> tuple[bool, str | None]:
@@ -37,7 +39,6 @@ def create_forecast_observation(
     checkpoint_type: str | None,
     timestamp: datetime,
     model_probability_over: Decimal,
-    market_snapshot: MarketSnapshot,
     evidence_snapshot_id: uuid.UUID,
     confidence: Decimal,
     uncertainty: Uncertainty,
@@ -45,6 +46,26 @@ def create_forecast_observation(
     revision_parent_id: uuid.UUID | None = None,
     revision_reason: str | None = None,
 ) -> ForecastObservation:
+    """Takes `evidence_snapshot_id` only — never a caller-supplied
+    `MarketSnapshot` alongside it. Accepting both independently would
+    let a caller give two competitors the same evidence_snapshot_id
+    while quietly stamping each observation's canonical_line/prices from
+    a *different* MarketSnapshot object, which the cohort's shared-
+    evidence-snapshot check (cohort.py) has no way to catch — it only
+    ever sees the id, not what it actually points to. Loading the
+    evidence row here and deriving the market snapshot from
+    `evidence.market_snapshot_id` makes that mismatch structurally
+    impossible instead of relying on the caller to pass consistent
+    arguments.
+    """
+
+    evidence = get_evidence_snapshot(session, evidence_snapshot_id)
+    if evidence.market_id != market_id:
+        raise ValueError(
+            f"evidence_snapshot {evidence_snapshot_id} belongs to market {evidence.market_id}, not {market_id}"
+        )
+    market_snapshot = MarketRepository(session).get_market_snapshot(evidence.market_snapshot_id)
+
     research_eligible, exclusion_reason = _research_eligibility(market_snapshot)
     canonical_prob = market_snapshot.canonical_over_probability
     disagreement = (model_probability_over - canonical_prob) if canonical_prob is not None else None

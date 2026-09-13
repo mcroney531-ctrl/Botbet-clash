@@ -35,6 +35,13 @@ def create_evidence_snapshot(
     return row
 
 
+def get_evidence_snapshot(session: Session, evidence_snapshot_id: uuid.UUID) -> EvidenceSnapshot:
+    row = session.get(EvidenceSnapshot, evidence_snapshot_id)
+    if row is None:
+        raise LookupError(f"evidence_snapshot {evidence_snapshot_id} not found")
+    return row
+
+
 def mock_evidence_payload(*, generated_at: datetime, market_snapshot, extra: dict | None = None) -> dict:
     """A Phase-2-fixture evidence payload — plausible shape, mocked
     content. Real provider integration (Phase 6) fills these fields for

@@ -70,6 +70,7 @@ from app.domain.errors import (
     InvalidStakeIncrement,
     InvalidStateTransition,
     LineOutsideAcceptableBoundary,
+    MarketNotInWeek,
     NoLegalStakeAvailable,
     PounceLimitExceeded,
     PriceOutsideAcceptableBoundary,
@@ -170,12 +171,19 @@ class SeasonCommissioner:
             week_uuid = uuid.UUID(week_id)
             week = self._require_week_in_season(session, week_uuid)
 
-            # ARCHITECTURE.md §4: "close_week requires every game in the
-            # week to be research-settlement-locked (or otherwise
-            # finalized), not 'the week reached FINAL'." Game.status is
-            # the finalization signal available today; a week with no
-            # games attached (e.g. a Week 0 harness fixture) has nothing
-            # to block on.
+            # NOTE - this checks GAMES_COMPLETE, not research-settlement-
+            # locked, and those are not the same thing. `Game.status ==
+            # FINAL` means the football game ended; it says nothing about
+            # whether research settlement (RULES.md §82's T+72h lock,
+            # tracked by `research_settlements`/`weeks.research_locked_at`)
+            # has actually happened for that game's markets. The eventual
+            # weekly orchestrator (ARCHITECTURE.md §4's per-game state
+            # machine) should gate closing on a proper
+            # GAMES_COMPLETE -> (research settlements locked) -> SETTLED ->
+            # CLOSED sequence; this is a deliberately narrower stand-in
+            # ("all games finished playing") until that orchestrator
+            # exists. A week with no games attached (e.g. a Week 0 harness
+            # fixture) has nothing to block on.
             unfinished = [
                 g.external_ref
                 for g in MarketRepository(session).games_for_week(self.season_id, week.week_number)
@@ -183,7 +191,7 @@ class SeasonCommissioner:
             ]
             if unfinished:
                 raise InvalidStateTransition(
-                    f"week {week_id} cannot be closed: game(s) {unfinished} are not yet FINAL"
+                    f"week {week_id} cannot be closed: game(s) {unfinished} have not finished playing (status != FINAL)"
                 )
 
             week = SeasonRepository(session).close_week(week_uuid, closed_at=self.clock.now())
@@ -215,11 +223,23 @@ class SeasonCommissioner:
 
             week = self._require_week_in_season(session, week_uuid)
             self._require_competitor_in_season(session, competitor_uuid)
-            self._require_market_in_season(session, market_uuid)
+            self._require_market_in_week(session, market_uuid, week)
             self._require_week_open(week)
             self._lock_competitor_week(session, competitor_uuid, week_uuid)
 
             self._ensure_solvent(session, competitor_uuid, week_uuid)
+
+            comp_repo = CompetitionRepository(session)
+            if self._has_weekly_decision(comp_repo, competitor_uuid, week_uuid):
+                # BET_EXECUTED and PASS_LOCKED are terminal (ARCHITECTURE.md
+                # §4 Axis 2) - a new pending ticket must never coexist with
+                # one. Without this, a ticket issued after the decision is
+                # already locked in would just be rejected later at
+                # record_execution time, but it would still sit around as
+                # an ISSUED ticket contradicting the derived decision state.
+                raise DuplicateWeeklyDecision(
+                    f"competitor {season_competitor_id} already has an official decision for week {week_id}"
+                )
 
             if is_pushable_line(observed_line):
                 raise PushableLineNotAllowed(
@@ -227,7 +247,6 @@ class SeasonCommissioner:
                     "RULES.md §6a requires non-pushable lines for V1 Competition wagers"
                 )
 
-            comp_repo = CompetitionRepository(session)
             if urgency is Urgency.POUNCE:
                 rules = season_rules_to_domain(SeasonRepository(session).get_active_rules(self.season_id))
                 active = comp_repo.active_pounce_tickets(competitor_uuid, week_uuid, self.clock.now())
@@ -304,6 +323,8 @@ class SeasonCommissioner:
 
             week = self._require_week_in_season(session, week_uuid)
             self._require_competitor_in_season(session, competitor_uuid)
+            if best_available_candidate_market_id:
+                self._require_market_in_week(session, uuid.UUID(best_available_candidate_market_id), week)
             self._require_week_open(week)
             self._lock_competitor_week(session, competitor_uuid, week_uuid)
 
@@ -594,13 +615,24 @@ class SeasonCommissioner:
             )
         return competitor
 
-    def _require_market_in_season(self, session, market_uuid: uuid.UUID) -> None:
+    def _require_market_in_week(self, session, market_uuid: uuid.UUID, week: WeekRow) -> None:
+        """Season membership alone isn't enough: a market's game must
+        also belong to the *same week_number* as `week`, or a Week 1
+        ticket could reference a Week 12 prop as long as both happen to
+        share a season (RULES.md's season-scoping fix didn't cover this —
+        it's a same-season, cross-week variant of the same bug class)."""
+
         market_repo = MarketRepository(session)
         market = market_repo.get_prop_market(market_uuid)
         game = market_repo.get_game(market.game_id)
         if game.season_id != self.season_id:
             raise CrossSeasonReference(
                 f"market {market_uuid} belongs to season {game.season_id} (via game {game.id}), not this Commissioner's season {self.season_id}"
+            )
+        if game.week_number != week.week_number:
+            raise MarketNotInWeek(
+                f"market {market_uuid} belongs to week_number {game.week_number} (via game {game.id}), "
+                f"not week {week.id}'s week_number {week.week_number}"
             )
 
     def _require_week_open(self, week: WeekRow) -> None:

@@ -16,7 +16,14 @@ from app.db.repositories.market_repository import MarketRepository
 from app.db.repositories.season_repository import SeasonRepository
 from app.db.session import session_scope
 from app.domain.enums import RiskPosture, Side, Urgency, WagerExecutionStatus
-from app.domain.errors import CrossSeasonReference, InvalidStateTransition, PounceLimitExceeded, WeekNotOpen
+from app.domain.errors import (
+    CrossSeasonReference,
+    DuplicateWeeklyDecision,
+    InvalidStateTransition,
+    MarketNotInWeek,
+    PounceLimitExceeded,
+    WeekNotOpen,
+)
 from app.domain.models import SeasonRules
 from app.services.season_commissioner import SeasonCommissioner
 
@@ -34,11 +41,11 @@ def make_rules(version="2026-integrity") -> SeasonRules:
     )
 
 
-def make_market(season_id, external_ref="g1") -> str:
+def make_market(season_id, external_ref="g1", week_number=1) -> str:
     with session_scope() as session:
         repo = MarketRepository(session)
         game = repo.create_game(
-            external_ref=external_ref, season_id=season_id, week_number=1,
+            external_ref=external_ref, season_id=season_id, week_number=week_number,
             home_team="KC", away_team="BUF", kickoff_at=datetime.now(timezone.utc) + timedelta(days=3),
         )
         player = repo.create_player(external_ref=f"player-{external_ref}", name="Player X", team="KC", position="WR")
@@ -201,3 +208,71 @@ def test_unexpired_pounce_still_blocks_a_second_one():
     )
     with pytest.raises(PounceLimitExceeded):
         issue(commissioner, week_id=week_id, season_competitor_id=sc_id, market_id=market2, urgency=Urgency.POUNCE)
+
+
+def test_issue_ticket_rejects_a_market_from_a_different_week_same_season():
+    commissioner = SeasonCommissioner.create_season(name="Wrong Week Market", year=2026, rules=make_rules("2026-k"))
+    sc_id = commissioner.register_competitor(competitor_id="openai", provider="OpenAI", display_name="OpenAI", model_identifier="x", model_version="v1")
+    week1_id = commissioner.open_week(week_number=1, is_real_money=True)
+    # Same season, but this market's game is scheduled for week 12.
+    week12_market = make_market(commissioner.season_id, external_ref="week12-market", week_number=12)
+
+    with pytest.raises(MarketNotInWeek):
+        issue(commissioner, week_id=week1_id, season_competitor_id=sc_id, market_id=week12_market)
+
+
+def test_record_pass_rejects_a_candidate_market_from_a_different_week():
+    commissioner = SeasonCommissioner.create_season(name="Wrong Week Candidate", year=2026, rules=make_rules("2026-l"))
+    sc_id = commissioner.register_competitor(competitor_id="openai", provider="OpenAI", display_name="OpenAI", model_identifier="x", model_version="v1")
+    week1_id = commissioner.open_week(week_number=1, is_real_money=True)
+    week12_market = make_market(commissioner.season_id, external_ref="week12-candidate", week_number=12)
+
+    with pytest.raises(MarketNotInWeek):
+        commissioner.record_pass(
+            week_id=week1_id, season_competitor_id=sc_id, reason_for_pass="best candidate wasn't good enough",
+            best_available_candidate_market_id=week12_market,
+        )
+
+
+def test_record_pass_accepts_a_candidate_market_from_the_same_week():
+    commissioner = SeasonCommissioner.create_season(name="Right Week Candidate", year=2026, rules=make_rules("2026-m"))
+    sc_id = commissioner.register_competitor(competitor_id="openai", provider="OpenAI", display_name="OpenAI", model_identifier="x", model_version="v1")
+    week1_id = commissioner.open_week(week_number=1, is_real_money=True)
+    week1_market = make_market(commissioner.season_id, external_ref="week1-candidate", week_number=1)
+
+    decision_id = commissioner.record_pass(
+        week_id=week1_id, season_competitor_id=sc_id, reason_for_pass="edge too small",
+        best_available_candidate_market_id=week1_market,
+    )
+    assert decision_id is not None
+
+
+def test_issue_ticket_rejects_a_new_ticket_after_bet_executed():
+    commissioner = SeasonCommissioner.create_season(name="Terminal Bet", year=2026, rules=make_rules("2026-n"))
+    sc_id = commissioner.register_competitor(competitor_id="openai", provider="OpenAI", display_name="OpenAI", model_identifier="x", model_version="v1")
+    week_id = commissioner.open_week(week_number=1, is_real_money=True)
+    market1 = make_market(commissioner.season_id, external_ref="terminal-bet-1")
+    market2 = make_market(commissioner.season_id, external_ref="terminal-bet-2")
+
+    ticket_id = issue(commissioner, week_id=week_id, season_competitor_id=sc_id, market_id=market1)
+    commissioner.record_execution(
+        ticket_id=ticket_id, status=WagerExecutionStatus.PLACED,
+        actual_line=Decimal("52.5"), actual_price=-110, actual_stake=Money.from_dollars_str("2.00"),
+    )
+
+    # BET_EXECUTED is terminal - no further ticket should even be issuable,
+    # not just unexecutable.
+    with pytest.raises(DuplicateWeeklyDecision):
+        issue(commissioner, week_id=week_id, season_competitor_id=sc_id, market_id=market2)
+
+
+def test_issue_ticket_rejects_a_new_ticket_after_pass_locked():
+    commissioner = SeasonCommissioner.create_season(name="Terminal Pass", year=2026, rules=make_rules("2026-o"))
+    sc_id = commissioner.register_competitor(competitor_id="openai", provider="OpenAI", display_name="OpenAI", model_identifier="x", model_version="v1")
+    week_id = commissioner.open_week(week_number=1, is_real_money=True)
+    market1 = make_market(commissioner.season_id, external_ref="terminal-pass-1")
+
+    commissioner.record_pass(week_id=week_id, season_competitor_id=sc_id, reason_for_pass="no edge this week")
+
+    with pytest.raises(DuplicateWeeklyDecision):
+        issue(commissioner, week_id=week_id, season_competitor_id=sc_id, market_id=market1)

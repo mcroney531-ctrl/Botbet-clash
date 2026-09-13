@@ -76,11 +76,10 @@ def test_model_probability_out_of_range_rejected_by_database():
     sc_id = _make_season_competitor(season_id, "openai")
     with pytest.raises(IntegrityError):
         with session_scope() as session:
-            snapshot = MarketRepository(session).get_market_snapshot(snapshot_id)
             create_forecast_observation(
                 session, season_competitor_id=sc_id, market_id=market_id, source_type="BENCHMARK",
                 checkpoint_type="OPENING", timestamp=now, model_probability_over=Decimal("1.5"),  # invalid
-                market_snapshot=snapshot, evidence_snapshot_id=evidence_id, confidence=Decimal("7.0"), uncertainty=Uncertainty.MEDIUM,
+                evidence_snapshot_id=evidence_id, confidence=Decimal("7.0"), uncertainty=Uncertainty.MEDIUM,
             )
 
 
@@ -89,11 +88,10 @@ def test_confidence_out_of_range_rejected_by_database():
     sc_id = _make_season_competitor(season_id, "openai")
     with pytest.raises(IntegrityError):
         with session_scope() as session:
-            snapshot = MarketRepository(session).get_market_snapshot(snapshot_id)
             create_forecast_observation(
                 session, season_competitor_id=sc_id, market_id=market_id, source_type="BENCHMARK",
                 checkpoint_type="OPENING", timestamp=now, model_probability_over=Decimal("0.6"),
-                market_snapshot=snapshot, evidence_snapshot_id=evidence_id, confidence=Decimal("11.0"), uncertainty=Uncertainty.MEDIUM,  # invalid
+                evidence_snapshot_id=evidence_id, confidence=Decimal("11.0"), uncertainty=Uncertainty.MEDIUM,  # invalid
             )
 
 
@@ -102,11 +100,10 @@ def test_negative_probability_rejected_by_database():
     sc_id = _make_season_competitor(season_id, "openai")
     with pytest.raises(IntegrityError):
         with session_scope() as session:
-            snapshot = MarketRepository(session).get_market_snapshot(snapshot_id)
             create_forecast_observation(
                 session, season_competitor_id=sc_id, market_id=market_id, source_type="BENCHMARK",
                 checkpoint_type="OPENING", timestamp=now, model_probability_over=Decimal("-0.1"),  # invalid
-                market_snapshot=snapshot, evidence_snapshot_id=evidence_id, confidence=Decimal("7.0"), uncertainty=Uncertainty.MEDIUM,
+                evidence_snapshot_id=evidence_id, confidence=Decimal("7.0"), uncertainty=Uncertainty.MEDIUM,
             )
 
 
@@ -133,7 +130,7 @@ def test_cohort_flags_mismatched_evidence_snapshots_as_a_system_error():
             create_forecast_observation(
                 session, season_competitor_id=sc_id, market_id=market_id, source_type="BENCHMARK",
                 checkpoint_type="OPENING", timestamp=now, model_probability_over=Decimal("0.6"),
-                market_snapshot=snapshot, evidence_snapshot_id=evidence_id, confidence=Decimal("7.0"), uncertainty=Uncertainty.MEDIUM,
+                evidence_snapshot_id=evidence_id, confidence=Decimal("7.0"), uncertainty=Uncertainty.MEDIUM,
             )
 
         # ...but Claude's observation is fabricated to point at a second,
@@ -147,7 +144,7 @@ def test_cohort_flags_mismatched_evidence_snapshots_as_a_system_error():
         create_forecast_observation(
             session, season_competitor_id=claude_id, market_id=market_id, source_type="BENCHMARK",
             checkpoint_type="OPENING", timestamp=now, model_probability_over=Decimal("0.55"),
-            market_snapshot=snapshot, evidence_snapshot_id=rogue_evidence.id, confidence=Decimal("7.0"), uncertainty=Uncertainty.MEDIUM,
+            evidence_snapshot_id=rogue_evidence.id, confidence=Decimal("7.0"), uncertainty=Uncertainty.MEDIUM,
         )
 
     with session_scope() as session:
@@ -166,12 +163,11 @@ def test_cohort_accepts_when_all_three_share_the_same_evidence_snapshot():
     labels = {gpt_id: "GPT", claude_id: "CLAUDE", gemini_id: "GEMINI"}
 
     with session_scope() as session:
-        snapshot = MarketRepository(session).get_market_snapshot(snapshot_id)
         for sc_id in (gpt_id, claude_id, gemini_id):
             create_forecast_observation(
                 session, season_competitor_id=sc_id, market_id=market_id, source_type="BENCHMARK",
                 checkpoint_type="OPENING", timestamp=now, model_probability_over=Decimal("0.6"),
-                market_snapshot=snapshot, evidence_snapshot_id=evidence_id, confidence=Decimal("7.0"), uncertainty=Uncertainty.MEDIUM,
+                evidence_snapshot_id=evidence_id, confidence=Decimal("7.0"), uncertainty=Uncertainty.MEDIUM,
             )
         lock_research_settlement(session, market_id=market_id, stat_value=Decimal("230"), locked_at=now + timedelta(days=10))
 
@@ -180,3 +176,34 @@ def test_cohort_accepts_when_all_three_share_the_same_evidence_snapshot():
 
     assert report.eligible_count == 1
     assert report.rows[0].eligible is True
+
+
+def test_create_forecast_observation_rejects_an_evidence_snapshot_for_a_different_market():
+    """create_forecast_observation must not trust a caller-supplied
+    MarketSnapshot alongside evidence_snapshot_id - it derives the market
+    snapshot from the evidence row itself, so passing an evidence snapshot
+    that actually belongs to a *different* market must be rejected rather
+    than silently stamping the observation with mismatched data.
+    """
+
+    season_id_a, market_id_a, _snapshot_id_a, evidence_id_a, now = _setup_market()
+    sc_id = _make_season_competitor(season_id_a, "openai")
+
+    # A second, unrelated market/evidence snapshot.
+    _season_id_b, market_id_b, _snapshot_id_b, _evidence_id_b, _now_b = _setup_market()
+    assert market_id_a != market_id_b
+
+    with pytest.raises(ValueError):
+        with session_scope() as session:
+            create_forecast_observation(
+                session, season_competitor_id=sc_id, market_id=market_id_b, source_type="BENCHMARK",
+                checkpoint_type="OPENING", timestamp=now, model_probability_over=Decimal("0.6"),
+                evidence_snapshot_id=evidence_id_a,  # belongs to market_id_a, not market_id_b
+                confidence=Decimal("7.0"), uncertainty=Uncertainty.MEDIUM,
+            )
+
+    # Nothing should have been written.
+    with session_scope() as session:
+        from app.db.models.forecast_lab import ForecastObservation
+
+        assert session.execute(select(ForecastObservation).where(ForecastObservation.market_id == market_id_b)).first() is None

@@ -186,18 +186,16 @@ def test_mocked_research_week_survives_a_full_reload():
     opening_forecasts = {}
     with session_scope() as session:
         market_repo = MarketRepository(session)
-        good_snapshot_row = market_repo.get_market_snapshot(good_snapshot_id)
         for sc_id, prob in ((gpt_id, Decimal("0.61")), (claude_id, Decimal("0.55")), (gemini_id, Decimal("0.58"))):
             obs = create_forecast_observation(
                 session, season_competitor_id=sc_id, market_id=market_good_id, source_type="BENCHMARK",
                 checkpoint_type="OPENING", timestamp=now, model_probability_over=prob,
-                market_snapshot=good_snapshot_row, evidence_snapshot_id=evidence_id,
+                evidence_snapshot_id=evidence_id,
                 confidence=Decimal("7.0"), uncertainty=Uncertainty.MEDIUM,
             )
             opening_forecasts[sc_id] = obs.id
             assert obs.research_eligible is True
 
-        no_canonical_snapshot_row = market_repo.get_market_snapshot(no_canonical_snapshot_id)
         no_canonical_evidence_id = session.execute(
             select(EvidenceSnapshot.id).where(EvidenceSnapshot.market_id == market_no_canonical_id)
         ).scalar_one()
@@ -205,7 +203,7 @@ def test_mocked_research_week_survives_a_full_reload():
             obs = create_forecast_observation(
                 session, season_competitor_id=sc_id, market_id=market_no_canonical_id, source_type="BENCHMARK",
                 checkpoint_type="OPENING", timestamp=now, model_probability_over=prob,
-                market_snapshot=no_canonical_snapshot_row, evidence_snapshot_id=no_canonical_evidence_id,
+                evidence_snapshot_id=no_canonical_evidence_id,
                 confidence=Decimal("5.0"), uncertainty=Uncertainty.HIGH,
             )
             assert obs.research_eligible is False
@@ -236,7 +234,7 @@ def test_mocked_research_week_survives_a_full_reload():
         mid_obs = create_forecast_observation(
             session, season_competitor_id=gpt_id, market_id=market_good_id, source_type="BENCHMARK",
             checkpoint_type="MID", timestamp=mid_time, model_probability_over=Decimal("0.66"),
-            market_snapshot=mid_snapshot, evidence_snapshot_id=mid_evidence_id,
+            evidence_snapshot_id=mid_evidence_id,
             confidence=Decimal("7.5"), uncertainty=Uncertainty.MEDIUM,
             revision_parent_id=opening_forecasts[gpt_id], revision_reason="SCHEDULED_CHECKPOINT",
         )
