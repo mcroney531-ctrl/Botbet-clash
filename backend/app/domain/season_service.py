@@ -30,6 +30,7 @@ from app.domain.errors import (
     InvalidStateTransition,
     InvalidStakeIncrement,
     LineOutsideAcceptableBoundary,
+    NoLegalStakeAvailable,
     PounceLimitExceeded,
     PriceOutsideAcceptableBoundary,
     PushableLineNotAllowed,
@@ -135,6 +136,14 @@ class SeasonService:
         win_probability = model_probability_over if side is Side.OVER else (Decimal(1) - model_probability_over)
         kelly_stake = kelly_reference_stake(self.season.rules, available, win_probability, price)
         final_allowed = resolve_final_allowed_stake(self.season.rules, available, urgency, model_requested_stake)
+        if final_allowed < self.season.rules.minimum_stake:
+            raise NoLegalStakeAvailable(
+                f"competitor {competitor.id}'s final_allowed_stake for this ticket floors to {final_allowed}, "
+                f"below minimum_stake {self.season.rules.minimum_stake} — no execution of this ticket could ever be legal "
+                f"(requested {model_requested_stake}, {urgency.value} cap on {available} available bankroll). "
+                "This is distinct from bankruptcy: the competitor may still be solvent for a higher-urgency ticket "
+                "whose cap clears the minimum."
+            )
 
         ticket = Ticket(
             competitor_id=competitor.id,
@@ -212,15 +221,24 @@ class SeasonService:
         never be called twice for the same ticket. PLACED additionally
         enforces every hard constraint the ticket carries — none of these
         can be bypassed by whatever recorded the human's execution input.
+
+        Solvency is only re-checked for PLACED. Retiring an already-issued
+        ticket as MISSED_WINDOW/SKIPPED/UNAVAILABLE/MARKET_MOVED is not new
+        real-money exposure — it's bookkeeping on exposure that either
+        never happened or already ended — so it must stay available even
+        for a competitor who has since gone BUSTED (e.g. from an
+        ADJUSTMENT applied after this ticket was issued but before it was
+        resolved). Gating retirement on solvency would leave a busted
+        competitor's outstanding tickets permanently unresolved.
         """
 
         competitor = self._competitors[ticket.competitor_id]
-        self._ensure_solvent(competitor, ticket.week_id)
 
         if ticket.status is not TicketStatus.ISSUED:
             raise TicketNotExecutable(f"ticket {ticket.id} is not ISSUED (status={ticket.status}); already resolved")
 
         if status is WagerExecutionStatus.PLACED:
+            self._ensure_solvent(competitor, ticket.week_id)
             if ticket.valid_until is not None and self.clock.now() > ticket.valid_until:
                 raise TicketExpired(f"ticket {ticket.id} expired at {ticket.valid_until}; cannot be PLACED")
             if self._has_weekly_decision(ticket.competitor_id, ticket.week_id):

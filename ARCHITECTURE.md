@@ -165,20 +165,40 @@ run.
 implementation of the `TICKET_PENDING → BET_EXECUTED` transition above) is
 the sole authoritative gate for turning a ticket into a real wager — every
 hard constraint the ticket carries is enforced there, not left to
-whatever recorded the human's execution input: the ticket must still be
-`ISSUED` and unexpired; `actual_stake` must be within both the ticket's
-`final_allowed_stake` *and* current available bankroll (the two can
-diverge if bankroll moved between issuance and execution), at least
-`minimum_stake`, and a whole multiple of `stake_increment`; `actual_line`
-must not have moved past `acceptable_line_boundary` in the side-aware
-direction (worse for OVER means higher, worse for UNDER means lower); and
-`actual_price` must be at least as good as `worst_acceptable_price` (the
-DATABASE.md §7 rename from "maximum" — American odds aren't ordered by
-raw magnitude once sign is involved, e.g. -125 is worse than -120 but
-that's not simply "a bigger negative number," so this compares via
-decimal/implied-probability odds, `price_is_acceptable()` in
-`backend/app/domain/risk.py`, rather than comparing the raw integers or
-their magnitudes).
+whatever recorded the human's execution input. First, regardless of
+status: the ticket must still be `ISSUED` (a ticket can only be resolved
+once). Solvency is then re-checked **only when `status = PLACED`** —
+retiring an already-issued ticket as `MISSED_WINDOW`/`SKIPPED`/
+`UNAVAILABLE`/`MARKET_MOVED` is bookkeeping on exposure that never
+happened or already ended, not new real-money exposure, so it must stay
+available even for a competitor who went `BUSTED` after this ticket was
+issued (e.g. from an `ADJUSTMENT`) — gating retirement on solvency would
+leave such a competitor's outstanding tickets permanently stuck `ISSUED`.
+For `PLACED` specifically, additionally: the ticket must be unexpired;
+`actual_stake` must be within both the ticket's `final_allowed_stake`
+*and* current available bankroll (the two can diverge if bankroll moved
+between issuance and execution), at least `minimum_stake`, and a whole
+multiple of `stake_increment`; `actual_line` must not have moved past
+`acceptable_line_boundary` in the side-aware direction (worse for OVER
+means higher, worse for UNDER means lower); and `actual_price` must be at
+least as good as `worst_acceptable_price` (the DATABASE.md §7 rename from
+"maximum" — American odds aren't ordered by raw magnitude once sign is
+involved, e.g. -125 is worse than -120 but that's not simply "a bigger
+negative number," so this compares via decimal/implied-probability odds,
+`price_is_acceptable()` in `backend/app/domain/risk.py`, rather than
+comparing the raw integers or their magnitudes).
+
+**Ticket issuance validation.** The mirror-image check happens at
+issuance, not execution: `issue_ticket` computes `final_allowed_stake`
+(§ above, floored to `stake_increment` last) and rejects the ticket
+outright if that floored amount is below `minimum_stake` — otherwise the
+service would mint a ticket no `PLACED` execution could ever legally
+satisfy (`actual_stake ≤ final_allowed_stake` and `actual_stake ≥
+minimum_stake` can't both hold once `final_allowed_stake` is $0). This is
+deliberately a different failure than bankruptcy: a $1.00 bankroll's 20%
+`STRONG` cap floors to $0.00 (no legal ticket), while its 30% `POUNCE`
+cap floors to $0.25 (still legal) — the competitor is solvent, just not
+for that ticket's urgency class.
 
 ## 4a. Benchmark slate: precommitted, resolved asynchronously per game
 

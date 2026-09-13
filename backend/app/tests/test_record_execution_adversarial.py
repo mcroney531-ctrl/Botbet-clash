@@ -25,6 +25,7 @@ from app.domain.errors import (
     DuplicateSettlement,
     InvalidStakeIncrement,
     LineOutsideAcceptableBoundary,
+    NoLegalStakeAvailable,
     PriceOutsideAcceptableBoundary,
     PushableLineNotAllowed,
     StakeBelowMinimum,
@@ -326,3 +327,75 @@ def test_wager_cannot_be_settled_twice(service: SeasonService, week1):
 
     # The rejected re-settlement must not have credited the ledger again.
     assert service.ledger.available_balance("openai") == balance_after_first_settlement
+
+
+def test_busted_competitor_can_still_retire_an_outstanding_ticket(service: SeasonService, week1):
+    # Ticket issued while solvent...
+    ticket = issue(service, week1)
+    # ...then an ADJUSTMENT (not a settlement) busts the competitor before
+    # the ticket is ever resolved. Retiring it as MISSED_WINDOW is not new
+    # real-money exposure, so it must still be allowed even though the
+    # competitor is now BUSTED.
+    service.ledger.record(
+        BankrollTransaction(
+            competitor_id="openai",
+            type=BankrollTransactionType.ADJUSTMENT,
+            amount=Money.from_dollars_str("-14.50"),
+            reason="test: bust the competitor while a ticket is still outstanding",
+        )
+    )
+    competitor = service._competitors["openai"]
+    assert competitor.status is CompetitorStatus.ACTIVE  # not yet re-evaluated
+
+    wager = service.record_execution(ticket=ticket, status=WagerExecutionStatus.MISSED_WINDOW)
+    assert wager.execution_status is WagerExecutionStatus.MISSED_WINDOW
+    assert ticket.status is TicketStatus.EXPIRED
+
+    # Attempting to PLACE the same ticket, in contrast, must still be
+    # rejected as new exposure for a busted competitor - but that's now
+    # moot since the ticket above is already retired (TicketNotExecutable
+    # would fire first); the important assertion is that retirement itself
+    # was never blocked by solvency.
+
+
+def test_issue_ticket_rejects_when_model_request_floors_to_zero(service: SeasonService, week1):
+    # $0.10 requested floors to $0.00 after the $0.25 increment - no
+    # execution of this ticket could ever be legal.
+    with pytest.raises(NoLegalStakeAvailable):
+        issue(service, week1, model_requested_stake=Money.from_dollars_str("0.10"))
+
+
+def test_issue_ticket_rejects_when_standard_cap_floors_below_minimum_but_pounce_still_legal(
+    service: SeasonService, week1
+):
+    # Drop bankroll to $1.00. Standard (20%) cap is $0.20 -> floors to
+    # $0.00: no legal STRONG ticket exists. Exceptional (30%) cap is
+    # $0.30 -> floors to $0.25: a Pounce at the same bankroll is legal.
+    # This is deliberately not bankruptcy (exceptional_cap(available)
+    # still clears minimum_stake) - it's a narrower "this ticket class
+    # isn't executable at this bankroll" case.
+    service.ledger.record(
+        BankrollTransaction(
+            competitor_id="openai",
+            type=BankrollTransactionType.ADJUSTMENT,
+            amount=Money.from_dollars_str("-14.00"),
+            reason="test: bankroll down to $1.00",
+        )
+    )
+    assert service.ledger.available_balance("openai") == Money.from_dollars_str("1.00")
+
+    with pytest.raises(NoLegalStakeAvailable):
+        issue(
+            service,
+            week1,
+            urgency=Urgency.STRONG,
+            model_requested_stake=Money.from_dollars_str("1.00"),
+        )
+
+    ticket = issue(
+        service,
+        week1,
+        urgency=Urgency.POUNCE,
+        model_requested_stake=Money.from_dollars_str("1.00"),
+    )
+    assert ticket.final_allowed_stake == Money.from_dollars_str("0.25")

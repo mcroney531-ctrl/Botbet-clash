@@ -32,6 +32,13 @@ class StakeBelowMinimum(RuleViolation):
     pass
 
 
+class NoLegalStakeAvailable(RuleViolation):
+    """issue_ticket's computed final_allowed_stake floors below
+    minimum_stake — no execution of this ticket could ever be legal.
+    Distinct from CompetitorBusted: the competitor may still be solvent
+    for a higher-urgency ticket whose cap clears the minimum."""
+
+
 class InvalidStakeIncrement(RuleViolation):
     pass
 
