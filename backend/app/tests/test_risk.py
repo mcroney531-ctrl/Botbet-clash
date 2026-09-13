@@ -31,6 +31,15 @@ def rules() -> SeasonRules:
 def test_american_to_decimal_odds():
     assert american_to_decimal_odds(-120) == pytest.approx(Decimal("1.8333"), rel=Decimal("0.001"))
     assert american_to_decimal_odds(150) == Decimal("2.5")
+    assert american_to_decimal_odds(-100) == Decimal("2")
+    assert american_to_decimal_odds(100) == Decimal("2")
+
+
+def test_american_to_decimal_odds_rejects_the_invalid_middle_range():
+    # Valid American odds are never strictly between -100 and +100.
+    for bad_price in (0, 1, -1, 50, -50, 99, -99):
+        with pytest.raises(ValueError):
+            american_to_decimal_odds(bad_price)
 
 
 def test_full_kelly_no_edge_is_zero():

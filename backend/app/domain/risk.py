@@ -21,8 +21,8 @@ from app.domain.models import SeasonRules
 
 def american_to_decimal_odds(price: int) -> Decimal:
     price_d = Decimal(price)
-    if price_d == 0:
-        raise ValueError("American price cannot be zero")
+    if -100 < price_d < 100:
+        raise ValueError(f"{price} is not a valid American price (must be <= -100 or >= 100)")
     if price_d < 0:
         return Decimal(100) / (-price_d) + 1
     return price_d / Decimal(100) + 1
@@ -68,16 +68,20 @@ def resolve_final_allowed_stake(
     The model may always request less than the cap; it may never exceed
     it. This never looks at the Kelly reference — that number is stored
     for analysis (RULES.md §10 / constitution §64), not enforced as a
-    ceiling. The cap itself is floored to `stake_increment` first, so the
-    returned value is always something `record_execution` can actually
-    accept — a nominal cap that isn't a whole number of increments would
-    be a ceiling nothing could ever legally be placed at.
+    ceiling. The result is always floored to `stake_increment` *after*
+    taking the min — flooring only the cap and then returning
+    `min(requested, floored_cap)` would still let an off-increment
+    `model_requested_stake` (e.g. $2.10 under a $3.00 cap) pass straight
+    through unfloored, which `record_execution` would then legitimately
+    reject. `final_allowed_stake` is supposed to mean "an amount that can
+    actually be placed" — that's only true if it's floored last.
     """
 
     if model_requested_stake.is_negative():
         raise ValueError("model_requested_stake cannot be negative")
-    cap = rules.cap_for(available_bankroll, urgency).floor_to_increment(rules.stake_increment)
-    return model_requested_stake.min(cap)
+    cap = rules.cap_for(available_bankroll, urgency)
+    raw_allowed = model_requested_stake.min(cap)
+    return raw_allowed.floor_to_increment(rules.stake_increment)
 
 
 def price_is_acceptable(worst_acceptable_price: int, actual_price: int) -> bool:

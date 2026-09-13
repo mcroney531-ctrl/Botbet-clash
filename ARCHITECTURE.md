@@ -199,9 +199,15 @@ week's earliest game reaches T-144h):
 
 1. List the week's games ordered by `kickoff_at`.
 2. Allocate `benchmark_slate_size` (10) slots across games by a fixed,
-   deterministic rule — e.g. round-robin over games-by-kickoff-order,
-   remainder to the earliest games — so no game is favored by anything
-   other than schedule position.
+   deterministic rule. **Kickoff order is a placeholder, not the frozen
+   rule** — with 10 slots against a 16-game week, "round-robin by
+   kickoff, remainder to the earliest games" systematically favors
+   Thursday/early-Sunday games and could under-select late-Sunday/Monday
+   games every single week. Before Week 1 this needs a rule with no such
+   bias: e.g. a deterministic shuffle seeded only from
+   `(season_id, week_id)` (schedule identifiers, never odds or forecasts)
+   to pick which games get a slot, still resolved async per-game as
+   below. Validate the frozen choice in Week 0.
 3. Assign each slot a `target_stat_type` (cycling through
    `supported_prop_types`) plus a fixed `fallback_stat_types` priority
    order, so a game missing its target type still has a deterministic

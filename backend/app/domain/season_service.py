@@ -25,6 +25,7 @@ from app.domain.enums import (
 )
 from app.domain.errors import (
     CompetitorBusted,
+    DuplicateSettlement,
     DuplicateWeeklyDecision,
     InvalidStateTransition,
     InvalidStakeIncrement,
@@ -72,7 +73,7 @@ class SeasonService:
         self._competitors: dict[str, Competitor] = {}
         self._tickets: dict[str, Ticket] = {}
         self._wagers: dict[str, Wager] = {}
-        self._settlements: dict[str, Settlement] = {}
+        self._settlements_by_wager_id: dict[str, Settlement] = {}
         self._pass_decisions: dict[tuple[str, str], PassDecision] = {}
 
     # -- setup ---------------------------------------------------------
@@ -118,7 +119,7 @@ class SeasonService:
         worst_acceptable_price: int | None = None,
         valid_until: datetime | None = None,
     ) -> Ticket:
-        self._require_active(competitor)
+        self._ensure_solvent(competitor, week.id)
         if is_pushable_line(market.line):
             raise PushableLineNotAllowed(
                 f"market {market.id} has a pushable line ({market.line}); "
@@ -214,7 +215,7 @@ class SeasonService:
         """
 
         competitor = self._competitors[ticket.competitor_id]
-        self._require_active(competitor)
+        self._ensure_solvent(competitor, ticket.week_id)
 
         if ticket.status is not TicketStatus.ISSUED:
             raise TicketNotExecutable(f"ticket {ticket.id} is not ISSUED (status={ticket.status}); already resolved")
@@ -309,9 +310,11 @@ class SeasonService:
     def settle_wager(self, *, wager: Wager, result: SportsbookResult, payout: Money) -> Settlement:
         if wager.execution_status is not WagerExecutionStatus.PLACED:
             raise InvalidStateTransition(f"wager {wager.id} was never PLACED; nothing to settle")
+        if wager.id in self._settlements_by_wager_id:
+            raise DuplicateSettlement(f"wager {wager.id} was already settled; settling it again would double-credit the ledger")
 
         settlement = Settlement(wager_id=wager.id, result=result, payout=payout, settled_at=self.clock.now())
-        self._settlements[settlement.id] = settlement
+        self._settlements_by_wager_id[wager.id] = settlement
 
         credit_type = {
             SportsbookResult.WIN: BankrollTransactionType.WIN_RETURN,
@@ -391,6 +394,23 @@ class SeasonService:
     def _require_active(self, competitor: Competitor) -> None:
         if competitor.status is CompetitorStatus.BUSTED:
             raise CompetitorBusted(f"competitor {competitor.id} is BUSTED; real-money bankroll is frozen for the season")
+
+    def _ensure_solvent(self, competitor: Competitor, week_id: str) -> None:
+        """Safety-net re-check before any real-money action (issuing or
+        executing a ticket): `_maybe_declare_bankruptcy` is normally
+        triggered by `settle_wager`, but a non-settlement ledger mutation
+        (e.g. a Commissioner ADJUSTMENT) can push a competitor into the
+        bankrupt zone with no settlement ever happening. Re-evaluating
+        here means that gets caught at the next real-money touchpoint
+        instead of leaving `status` stale as ACTIVE indefinitely. Once all
+        bankroll mutations flow through one ledger service (Phase 2+),
+        that service can re-check on every write instead of relying on
+        call sites to remember this — see ARCHITECTURE.md §3.
+        """
+
+        self._require_active(competitor)
+        self._maybe_declare_bankruptcy(competitor.id, week_id)
+        self._require_active(competitor)
 
     def _active_pounce_tickets(self, competitor_id: str, week_id: str) -> list[Ticket]:
         return [

@@ -10,8 +10,19 @@ from decimal import Decimal
 import pytest
 
 from app.core.money import Money
-from app.domain.enums import BankrollTransactionType, RiskPosture, Side, TicketStatus, Urgency, WagerExecutionStatus
+from app.domain.enums import (
+    BankrollTransactionType,
+    CompetitorStatus,
+    RiskPosture,
+    Side,
+    SportsbookResult,
+    TicketStatus,
+    Urgency,
+    WagerExecutionStatus,
+)
 from app.domain.errors import (
+    CompetitorBusted,
+    DuplicateSettlement,
     InvalidStakeIncrement,
     LineOutsideAcceptableBoundary,
     PriceOutsideAcceptableBoundary,
@@ -94,15 +105,38 @@ def test_actual_stake_below_minimum_rejected(service: SeasonService, week1):
 
 
 def test_actual_stake_must_be_a_multiple_of_increment(service: SeasonService, week1):
-    ticket = issue(service, week1, model_requested_stake=Money.from_dollars_str("2.10"))
+    # final_allowed_stake is itself always increment-aligned (resolve_final_allowed_stake
+    # floors it), so to exercise this check independently the requested
+    # actual_stake just needs to be <= the cap but off-increment — e.g. the
+    # human mis-recorded the executed amount.
+    ticket = issue(service, week1, model_requested_stake=Money.from_dollars_str("3.00"))
+    assert ticket.final_allowed_stake == Money.from_dollars_str("3.00")
     with pytest.raises(InvalidStakeIncrement):
         service.record_execution(
             ticket=ticket,
             status=WagerExecutionStatus.PLACED,
             actual_line=Decimal("52.5"),
             actual_price=-115,
-            actual_stake=Money(210),  # not a multiple of the $0.25 increment
+            actual_stake=Money(210),  # $2.10 - under cap, but not a multiple of the $0.25 increment
         )
+
+
+def test_final_allowed_stake_is_always_increment_aligned(service: SeasonService, week1):
+    # Regression: resolve_final_allowed_stake used to floor the cap and
+    # then take min(requested, floored_cap), which let an off-increment
+    # request (e.g. $2.10 under a $3.00 cap) pass through unfloored -
+    # producing a final_allowed_stake record_execution would then reject
+    # outright. Flooring must happen last, after the min.
+    ticket = issue(service, week1, model_requested_stake=Money.from_dollars_str("2.10"))
+    assert ticket.final_allowed_stake == Money.from_dollars_str("2.00")
+    wager = service.record_execution(
+        ticket=ticket,
+        status=WagerExecutionStatus.PLACED,
+        actual_line=Decimal("52.5"),
+        actual_price=-115,
+        actual_stake=ticket.final_allowed_stake,
+    )
+    assert wager.actual_stake == Money.from_dollars_str("2.00")
 
 
 def test_ticket_cannot_be_executed_twice(service: SeasonService, week1):
@@ -252,3 +286,43 @@ def test_bankroll_at_execution_is_captured_before_the_stake_debit(service: Seaso
 def test_pushable_line_rejected_at_issuance(service: SeasonService, week1):
     with pytest.raises(PushableLineNotAllowed):
         issue(service, week1, market=market(line=Decimal("75")))
+
+
+def test_adjustment_into_dead_zone_is_caught_before_next_ticket(service: SeasonService, week1):
+    # No settlement happens here at all - a Commissioner ADJUSTMENT alone
+    # drops available bankroll to $0.50, where even the 30% exceptional
+    # cap ($0.15) can't clear the $0.25 minimum stake. Nothing marks the
+    # competitor BUSTED until the next real-money touchpoint re-checks.
+    competitor = service._competitors["openai"]
+    service.ledger.record(
+        BankrollTransaction(
+            competitor_id="openai",
+            type=BankrollTransactionType.ADJUSTMENT,
+            amount=Money.from_dollars_str("-14.50"),
+            reason="test: simulate a non-settlement ledger event that strands the competitor",
+        )
+    )
+    assert competitor.status is CompetitorStatus.ACTIVE  # stale - nothing has re-evaluated it yet
+    with pytest.raises(CompetitorBusted):
+        issue(service, week1)
+    assert competitor.status is CompetitorStatus.BUSTED
+
+
+def test_wager_cannot_be_settled_twice(service: SeasonService, week1):
+    ticket = issue(service, week1)
+    wager = service.record_execution(
+        ticket=ticket,
+        status=WagerExecutionStatus.PLACED,
+        actual_line=Decimal("52.5"),
+        actual_price=-115,
+        actual_stake=Money.from_dollars_str("2.00"),
+    )
+    service.settle_wager(wager=wager, result=SportsbookResult.WIN, payout=Money.from_dollars_str("3.74"))
+    balance_after_first_settlement = service.ledger.available_balance("openai")
+    assert balance_after_first_settlement == Money.from_dollars_str("16.74")
+
+    with pytest.raises(DuplicateSettlement):
+        service.settle_wager(wager=wager, result=SportsbookResult.WIN, payout=Money.from_dollars_str("3.74"))
+
+    # The rejected re-settlement must not have credited the ledger again.
+    assert service.ledger.available_balance("openai") == balance_after_first_settlement

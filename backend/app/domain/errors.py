@@ -59,3 +59,8 @@ class PriceOutsideAcceptableBoundary(RuleViolation):
 
 class DuplicateWeeklyDecision(RuleViolation):
     """A competitor may only reach one official BET or PASS per week."""
+
+
+class DuplicateSettlement(InvalidStateTransition):
+    """A wager may only be settled once — settling it again would credit
+    (or attempt to credit) the ledger twice for the same outcome."""
