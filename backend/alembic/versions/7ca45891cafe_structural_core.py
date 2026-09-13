@@ -1,8 +1,8 @@
 """structural core
 
-Revision ID: b94274d79b10
+Revision ID: 7ca45891cafe
 Revises: 
-Create Date: 2026-09-13 02:17:15.881480
+Create Date: 2026-09-13 02:33:40.074020
 
 """
 from typing import Sequence, Union
@@ -12,7 +12,7 @@ import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
 # revision identifiers, used by Alembic.
-revision: str = 'b94274d79b10'
+revision: str = '7ca45891cafe'
 down_revision: Union[str, Sequence[str], None] = None
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
@@ -208,6 +208,9 @@ def upgrade() -> None:
     sa.Column('market_max_line', sa.Numeric(precision=6, scale=2), nullable=True),
     sa.Column('number_of_books', sa.Integer(), nullable=False),
     sa.Column('is_valid_canonical_baseline', sa.Boolean(), nullable=False),
+    sa.CheckConstraint('canonical_over_probability IS NULL OR (canonical_over_probability >= 0 AND canonical_over_probability <= 1)', name=op.f('ck_market_snapshots_canonical_over_probability_range')),
+    sa.CheckConstraint('canonical_under_probability IS NULL OR (canonical_under_probability >= 0 AND canonical_under_probability <= 1)', name=op.f('ck_market_snapshots_canonical_under_probability_range')),
+    sa.CheckConstraint('same_line_consensus_over_probability IS NULL OR (same_line_consensus_over_probability >= 0 AND same_line_consensus_over_probability <= 1)', name=op.f('ck_market_snapshots_consensus_probability_range')),
     sa.ForeignKeyConstraint(['market_id'], ['prop_markets.id'], name=op.f('fk_market_snapshots_market_id_prop_markets')),
     sa.PrimaryKeyConstraint('id', name=op.f('pk_market_snapshots'))
     )
@@ -300,6 +303,10 @@ def upgrade() -> None:
     sa.Column('exclusion_reason', sa.String(), nullable=True),
     sa.Column('agent_session_id', sa.Uuid(), nullable=True),
     sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
+    sa.CheckConstraint('canonical_market_probability_over IS NULL OR (canonical_market_probability_over >= 0 AND canonical_market_probability_over <= 1)', name=op.f('ck_forecast_observations_canonical_probability_range')),
+    sa.CheckConstraint('confidence >= 1 AND confidence <= 10', name=op.f('ck_forecast_observations_confidence_range')),
+    sa.CheckConstraint('model_probability_over >= 0 AND model_probability_over <= 1', name=op.f('ck_forecast_observations_probability_range')),
+    sa.CheckConstraint('same_line_consensus_probability_over IS NULL OR (same_line_consensus_probability_over >= 0 AND same_line_consensus_probability_over <= 1)', name=op.f('ck_forecast_observations_consensus_probability_range')),
     sa.ForeignKeyConstraint(['agent_session_id'], ['agent_sessions.id'], name=op.f('fk_forecast_observations_agent_session_id_agent_sessions')),
     sa.ForeignKeyConstraint(['evidence_snapshot_id'], ['evidence_snapshots.id'], name=op.f('fk_forecast_observations_evidence_snapshot_id_evidence_snapshots')),
     sa.ForeignKeyConstraint(['market_id'], ['prop_markets.id'], name=op.f('fk_forecast_observations_market_id_prop_markets')),

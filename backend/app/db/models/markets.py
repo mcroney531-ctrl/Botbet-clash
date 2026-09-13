@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import ForeignKey, Integer, Numeric, String, UniqueConstraint
+from sqlalchemy import CheckConstraint, ForeignKey, Integer, Numeric, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base, created_at_column, uuid_pk
@@ -86,6 +86,21 @@ class MarketSnapshot(Base):
     market_max_line: Mapped[Decimal | None] = mapped_column(Numeric(6, 2), nullable=True)
     number_of_books: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     is_valid_canonical_baseline: Mapped[bool] = mapped_column(nullable=False, default=False)
+
+    __table_args__ = (
+        CheckConstraint(
+            "canonical_over_probability IS NULL OR (canonical_over_probability >= 0 AND canonical_over_probability <= 1)",
+            name="canonical_over_probability_range",
+        ),
+        CheckConstraint(
+            "canonical_under_probability IS NULL OR (canonical_under_probability >= 0 AND canonical_under_probability <= 1)",
+            name="canonical_under_probability_range",
+        ),
+        CheckConstraint(
+            "same_line_consensus_over_probability IS NULL OR (same_line_consensus_over_probability >= 0 AND same_line_consensus_over_probability <= 1)",
+            name="consensus_probability_range",
+        ),
+    )
 
 
 class CheckpointRun(Base):

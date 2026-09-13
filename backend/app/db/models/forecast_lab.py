@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import BigInteger, ForeignKey, Integer, Numeric, String, UniqueConstraint
+from sqlalchemy import BigInteger, CheckConstraint, ForeignKey, Integer, Numeric, String, UniqueConstraint
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -57,6 +57,19 @@ class ForecastObservation(Base):
     exclusion_reason: Mapped[str | None] = mapped_column(String, nullable=True)
     agent_session_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("agent_sessions.id"), nullable=True)
     created_at: Mapped[datetime] = created_at_column()
+
+    __table_args__ = (
+        CheckConstraint("model_probability_over >= 0 AND model_probability_over <= 1", name="probability_range"),
+        CheckConstraint(
+            "canonical_market_probability_over IS NULL OR (canonical_market_probability_over >= 0 AND canonical_market_probability_over <= 1)",
+            name="canonical_probability_range",
+        ),
+        CheckConstraint(
+            "same_line_consensus_probability_over IS NULL OR (same_line_consensus_probability_over >= 0 AND same_line_consensus_probability_over <= 1)",
+            name="consensus_probability_range",
+        ),
+        CheckConstraint("confidence >= 1 AND confidence <= 10", name="confidence_range"),
+    )
 
 
 class BenchmarkSlatePlan(Base):

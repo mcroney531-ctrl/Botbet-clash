@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.db.models.competition import PassDecision as PassDecisionRow
@@ -30,12 +31,18 @@ class CompetitionRepository:
             raise LookupError(f"ticket {ticket_id} not found")
         return row
 
-    def active_pounce_tickets(self, season_competitor_id: uuid.UUID, week_id: uuid.UUID) -> list[TicketRow]:
+    def active_pounce_tickets(self, season_competitor_id: uuid.UUID, week_id: uuid.UUID, now: datetime) -> list[TicketRow]:
+        """`status == ISSUED` alone isn't "active" - an expired,
+        unexecuted Pounce may be replaced (RULES.md §74), so a ticket
+        past its own `valid_until` must not count against the limit even
+        though nothing has flipped its `status` to EXPIRED yet."""
+
         stmt = select(TicketRow).where(
             TicketRow.season_competitor_id == season_competitor_id,
             TicketRow.week_id == week_id,
             TicketRow.urgency == "POUNCE",
             TicketRow.status == "ISSUED",
+            or_(TicketRow.valid_until.is_(None), TicketRow.valid_until > now),
         )
         return list(self.session.execute(stmt).scalars())
 

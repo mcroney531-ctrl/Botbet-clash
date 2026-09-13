@@ -11,6 +11,7 @@ from decimal import Decimal
 from app.db.repositories.forecast_repository import ForecastRepository
 from app.db.repositories.market_repository import MarketRepository
 from app.db.repositories.research_repository import ResearchRepository
+from app.db.repositories.season_repository import SeasonRepository
 from app.db.session import session_scope
 from app.domain.enums import Uncertainty
 from app.domain.models import SeasonRules
@@ -22,14 +23,6 @@ from app.forecast_lab.research_settlement_service import derive_outcome, lock_re
 from app.forecast_lab.scoring import brier_score, log_loss
 from app.core.money import Money
 from app.services.season_commissioner import SeasonCommissioner
-
-PROP_TYPES = ["passing_yards", "passing_touchdowns", "rushing_yards", "receptions", "receiving_yards"]
-WINDOWS = {
-    "OPENING": {"start_hours_before_kickoff": 144, "end_hours_before_kickoff": 96},
-    "MID": {"start_hours_before_kickoff": 60, "end_hours_before_kickoff": 36},
-    "FINAL": {"start_hours_before_kickoff": 6, "end_hours_before_kickoff": 2},
-}
-CANONICAL_BOOK = "DRAFTKINGS"
 
 
 def make_rules() -> SeasonRules:
@@ -48,6 +41,18 @@ def make_rules() -> SeasonRules:
 def test_mocked_research_week_survives_a_full_reload():
     # ---- 1-3. Season, rules, three season-competitors -----------------
     commissioner = SeasonCommissioner.create_season(name="Mock Research Week", year=2026, rules=make_rules())
+
+    # Load the research configuration (checkpoint windows, canonical
+    # sportsbook, supported prop types) from the *persisted* season_rules
+    # row rather than a parallel test constant — this is the piece that
+    # actually proves the Forecast Lab runs from the frozen season
+    # configuration, not from whatever the test file happens to hardcode.
+    with session_scope() as session:
+        active_rules_row = SeasonRepository(session).get_active_rules(commissioner.season_id)
+        windows_config = dict(active_rules_row.checkpoint_windows)
+        canonical_book = active_rules_row.canonical_sportsbook
+        prop_types = list(active_rules_row.supported_prop_types)
+
     labels = {}
     for competitor_id, provider, label in (("openai", "OpenAI", "GPT"), ("anthropic", "Anthropic", "CLAUDE"), ("google", "Google", "GEMINI")):
         sc_id = commissioner.register_competitor(
@@ -90,7 +95,7 @@ def test_mocked_research_week_survives_a_full_reload():
         # one market that intentionally fails canonical-market eligibility
         # (step 11 - no DRAFTKINGS quote at all, only a non-canonical book).
         market_good = market_repo.create_prop_market(game_id=game_a.id, player_id=player_a.id, stat_type="passing_yards")
-        market_repo.add_quote(market_id=market_good.id, sportsbook=CANONICAL_BOOK, line=Decimal("225.5"), over_price=-115, under_price=-105, retrieved_at=now - timedelta(hours=1))
+        market_repo.add_quote(market_id=market_good.id, sportsbook=canonical_book, line=Decimal("225.5"), over_price=-115, under_price=-105, retrieved_at=now - timedelta(hours=1))
         market_repo.add_quote(market_id=market_good.id, sportsbook="FANDUEL", line=Decimal("225.5"), over_price=-110, under_price=-110, retrieved_at=now - timedelta(hours=1))
 
         market_no_canonical = market_repo.create_prop_market(game_id=game_a.id, player_id=player_a2.id, stat_type="receiving_yards")
@@ -100,7 +105,7 @@ def test_mocked_research_week_survives_a_full_reload():
         # -> ineligible, and it's the only market in the game, so its
         # assigned benchmark slot has nothing to fall back to (step 12).
         market_pushable = market_repo.create_prop_market(game_id=game_d.id, player_id=player_d.id, stat_type="passing_touchdowns")
-        market_repo.add_quote(market_id=market_pushable.id, sportsbook=CANONICAL_BOOK, line=Decimal("2"), over_price=-120, under_price=100, retrieved_at=now - timedelta(hours=1))
+        market_repo.add_quote(market_id=market_pushable.id, sportsbook=canonical_book, line=Decimal("2"), over_price=-120, under_price=100, retrieved_at=now - timedelta(hours=1))
 
         game_a_id, game_d_id, game_b_id = game_a.id, game_d.id, game_b.id
         market_good_id, market_no_canonical_id, market_pushable_id = market_good.id, market_no_canonical.id, market_pushable.id
@@ -110,7 +115,7 @@ def test_mocked_research_week_survives_a_full_reload():
         market_repo = MarketRepository(session)
         games = [market_repo.get_game(game_a_id), market_repo.get_game(game_d_id), market_repo.get_game(game_b_id)]
         plan = commit_benchmark_slate_plan(
-            session, week_id=uuid.UUID(week_id), games=games, target_slot_count=3, prop_types=PROP_TYPES, committed_at=now
+            session, week_id=uuid.UUID(week_id), games=games, target_slot_count=3, prop_types=prop_types, committed_at=now
         )
         plan_id = plan.id
 
@@ -118,19 +123,19 @@ def test_mocked_research_week_survives_a_full_reload():
     with session_scope() as session:
         market_repo = MarketRepository(session)
         game_a_row = market_repo.get_game(game_a_id)
-        run_a = capture_checkpoint(session, game=game_a_row, checkpoint_type="OPENING", windows_config=WINDOWS, now=now, canonical_sportsbook=CANONICAL_BOOK)
+        run_a = capture_checkpoint(session, game=game_a_row, checkpoint_type="OPENING", windows_config=windows_config, now=now, canonical_sportsbook=canonical_book)
         assert run_a.status == "CAPTURED"
 
         game_d_row = market_repo.get_game(game_d_id)
-        run_d = capture_checkpoint(session, game=game_d_row, checkpoint_type="OPENING", windows_config=WINDOWS, now=now, canonical_sportsbook=CANONICAL_BOOK)
+        run_d = capture_checkpoint(session, game=game_d_row, checkpoint_type="OPENING", windows_config=windows_config, now=now, canonical_sportsbook=canonical_book)
         assert run_d.status == "CAPTURED"
 
         game_b_row = market_repo.get_game(game_b_id)
-        run_b = capture_checkpoint(session, game=game_b_row, checkpoint_type="OPENING", windows_config=WINDOWS, now=now, canonical_sportsbook=CANONICAL_BOOK)
+        run_b = capture_checkpoint(session, game=game_b_row, checkpoint_type="OPENING", windows_config=windows_config, now=now, canonical_sportsbook=canonical_book)
         assert run_b.status == "PENDING"  # window hasn't opened yet - proves per-game independence
 
         # Idempotency: capturing game_a again must be a pure no-op.
-        run_a_again = capture_checkpoint(session, game=game_a_row, checkpoint_type="OPENING", windows_config=WINDOWS, now=now + timedelta(minutes=5), canonical_sportsbook=CANONICAL_BOOK)
+        run_a_again = capture_checkpoint(session, game=game_a_row, checkpoint_type="OPENING", windows_config=windows_config, now=now + timedelta(minutes=5), canonical_sportsbook=canonical_book)
         assert run_a_again.id == run_a.id
         assert run_a_again.captured_at == run_a.captured_at  # unchanged, not re-captured
 
@@ -212,10 +217,10 @@ def test_mocked_research_week_survives_a_full_reload():
     with session_scope() as session:
         market_repo = MarketRepository(session)
         # A fresh, later quote at a new line - this is what "the line moved" means.
-        market_repo.add_quote(market_id=market_good_id, sportsbook=CANONICAL_BOOK, line=Decimal("230.5"), over_price=-110, under_price=-110, retrieved_at=mid_time)
+        market_repo.add_quote(market_id=market_good_id, sportsbook=canonical_book, line=Decimal("230.5"), over_price=-110, under_price=-110, retrieved_at=mid_time)
         market_repo.add_quote(market_id=market_good_id, sportsbook="FANDUEL", line=Decimal("230.5"), over_price=-112, under_price=-108, retrieved_at=mid_time)
         game_a_row = market_repo.get_game(game_a_id)
-        run_mid = capture_checkpoint(session, game=game_a_row, checkpoint_type="MID", windows_config=WINDOWS, now=mid_time, canonical_sportsbook=CANONICAL_BOOK)
+        run_mid = capture_checkpoint(session, game=game_a_row, checkpoint_type="MID", windows_config=windows_config, now=mid_time, canonical_sportsbook=canonical_book)
         assert run_mid.status == "CAPTURED"
         mid_snapshot = market_repo.latest_snapshot(market_good_id)
         assert mid_snapshot.canonical_line == Decimal("230.5")  # moved from 225.5

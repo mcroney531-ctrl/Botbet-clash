@@ -23,6 +23,8 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 
+from sqlalchemy import text
+
 from app.core.clock import Clock, SystemClock
 from app.core.money import Money
 from app.db.mappers.competition import (
@@ -38,12 +40,15 @@ from app.db.models.competition import PassDecision as PassDecisionRow
 from app.db.models.competition import Ticket as TicketRow
 from app.db.models.competition import Wager as WagerRow
 from app.db.models.events import CompetitionEvent as CompetitionEventRow
+from app.db.models.season import SeasonCompetitor as SeasonCompetitorRow
+from app.db.models.season import Week as WeekRow
 from app.db.models.settlement import BankrollTransaction as BankrollTransactionRow
 from app.db.models.settlement import Settlement as SettlementRow
 from app.db.repositories.competitor_repository import CompetitorRepository
 from app.db.repositories.competition_repository import CompetitionRepository
 from app.db.repositories.event_repository import EventRepository
 from app.db.repositories.ledger_repository import LedgerRepository
+from app.db.repositories.market_repository import MarketRepository
 from app.db.repositories.season_repository import SeasonRepository
 from app.db.session import session_scope
 from app.domain.enums import (
@@ -59,6 +64,7 @@ from app.domain.enums import (
 )
 from app.domain.errors import (
     CompetitorBusted,
+    CrossSeasonReference,
     DuplicateSettlement,
     DuplicateWeeklyDecision,
     InvalidStakeIncrement,
@@ -72,6 +78,7 @@ from app.domain.errors import (
     StakeExceedsCap,
     TicketExpired,
     TicketNotExecutable,
+    WeekNotOpen,
 )
 from app.domain.lines import is_pushable_line
 from app.domain.models import SeasonRules as DomainSeasonRules
@@ -161,6 +168,24 @@ class SeasonCommissioner:
     def close_week(self, week_id: str) -> None:
         with session_scope() as session:
             week_uuid = uuid.UUID(week_id)
+            week = self._require_week_in_season(session, week_uuid)
+
+            # ARCHITECTURE.md §4: "close_week requires every game in the
+            # week to be research-settlement-locked (or otherwise
+            # finalized), not 'the week reached FINAL'." Game.status is
+            # the finalization signal available today; a week with no
+            # games attached (e.g. a Week 0 harness fixture) has nothing
+            # to block on.
+            unfinished = [
+                g.external_ref
+                for g in MarketRepository(session).games_for_week(self.season_id, week.week_number)
+                if g.status != "FINAL"
+            ]
+            if unfinished:
+                raise InvalidStateTransition(
+                    f"week {week_id} cannot be closed: game(s) {unfinished} are not yet FINAL"
+                )
+
             week = SeasonRepository(session).close_week(week_uuid, closed_at=self.clock.now())
             self._publish(session, week_id=week.id, season_competitor_id=None, event_type=CompetitionEventType.WEEK_CLOSED,
                            payload={"week_number": week.week_number})
@@ -186,8 +211,13 @@ class SeasonCommissioner:
         valid_until: datetime | None = None,
     ) -> str:
         with session_scope() as session:
-            competitor_repo = CompetitorRepository(session)
             week_uuid, competitor_uuid, market_uuid = uuid.UUID(week_id), uuid.UUID(season_competitor_id), uuid.UUID(market_id)
+
+            week = self._require_week_in_season(session, week_uuid)
+            self._require_competitor_in_season(session, competitor_uuid)
+            self._require_market_in_season(session, market_uuid)
+            self._require_week_open(week)
+            self._lock_competitor_week(session, competitor_uuid, week_uuid)
 
             self._ensure_solvent(session, competitor_uuid, week_uuid)
 
@@ -200,7 +230,7 @@ class SeasonCommissioner:
             comp_repo = CompetitionRepository(session)
             if urgency is Urgency.POUNCE:
                 rules = season_rules_to_domain(SeasonRepository(session).get_active_rules(self.season_id))
-                active = comp_repo.active_pounce_tickets(competitor_uuid, week_uuid)
+                active = comp_repo.active_pounce_tickets(competitor_uuid, week_uuid, self.clock.now())
                 if len(active) >= rules.pounce_limit:
                     raise PounceLimitExceeded(
                         f"competitor {season_competitor_id} already has {rules.pounce_limit} active Pounce ticket(s) for week {week_id}"
@@ -271,6 +301,12 @@ class SeasonCommissioner:
     ) -> str:
         with session_scope() as session:
             week_uuid, competitor_uuid = uuid.UUID(week_id), uuid.UUID(season_competitor_id)
+
+            week = self._require_week_in_season(session, week_uuid)
+            self._require_competitor_in_season(session, competitor_uuid)
+            self._require_week_open(week)
+            self._lock_competitor_week(session, competitor_uuid, week_uuid)
+
             competitor = CompetitorRepository(session).get(competitor_uuid)
             if competitor.status == "BUSTED":
                 raise CompetitorBusted(f"competitor {season_competitor_id} is BUSTED; real-money bankroll is frozen for the season")
@@ -323,6 +359,11 @@ class SeasonCommissioner:
             ticket_uuid = uuid.UUID(ticket_id)
             ticket = comp_repo.get_ticket(ticket_uuid)
 
+            # A ticket_id from another season's Commissioner must be
+            # rejected before anything below applies this season's rules
+            # to it or writes an event mislabeled with this season_id.
+            self._require_week_in_season(session, ticket.week_id)
+
             if ticket.status != "ISSUED":
                 raise TicketNotExecutable(f"ticket {ticket_id} is not ISSUED (status={ticket.status}); already resolved")
 
@@ -331,6 +372,9 @@ class SeasonCommissioner:
             ledger_repo = LedgerRepository(session)
 
             if status is WagerExecutionStatus.PLACED:
+                self._lock_competitor_week(session, competitor_uuid, ticket.week_id)
+                week = SeasonRepository(session).get_week(ticket.week_id)
+                self._require_week_open(week)
                 self._ensure_solvent(session, competitor_uuid, ticket.week_id)
                 if ticket.valid_until is not None and self.clock.now() > ticket.valid_until:
                     raise TicketExpired(f"ticket {ticket_id} expired at {ticket.valid_until}; cannot be PLACED")
@@ -429,6 +473,7 @@ class SeasonCommissioner:
             comp_repo = CompetitionRepository(session)
             wager_uuid = uuid.UUID(wager_id)
             wager = comp_repo.get_wager(wager_uuid)
+            self._require_competitor_in_season(session, wager.season_competitor_id)
 
             if wager.execution_status != "PLACED":
                 raise InvalidStateTransition(f"wager {wager_id} was never PLACED; nothing to settle")
@@ -529,6 +574,53 @@ class SeasonCommissioner:
 
     def _has_weekly_decision(self, comp_repo: CompetitionRepository, competitor_uuid: uuid.UUID, week_uuid: uuid.UUID) -> bool:
         return comp_repo.has_pass_decision(competitor_uuid, week_uuid) or comp_repo.has_placed_wager(competitor_uuid, week_uuid)
+
+    def _require_week_in_season(self, session, week_uuid: uuid.UUID) -> WeekRow:
+        """Every consequential operation is scoped to `self.season_id` —
+        a week/competitor/market id belonging to a different season must
+        be rejected before this Commissioner's rules are ever applied to
+        it or an event gets written under the wrong season_id."""
+
+        week = SeasonRepository(session).get_week(week_uuid)
+        if week.season_id != self.season_id:
+            raise CrossSeasonReference(f"week {week_uuid} belongs to season {week.season_id}, not this Commissioner's season {self.season_id}")
+        return week
+
+    def _require_competitor_in_season(self, session, competitor_uuid: uuid.UUID) -> SeasonCompetitorRow:
+        competitor = CompetitorRepository(session).get(competitor_uuid)
+        if competitor.season_id != self.season_id:
+            raise CrossSeasonReference(
+                f"season_competitor {competitor_uuid} belongs to season {competitor.season_id}, not this Commissioner's season {self.season_id}"
+            )
+        return competitor
+
+    def _require_market_in_season(self, session, market_uuid: uuid.UUID) -> None:
+        market_repo = MarketRepository(session)
+        market = market_repo.get_prop_market(market_uuid)
+        game = market_repo.get_game(market.game_id)
+        if game.season_id != self.season_id:
+            raise CrossSeasonReference(
+                f"market {market_uuid} belongs to season {game.season_id} (via game {game.id}), not this Commissioner's season {self.season_id}"
+            )
+
+    def _require_week_open(self, week: WeekRow) -> None:
+        if week.status != "OPENED":
+            raise WeekNotOpen(f"week {week.id} is not OPENED (status={week.status})")
+
+    def _lock_competitor_week(self, session, competitor_uuid: uuid.UUID, week_uuid: uuid.UUID) -> None:
+        """Serialize every consequential action for one (competitor, week)
+        pair within a single Postgres transaction, so two concurrent
+        requests can never both observe 'no official decision yet' (or
+        'zero active Pounces') and both proceed. `pg_advisory_xact_lock`
+        auto-releases at commit/rollback, matching this class's one-
+        transaction-per-method shape exactly — no separate unlock call
+        needed. A dedicated `weekly_decisions` table with
+        `UNIQUE(season_competitor_id, week_id)` would be the cleaner
+        long-term primitive; this is the V1 stopgap.
+        """
+
+        key = f"{competitor_uuid}:{week_uuid}"
+        session.execute(text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"), {"key": key})
 
     def _ensure_solvent(self, session, competitor_uuid: uuid.UUID, week_id: uuid.UUID | None = None) -> None:
         competitor_repo = CompetitorRepository(session)

@@ -71,3 +71,16 @@ class DuplicateWeeklyDecision(RuleViolation):
 class DuplicateSettlement(InvalidStateTransition):
     """A wager may only be settled once — settling it again would credit
     (or attempt to credit) the ledger twice for the same outcome."""
+
+
+class CrossSeasonReference(RuleViolation):
+    """A week/competitor/market id belonging to a different season was
+    passed to this season's Commissioner. Applying one season's rules to
+    another season's state (or writing an event mislabeled with the
+    wrong season_id) is exactly the bug DATABASE.md's season-scoping
+    fix exists to prevent."""
+
+
+class WeekNotOpen(InvalidStateTransition):
+    """A real-money action was attempted against a week that isn't
+    currently OPENED (not yet opened, or already closed)."""

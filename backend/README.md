@@ -90,6 +90,12 @@ covering all 25 tables in `DATABASE.md`'s structural core: `seasons`,
 not just checked in Python — including a defense-in-depth test that
 `settlements.wager_id UNIQUE` rejects a duplicate at the database level
 even if the application-level `DuplicateSettlement` check is bypassed.
+The hardening pass below added further `CHECK` constraints
+(probability/confidence bounds on `forecast_observations`/
+`market_snapshots`); since no real data exists yet in this dev/test
+environment, that migration was regenerated in place rather than layered
+as a second revision — a real deployment would add it as a new
+migration instead.
 
 **Repository / service boundaries** — `app/domain/` (Phase 1) has zero
 imports from `app/db/` or `app/services/`; the dependency runs one way.
@@ -108,8 +114,62 @@ Phase 1 already had tests for. Each public method is exactly one
 (settlement + return transaction + bankruptcy re-check) each land
 atomically, never partially.
 
-**Tests added** — 57 total (was 45 at the end of Phase 1):
-- 12 new pure unit tests (no DB): `test_market_math.py` (de-vig, consensus,
+**Hardening pass (post-review)** — four integrity gaps found once a real
+Commissioner and database existed to enforce them against:
+- **Cross-season references were not rejected.** `SeasonCommissioner`
+  now validates every week/competitor/market id against `self.season_id`
+  before applying any rule to it (`_require_week_in_season`,
+  `_require_competitor_in_season`, `_require_market_in_season`,
+  raising the new `CrossSeasonReference`) — including validating a
+  ticket's own week on `record_execution`, so a ticket id from a foreign
+  season's Commissioner is rejected too, not just raw ids passed
+  directly. Proven with adversarial tests that mix Season 1/Season 2 ids
+  and confirm the transaction writes nothing.
+- **The week lifecycle wasn't enforced.** `issue_ticket` and
+  `record_pass` now require `week.status == "OPENED"` (`WeekNotOpen`
+  otherwise), and `close_week` now requires every game scheduled for
+  that week to be `FINAL` before it will close (a week with no games
+  attached has nothing to block on).
+- **No concurrency protection.** Two simultaneous requests could both
+  observe "no official decision yet" (or "zero active Pounces") under
+  READ COMMITTED and both proceed — there was no DB-level exclusion on
+  either check. Added `_lock_competitor_week`, a
+  `pg_advisory_xact_lock` keyed on `(season_competitor_id, week_id)`
+  acquired at the start of `issue_ticket`, `record_pass`, and
+  `record_execution`'s `PLACED` path; it auto-releases at
+  commit/rollback, matching this class's one-transaction-per-method
+  shape. **Verified the fix actually does something**: temporarily
+  reverting the lock made the new race tests fail deterministically on
+  every run (not flaky — every run), confirming the race is real and
+  the lock is what closes it. A dedicated `weekly_decisions` table with
+  `UNIQUE(season_competitor_id, week_id)` would be the cleaner
+  long-term primitive; this is the documented V1 stopgap.
+- **An expired Pounce still counted as active.**
+  `active_pounce_tickets` checked `status == ISSUED` but never
+  `valid_until`, so an expired-but-unretired Pounce could block a
+  legal replacement (RULES.md §74). Fixed at the query level.
+
+Two research-data integrity items landed alongside these: `CHECK`
+constraints on `forecast_observations`/`market_snapshots` enforcing
+`0 ≤ probability ≤ 1` and `1 ≤ confidence ≤ 10` at the database level
+(not just in Python), and a cohort-integrity check — if two competitors'
+"standardized" observations for the same checkpoint somehow point at
+different evidence snapshots (which atomic checkpoint capture is
+supposed to make impossible), the cohort now excludes that row with
+`OTHER` rather than silently scoring it as a fair comparison.
+
+**Declined from the same review round:** rejecting tickets on
+Week 0 / non-real-money weeks. RULES.md §3 and constitution §6 are
+explicit that Week 0 exists specifically to exercise the full weekly
+lifecycle — including ticket issuance and "fake wager execution" —
+through the *same* code paths as a real week, distinguished only by
+`is_real_money=False` for downstream settlement/standings treatment.
+Blocking ticket issuance on that flag would defeat Week 0's purpose
+rather than harden anything; flagging this back rather than
+implementing it silently.
+
+**Tests added** — 74 total (was 45 at the end of Phase 1):
+- 12 pure unit tests (no DB): `test_market_math.py` (de-vig, consensus,
   quantization) plus a `Money.floor_to_increment` regression already
   covered under Phase 1's suite.
 - 4 Phase 2A integration tests (`test_season_commissioner.py`): the full
@@ -120,6 +180,18 @@ atomically, never partially.
   constraint test.
 - 1 Phase 2B integration test (`test_forecast_lab_mocked_week.py`): the
   full 20-step mocked research week — see below.
+- 10 hardening tests (`test_commissioner_integrity.py`): cross-season
+  rejection (week/competitor/market/ticket), week-not-opened rejection
+  (issue + pass), close-week games-not-final rejection and success, and
+  Pounce expiry (expired doesn't block, unexpired still does).
+- 2 concurrency tests (`test_concurrency.py`, 10 racing iterations each):
+  simultaneous placements never both succeed, simultaneous Pounces never
+  both succeed — both independently confirmed to fail reliably with the
+  lock removed.
+- 5 forecast-data integrity tests (`test_forecast_lab_constraints.py`):
+  out-of-range probability/confidence rejected by the database, and the
+  cohort evidence-snapshot-mismatch check (both the failure and the
+  matching-snapshot success case).
 
 **Mock week result** — `test_forecast_lab_mocked_week.py` passes end to
 end: three games with independent kickoffs; a benchmark slate plan

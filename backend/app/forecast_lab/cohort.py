@@ -75,6 +75,18 @@ def evaluate_common_cohort(
                     exclusion_reason = obs.exclusion_reason or f"{label}_FORECAST_INVALID"
                     break
 
+        # Integrity check: at a standardized checkpoint (checkpoint_type
+        # is not None), the whole point of atomic checkpoint capture
+        # (ARCHITECTURE.md §4) is that every competitor is handed the
+        # identical evidence snapshot. If their observations somehow
+        # point at different snapshots, they weren't actually compared
+        # under the same information - that's a system error, not a
+        # market to silently score.
+        if exclusion_reason is None and checkpoint_type is not None:
+            evidence_snapshot_ids = {obs.evidence_snapshot_id for obs in observations.values()}
+            if len(evidence_snapshot_ids) > 1:
+                exclusion_reason = "OTHER"
+
         if exclusion_reason is None:
             settlement = research_repo.get_for_market(market_id)
             if settlement is None:
