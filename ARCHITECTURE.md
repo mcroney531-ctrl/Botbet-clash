@@ -453,6 +453,13 @@ settled state.
 
 ## 13. Build sequence
 
-Follows constitution §117 phases 0–13 in order; this repository currently
-implements **Phase 1 (domain skeleton, fake markets)**. See `DATABASE.md`
-for the schema those Phase 1 models are drawn from.
+Follows constitution §117 phases 0–13 in order. This repository currently
+implements Phase 1 (domain skeleton, fake markets) plus Phase 2 split into
+**2A** (PostgreSQL persistence for the Phase 1 domain, under `app/db/` +
+`app/services/season_commissioner.py`) and **2B** (Forecast Lab core —
+market math, snapshots, checkpoints, the precommitted benchmark slate,
+forecast observations, research settlement, and scoring, under
+`app/forecast_lab/`), against mocked/fixture data throughout — no real AI
+provider or sports-data provider is wired in yet (Phases 3 and 6). See
+`DATABASE.md` for the schema and `backend/README.md` for the current
+module/test layout and the Phase 2 readout.
