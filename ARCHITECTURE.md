@@ -92,38 +92,74 @@ No competitor agent grades its own performance; all scoring
 (`forecast_lab`, `attribution`) is computed by the Commissioner-owned
 pipeline against data the agent cannot write to after the fact.
 
-## 4. Weekly orchestration (state machine)
+## 4. Weekly orchestration (two independent state machines)
+
+**v2 correction:** v1 modeled this as one linear per-week state machine
+(`OPENING_SNAPSHOT_CAPTURED → ... → MID_SNAPSHOT_CAPTURED → ... →
+WEEKLY_DECISIONS_LOCKED → TICKETS_ISSUED → ...`). That's wrong on two
+independent axes and was corrected as follows.
+
+**Axis 1 — Forecast Lab checkpoint progression is per-game, not
+per-week.** A week's games kick off at different times (Thursday, Sunday
+early/late, Sunday night, Monday) — RULES.md §9 already says checkpoints
+are kickoff-relative, so there is no single "the week hit MID" moment.
+Each game independently drives its own `checkpoint_runs` rows
+(DATABASE.md §4):
 
 ```
-WEEK_OPENED
-  → BENCHMARK_SLATE_BUILT
-  → OPENING_SNAPSHOT_CAPTURED
-  → OPENING_FORECASTS_COLLECTED (all 3 competitors)
-  → [ongoing] WATCHLISTS_ACTIVE, OPEN_MARKET_DISCOVERY,
-              EVENT_TRIGGERED_REVIEWS, POUNCE_WINDOW
-  → MID_SNAPSHOT_CAPTURED → MID_FORECASTS_COLLECTED
-  → FINAL_SNAPSHOT_CAPTURED → FINAL_FORECASTS_COLLECTED
-  → WEEKLY_DECISIONS_LOCKED (BET or PASS per competitor)
-  → TICKETS_ISSUED → HUMAN_EXECUTION_RECORDED
-  → GAMES_COMPLETE
-  → SPORTSBOOK_SETTLED
-  → RESEARCH_SETTLEMENT_LOCKED (T+72h)
-  → ATTRIBUTION_CLASSIFIED
-  → WEEKLY_RECEIPT_GENERATED
-  → WEEK_CLOSED
+per game:
+  CHECKPOINT_PENDING(OPENING) → CHECKPOINT_CAPTURED(OPENING) → FORECASTS_COLLECTED(OPENING)
+  CHECKPOINT_PENDING(MID)     → CHECKPOINT_CAPTURED(MID)     → FORECASTS_COLLECTED(MID)
+  CHECKPOINT_PENDING(FINAL)   → CHECKPOINT_CAPTURED(FINAL)   → FORECASTS_COLLECTED(FINAL)
+  → GAME_COMPLETE → RESEARCH_SETTLEMENT_LOCKED (T+72h after this game)
 ```
 
-Each transition is driven by the Commissioner control panel (manual
-trigger in Week 0 / early season) or a scheduled job (§6) later. Every
-transition emits a `CompetitionEvent`.
+A `Week` (DATABASE.md §1) tracks only aggregate bookkeeping —
+`OPENED → ... → GAMES_COMPLETE → SETTLED → CLOSED` — derived from whether
+all its games have reached the corresponding per-game state, not a
+checkpoint stage in its own right. `close_week` requires every game in
+the week to be `RESEARCH_SETTLEMENT_LOCKED` (or otherwise finalized),
+not "the week reached FINAL."
 
-Checkpoint capture (`OPENING`/`MID`/`FINAL`) is **atomic per constitution
-§27**: freeze market + evidence state first, then fan out the identical
-snapshot to all three `CompetitorAgent`s, then persist all three
-responses against that one `evidence_snapshot_id`. The market must not be
-allowed to move underneath the three calls — the orchestrator takes the
-snapshot once, before any agent call, and every agent reads from the
-persisted snapshot object, not from a live provider call.
+Checkpoint capture is still **atomic per constitution §27** within a
+single `(game_id, checkpoint_type)` run: freeze market + evidence state
+for every market in that game first, then fan out the identical snapshots
+to all three `CompetitorAgent`s, then persist all three responses against
+those `evidence_snapshot_id`s. The market must not be allowed to move
+underneath the three calls — the orchestrator takes the snapshot once,
+before any agent call, and every agent reads from the persisted snapshot
+object, not from a live provider call.
+
+**Axis 2 — a competitor's weekly decision state is independent of
+checkpoint progression, and is per (season_competitor, week), not
+per-week.** A Pounce is explicitly allowed to fire Tuesday, long before
+any game's MID or FINAL checkpoint (constitution §59, §73) — so
+"decisions locked" can never be a single week-wide gate that Forecast Lab
+checkpoints must pass through first. This state is **derived**, not
+stored as its own column — computed on read from the existing
+`tickets`/`wagers`/`pass_decisions` rows for that
+`(season_competitor_id, week_id)`, the same append-only-audit principle
+used everywhere else in this schema (a redundant stored status could
+drift out of sync with the rows that are actually authoritative):
+
+```
+RESEARCHING                              -- no ticket/pass yet this week
+  → TICKET_PENDING (an ISSUED ticket exists, urgency WATCH/LEAN/STRONG/POUNCE)
+  → BET_EXECUTED (a wager with execution_status = PLACED exists)         [terminal]
+  → TICKET_EXPIRED_RETRY_ALLOWED (ticket EXPIRED/SKIPPED, no PLACED wager yet
+     for this competitor+week — a fresh ticket may still be issued)
+      → back to TICKET_PENDING, or:
+RESEARCHING → PASS_LOCKED (a pass_decisions row exists)                  [terminal]
+```
+
+`SeasonService`/`CommissionerService` enforce the two terminal states as
+mutually exclusive and single-use per `(season_competitor_id, week_id)`
+(constitution §12: at most one official wager per competitor per week) —
+this is exactly what `DuplicateWeeklyDecision` guards in the Phase 1
+implementation. Nothing about reaching `BET_EXECUTED` or `PASS_LOCKED`
+for one competitor requires or blocks any other competitor's state, and
+nothing about it requires any particular Forecast Lab checkpoint to have
+run.
 
 ## 5. AI orchestration
 
@@ -145,11 +181,18 @@ class CompetitorAgent(Protocol):
 Provider adapters (`OpenAIAgent`, `ClaudeAgent`, `GeminiAgent`) implement
 this and own all provider-specific prompt formatting and response
 parsing. Every call records: competitor, provider, exact model id,
-timestamp, prompt_version, schema_version, evidence_snapshot_id,
-market_snapshot_id, raw structured response, validated response, and
-bankroll_at_decision (constitution §106) — this is written by the
-orchestrator wrapper around every adapter call, not by the adapters
-themselves, so it can never be skipped.
+timestamp, prompt_version, schema_version, raw structured response,
+validated response, and bankroll_at_decision (constitution §106) — this
+is written by the orchestrator wrapper around every adapter call, not by
+the adapters themselves, so it can never be skipped. For a single-market
+call this also includes `evidence_snapshot_id`/`market_snapshot_id`
+directly on the `agent_sessions` row; for a batched
+`forecast_benchmark(slate, snapshot_ids)` call covering N props, those two
+columns stay null and the wrapper instead writes one
+`agent_session_evidence_snapshots` row per snapshot in the batch
+(DATABASE.md §6) — each resulting `ForecastObservation` still carries its
+own `evidence_snapshot_id`, so per-prop lineage never depends on the
+batch-level join table.
 
 **Structured output failure handling** (constitution §54): schema
 validation failure → request correction → retry once → reject and log
@@ -170,13 +213,17 @@ panel button) or later put behind a scheduler (APScheduler/cron):
 
 | Job | Trigger | Idempotency key |
 |---|---|---|
-| `capture_checkpoint(week, checkpoint_type)` | window open, manual or scheduled | `(week_id, checkpoint_type)` — no-ops if already captured |
-| `poll_market_events(week)` | interval | dedupes via `MarketEvent` fingerprint |
-| `run_benchmark_forecast(week, checkpoint)` | after checkpoint capture | `(week_id, checkpoint, competitor_id)` |
-| `lock_research_settlement(week)` | T+72h after last game | `week_id` — refuses to re-lock once `research_locked_at` set |
+| `capture_checkpoint(game, checkpoint_type)` | that game's kickoff-relative window open, manual or scheduled | `(game_id, checkpoint_type)` — no-ops if `checkpoint_runs` row already `CAPTURED` |
+| `poll_market_events(game)` | interval | dedupes via `MarketEvent` fingerprint |
+| `run_benchmark_forecast(game, checkpoint, season_competitor)` | after that game's checkpoint capture | `(game_id, checkpoint, season_competitor_id)` |
+| `lock_research_settlement(game)` | T+72h after that game completes | `game_id` — refuses to re-lock once `research_locked_at` set (per market) |
 | `settle_sportsbook_wager(wager_id)` | manual (human reports result) | `wager_id` |
-| `close_week(week)` | all settlements done | `week_id` |
+| `close_week(week)` | every game in the week is research-settlement-locked (or otherwise finalized) | `week_id` |
 | `generate_weekly_receipt(week)` | after `close_week` | `week_id` |
+
+A Thursday game's `capture_checkpoint`/`run_benchmark_forecast`/
+`lock_research_settlement` cycle runs and completes independently of a
+Monday game in the same week — this is the mechanism behind Axis 1 in §4.
 
 All jobs are pure functions over the DB: given the same inputs and current
 DB state, re-running is safe (either no-ops or produces the same result).
@@ -257,7 +304,7 @@ Concretely:
 - Every AI decision row carries its `evidence_snapshot_id` and
   `market_snapshot_id` foreign keys — never a denormalized copy that could
   drift from the snapshot.
-- `AuditLog` is a thin read-side: given a `week_id` (or `competitor_id`,
+- `AuditLog` is a thin read-side: given a `week_id` (or `season_competitor_id`,
   or `market_id`), it walks `CompetitionEvent` + the append-only tables in
   timestamp order and renders a full timeline. It contains no business
   logic of its own — if it did, it could disagree with the system it's

@@ -84,6 +84,14 @@ class Week:
 
 @dataclass(slots=True)
 class Competitor:
+    """A competitor *within one season* — this maps to `season_competitors`
+    in DATABASE.md, not the bare cross-season `competitors` identity row.
+    Phase 1 only ever runs one season in memory, so that split doesn't
+    exist here yet; a Phase 2 persistence layer introduces a separate
+    cross-season identity table and points every FK below at this row's
+    season-scoped id instead of a bare provider string.
+    """
+
     id: str
     provider: str
     model_identifier: str

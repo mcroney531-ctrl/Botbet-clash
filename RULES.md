@@ -7,11 +7,21 @@ the system can be built and tested. Every value here is versioned via
 `SeasonRules.rules_version` and must not change mid-season except for a
 recorded emergency amendment (see §14).
 
+**`2026-w0.2` changelog (pre-Phase-2 correction pass):** added §6a —
+official Competition wagers are now restricted to the same non-pushable
+lines as Forecast Lab, and `anytime_td` is dropped from V1 entirely. This
+is a genuine scope tightening versus the constitution's original
+allowance (constitution §13, §22), made because the ticket/stake schema
+only prices binary OVER/UNDER markets — see DATABASE.md §7 for the
+technical reasoning. Everywhere else in this document that says
+"competitor," read it as "season-competitor" (DATABASE.md §1) — a
+model's identity is scoped to one season's roster.
+
 ## 1. Season basics
 
 | Field | Value |
 |---|---|
-| `rules_version` | `"2026-w0.1"` |
+| `rules_version` | `"2026-w0.2"` |
 | `starting_bankroll_cents` | `1500` ($15.00) |
 | `competitors` | `openai`, `anthropic`, `google` |
 | `sport` | NFL |
@@ -87,9 +97,31 @@ receptions
 receiving_yards
 ```
 
-`anytime_td` is Competition-eligible (real wagers) but excluded from V1
-Forecast Lab benchmark construction. Market eligibility is configurable via
-`SeasonRules.supported_prop_types`.
+Market eligibility is configurable via `SeasonRules.supported_prop_types`.
+
+## 6a. Competition lines must be non-pushable (V1 scope)
+
+The constitution originally allowed integer (pushable) lines and
+`anytime_td` as Competition-eligible even where Forecast Lab excluded
+them (constitution §13, §22). That's reverted for V1:
+
+- `SeasonRules.competition_requires_nonpushable_line = true` — an
+  official BET ticket must use the same non-pushable-line eligibility
+  test as the Forecast Lab benchmark cohort (§ RESEARCH_INELIGIBLE_PUSHABLE_LINE
+  in reverse: a market failing that same test is also Competition-
+  ineligible for V1).
+- `anytime_td` is dropped from `supported_prop_types` for V1 entirely —
+  it has no numeric line at all, so it doesn't fit the ticket schema's
+  `observed_line` / OVER-UNDER model regardless of pushability.
+
+Reason: every stake-sizing and probability field in this system
+(`model_probability_over`, Kelly reference, EV) is binary. A pushable
+integer line or a TD-scorer market is really a three-outcome bet
+(OVER/PUSH/UNDER, or SCORES/DOESN'T), and pricing it correctly needs
+`P(push)`/a proper multi-outcome model, not just `model_probability_over`.
+Building that now would complicate Week 0 for a case the constitution
+itself says can wait ("Add ternary modeling later" is the right call).
+Both may return in a later phase behind real three-outcome pricing.
 
 ## 7. Benchmark slate
 
