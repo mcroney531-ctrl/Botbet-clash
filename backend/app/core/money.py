@@ -68,6 +68,15 @@ class Money:
     def min(self, other: "Money") -> "Money":
         return self if self.cents <= other.cents else other
 
+    def floor_to_increment(self, increment: "Money") -> "Money":
+        """Round down to the nearest multiple of `increment` (e.g. a
+        sportsbook's practical stake increment). A cap that isn't itself
+        placeable in whole increments is not actually a usable ceiling."""
+
+        if increment.cents <= 0:
+            raise ValueError("increment must be positive")
+        return Money((self.cents // increment.cents) * increment.cents)
+
     def is_negative(self) -> bool:
         return self.cents < 0
 

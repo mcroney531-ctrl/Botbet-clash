@@ -25,6 +25,35 @@ class PounceLimitExceeded(RuleViolation):
 
 
 class StakeExceedsCap(RuleViolation):
+    """actual_stake exceeds the ticket's final_allowed_stake or current available bankroll."""
+
+
+class StakeBelowMinimum(RuleViolation):
+    pass
+
+
+class InvalidStakeIncrement(RuleViolation):
+    pass
+
+
+class PushableLineNotAllowed(RuleViolation):
+    """RULES.md §6a: V1 official Competition wagers must use a non-pushable line."""
+
+
+class TicketNotExecutable(InvalidStateTransition):
+    """record_execution was called on a ticket that isn't ISSUED (already
+    resolved by an earlier call)."""
+
+
+class TicketExpired(RuleViolation):
+    """record_execution(status=PLACED) was attempted after ticket.valid_until."""
+
+
+class LineOutsideAcceptableBoundary(RuleViolation):
+    pass
+
+
+class PriceOutsideAcceptableBoundary(RuleViolation):
     pass
 
 

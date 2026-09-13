@@ -33,6 +33,15 @@ def test_ordering_and_min():
     assert Money(300).min(Money(200)) == Money(200)
 
 
+def test_floor_to_increment():
+    assert Money(603).floor_to_increment(Money(25)) == Money(600)
+    assert Money(624).floor_to_increment(Money(25)) == Money(600)
+    assert Money(625).floor_to_increment(Money(25)) == Money(625)
+    assert Money(18).floor_to_increment(Money(25)) == Money(0)
+    with pytest.raises(ValueError):
+        Money(100).floor_to_increment(Money(0))
+
+
 def test_as_dollars_str():
     assert Money(1500).as_dollars_str() == "$15.00"
     assert Money(-25).as_dollars_str() == "-$0.25"

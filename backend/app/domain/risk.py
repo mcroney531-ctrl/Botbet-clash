@@ -15,7 +15,7 @@ from __future__ import annotations
 from decimal import Decimal
 
 from app.core.money import Money
-from app.domain.enums import Urgency
+from app.domain.enums import Side, Urgency
 from app.domain.models import SeasonRules
 
 
@@ -68,10 +68,50 @@ def resolve_final_allowed_stake(
     The model may always request less than the cap; it may never exceed
     it. This never looks at the Kelly reference — that number is stored
     for analysis (RULES.md §10 / constitution §64), not enforced as a
-    ceiling.
+    ceiling. The cap itself is floored to `stake_increment` first, so the
+    returned value is always something `record_execution` can actually
+    accept — a nominal cap that isn't a whole number of increments would
+    be a ceiling nothing could ever legally be placed at.
     """
 
     if model_requested_stake.is_negative():
         raise ValueError("model_requested_stake cannot be negative")
-    cap = rules.cap_for(available_bankroll, urgency)
+    cap = rules.cap_for(available_bankroll, urgency).floor_to_increment(rules.stake_increment)
     return model_requested_stake.min(cap)
+
+
+def price_is_acceptable(worst_acceptable_price: int, actual_price: int) -> bool:
+    """True if `actual_price` is at least as good for the bettor as
+    `worst_acceptable_price` — i.e. the execution didn't get worse than the
+    boundary the ticket named.
+
+    For valid American odds (which are never in the open interval
+    (-100, 100)), plain signed-integer comparison happens to already be
+    monotonic in "how good is this price for the bettor" — -115 > -120
+    (better), and any positive price outnumbers any negative one (also
+    better) — so `actual_price >= worst_acceptable_price` would score the
+    same verdict here. The reason to go through decimal odds anyway: it's
+    the version that can't be quietly broken by a sign-unaware refactor
+    (e.g. someone "simplifying" this to compare `abs(price)`, which
+    inverts the ordering for positive prices), and it fails loudly
+    (`ValueError`) instead of silently misordering if a price of 0 or
+    something else outside the valid American-odds range ever shows up.
+    """
+
+    return american_to_decimal_odds(actual_price) >= american_to_decimal_odds(worst_acceptable_price)
+
+
+def line_is_acceptable(side: Side, worst_acceptable_line: Decimal, actual_line: Decimal) -> bool:
+    """True if `actual_line` has not moved past the ticket's boundary
+    against the bettor. Which direction is "against the bettor" depends
+    on the side:
+
+    - OVER: a higher line is harder to clear, so the boundary is a
+      ceiling — actual_line must be <= worst_acceptable_line.
+    - UNDER: a lower line is harder to stay under, so the boundary is a
+      floor — actual_line must be >= worst_acceptable_line.
+    """
+
+    if side is Side.OVER:
+        return actual_line <= worst_acceptable_line
+    return actual_line >= worst_acceptable_line

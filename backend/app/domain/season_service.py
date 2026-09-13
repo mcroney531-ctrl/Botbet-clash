@@ -27,10 +27,19 @@ from app.domain.errors import (
     CompetitorBusted,
     DuplicateWeeklyDecision,
     InvalidStateTransition,
+    InvalidStakeIncrement,
+    LineOutsideAcceptableBoundary,
     PounceLimitExceeded,
+    PriceOutsideAcceptableBoundary,
+    PushableLineNotAllowed,
+    StakeBelowMinimum,
+    StakeExceedsCap,
+    TicketExpired,
+    TicketNotExecutable,
 )
 from app.domain.events import CompetitionEventBus
 from app.domain.ledger import BankrollLedger
+from app.domain.lines import is_pushable_line
 from app.domain.models import (
     BankrollTransaction,
     Competitor,
@@ -44,7 +53,12 @@ from app.domain.models import (
     Wager,
     Week,
 )
-from app.domain.risk import kelly_reference_stake, resolve_final_allowed_stake
+from app.domain.risk import (
+    kelly_reference_stake,
+    line_is_acceptable,
+    price_is_acceptable,
+    resolve_final_allowed_stake,
+)
 from app.core.money import Money
 
 
@@ -101,10 +115,15 @@ class SeasonService:
         model_requested_stake: Money,
         why_now: str,
         acceptable_line_boundary: Decimal | None = None,
-        maximum_acceptable_price: int | None = None,
+        worst_acceptable_price: int | None = None,
         valid_until: datetime | None = None,
     ) -> Ticket:
         self._require_active(competitor)
+        if is_pushable_line(market.line):
+            raise PushableLineNotAllowed(
+                f"market {market.id} has a pushable line ({market.line}); "
+                "RULES.md §6a requires non-pushable lines for V1 Competition wagers"
+            )
         if urgency is Urgency.POUNCE and len(self._active_pounce_tickets(competitor.id, week.id)) >= self.season.rules.pounce_limit:
             raise PounceLimitExceeded(
                 f"competitor {competitor.id} already has {self.season.rules.pounce_limit} active Pounce ticket(s) for week {week.id}"
@@ -129,7 +148,7 @@ class SeasonService:
             observed_line=market.line,
             why_now=why_now,
             acceptable_line_boundary=acceptable_line_boundary,
-            maximum_acceptable_price=maximum_acceptable_price,
+            worst_acceptable_price=worst_acceptable_price,
             valid_until=valid_until,
             created_at=self.clock.now(),
         )
@@ -186,16 +205,60 @@ class SeasonService:
         actual_price: int | None = None,
         actual_stake: Money | None = None,
     ) -> Wager:
+        """The authoritative validation gate for turning a ticket into a
+        wager (constitution §75-76). A ticket can only be resolved once:
+        every non-PLACED status also permanently retires it, so this can
+        never be called twice for the same ticket. PLACED additionally
+        enforces every hard constraint the ticket carries — none of these
+        can be bypassed by whatever recorded the human's execution input.
+        """
+
         competitor = self._competitors[ticket.competitor_id]
         self._require_active(competitor)
 
+        if ticket.status is not TicketStatus.ISSUED:
+            raise TicketNotExecutable(f"ticket {ticket.id} is not ISSUED (status={ticket.status}); already resolved")
+
         if status is WagerExecutionStatus.PLACED:
+            if ticket.valid_until is not None and self.clock.now() > ticket.valid_until:
+                raise TicketExpired(f"ticket {ticket.id} expired at {ticket.valid_until}; cannot be PLACED")
             if self._has_weekly_decision(ticket.competitor_id, ticket.week_id):
                 raise DuplicateWeeklyDecision(
                     f"competitor {ticket.competitor_id} already has an official decision for week {ticket.week_id}"
                 )
-            if actual_stake is None:
-                raise ValueError("actual_stake is required when execution status is PLACED")
+            if actual_stake is None or actual_line is None or actual_price is None:
+                raise ValueError("actual_stake, actual_line, and actual_price are all required when status is PLACED")
+
+            available_before = self.ledger.available_balance(ticket.competitor_id)
+
+            if actual_stake > ticket.final_allowed_stake:
+                raise StakeExceedsCap(
+                    f"actual_stake {actual_stake} exceeds ticket {ticket.id}'s final_allowed_stake {ticket.final_allowed_stake}"
+                )
+            if actual_stake > available_before:
+                raise StakeExceedsCap(f"actual_stake {actual_stake} exceeds available bankroll {available_before}")
+            if actual_stake < self.season.rules.minimum_stake:
+                raise StakeBelowMinimum(f"actual_stake {actual_stake} is below minimum_stake {self.season.rules.minimum_stake}")
+            increment = self.season.rules.stake_increment.cents
+            if increment > 0 and actual_stake.cents % increment != 0:
+                raise InvalidStakeIncrement(
+                    f"actual_stake {actual_stake} is not a multiple of stake_increment {self.season.rules.stake_increment}"
+                )
+
+            if ticket.acceptable_line_boundary is not None and not line_is_acceptable(
+                ticket.side, ticket.acceptable_line_boundary, actual_line
+            ):
+                raise LineOutsideAcceptableBoundary(
+                    f"actual_line {actual_line} is past ticket {ticket.id}'s acceptable boundary "
+                    f"{ticket.acceptable_line_boundary} for side {ticket.side}"
+                )
+            if ticket.worst_acceptable_price is not None and not price_is_acceptable(
+                ticket.worst_acceptable_price, actual_price
+            ):
+                raise PriceOutsideAcceptableBoundary(
+                    f"actual_price {actual_price} is worse than ticket {ticket.id}'s worst_acceptable_price "
+                    f"{ticket.worst_acceptable_price}"
+                )
 
         wager = Wager(
             ticket_id=ticket.id,
@@ -214,6 +277,10 @@ class SeasonService:
 
         if status is WagerExecutionStatus.PLACED:
             assert actual_stake is not None
+            # Captured before the STAKE debit below, so this mirrors
+            # `bankroll_at_decision` (constitution §106): "what bankroll was
+            # this wager sized against," not the post-debit remainder.
+            wager.bankroll_at_execution = available_before
             self.ledger.record(
                 BankrollTransaction(
                     competitor_id=ticket.competitor_id,
@@ -224,7 +291,6 @@ class SeasonService:
                     reason="wager placed",
                 )
             )
-            wager.bankroll_at_execution = self.ledger.available_balance(ticket.competitor_id)
             ticket.status = TicketStatus.EXECUTED
             self._publish(
                 ticket.week_id,
@@ -349,7 +415,17 @@ class SeasonService:
         if competitor.status is CompetitorStatus.BUSTED:
             return
         available = self.ledger.available_balance(competitor_id)
-        if available < self.season.rules.minimum_stake:
+        # "available < minimum_stake" (constitution §79's literal wording)
+        # is a special case of the real condition: no legal wager is
+        # possible once even the most permissive (exceptional/Pounce) cap
+        # can no longer clear the minimum stake. That's a strict
+        # generalization — exceptional_cap(available) <= available always
+        # — so this also catches the case where a competitor still has a
+        # nonzero balance but every stake cap available to them now rounds
+        # under the minimum, which record_execution would otherwise reject
+        # forever without ever actually declaring them BUSTED.
+        floored_cap = self.season.rules.exceptional_cap(available).floor_to_increment(self.season.rules.stake_increment)
+        if floored_cap < self.season.rules.minimum_stake:
             competitor.status = CompetitorStatus.BUSTED
             self._publish(
                 week_id,

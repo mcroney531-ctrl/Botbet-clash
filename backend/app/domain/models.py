@@ -139,7 +139,7 @@ class Ticket:
     why_now: str
     id: str = field(default_factory=new_id)
     acceptable_line_boundary: Decimal | None = None
-    maximum_acceptable_price: int | None = None
+    worst_acceptable_price: int | None = None
     valid_until: datetime | None = None
     status: TicketStatus = TicketStatus.ISSUED
     created_at: datetime | None = None

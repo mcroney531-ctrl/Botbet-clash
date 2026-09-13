@@ -162,6 +162,8 @@ def test_only_one_official_decision_per_week(service: SeasonService, week1: Week
         ticket=ticket,
         status=WagerExecutionStatus.PLACED,
         sportsbook="DRAFTKINGS",
+        actual_line=Decimal("52.5"),
+        actual_price=-115,
         actual_stake=Money.from_dollars_str("2.00"),
     )
     with pytest.raises(DuplicateWeeklyDecision):
@@ -175,13 +177,13 @@ def test_bankruptcy_freezes_competitor(service: SeasonService, week1: Week):
     # how bankruptcy would actually unfold over a real season).
     week = week1
     for i in range(20):
-        available = service.ledger.available_balance("openai")
-        if available < service.season.rules.minimum_stake:
+        if competitor.status is CompetitorStatus.BUSTED:
             break
         if i > 0:
             week = service.open_week(Week(season_id=service.season.id, week_number=i + 1, is_real_money=True))
         # Use the exceptional (Pounce) cap to drain the bankroll in a
         # reasonable number of iterations for the test.
+        available = service.ledger.available_balance("openai")
         cap = service.season.rules.exceptional_cap(available)
         ticket = service.issue_ticket(
             week=week,
@@ -198,12 +200,19 @@ def test_bankruptcy_freezes_competitor(service: SeasonService, week1: Week):
             ticket=ticket,
             status=WagerExecutionStatus.PLACED,
             sportsbook="DRAFTKINGS",
-            actual_stake=cap,
+            actual_line=Decimal("52.5"),
+            actual_price=-115,
+            actual_stake=ticket.final_allowed_stake,  # already floored to a legal increment
         )
         service.settle_wager(wager=wager, result=SportsbookResult.LOSS, payout=Money.zero())
 
     assert competitor.status is CompetitorStatus.BUSTED
-    assert service.ledger.available_balance("openai") < service.season.rules.minimum_stake
+    # Not necessarily below minimum_stake outright — busted also covers the
+    # case where the balance is nonzero but even the exceptional cap can no
+    # longer clear the minimum stake (see _maybe_declare_bankruptcy).
+    final_available = service.ledger.available_balance("openai")
+    floored_cap = service.season.rules.exceptional_cap(final_available).floor_to_increment(service.season.rules.stake_increment)
+    assert floored_cap < service.season.rules.minimum_stake
 
     with pytest.raises(CompetitorBusted):
         service.issue_ticket(

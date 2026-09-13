@@ -14,6 +14,17 @@ batched AI calls had nowhere to record multiple evidence inputs (§6),
 competitors were not season-scoped (§1), and `pass_decisions` had a
 uniqueness bug. See each section below for the fix and rationale.
 
+**v3 note (second review pass):** `prop_markets.is_pushable` removed —
+same mistake as the v2 research-settlement fix, approached from another
+angle (§2). See RULES.md's own v2 changelog for the companion §6a/§8
+contradiction fix and ARCHITECTURE.md §4a for the precommitted benchmark-
+slate algorithm added to resolve per-game Opening timing. Phase 1 code
+also got a hardening pass in this round: `record_execution` is now the
+sole authoritative validation gate (stake vs. cap/bankroll/minimum/
+increment, ticket state/expiry, side-aware line and price boundaries) —
+see `backend/app/domain/season_service.py` and the adversarial tests in
+`backend/app/tests/test_record_execution_adversarial.py`.
+
 Conventions used throughout:
 
 - All money is `BIGINT` cents. Never `NUMERIC`/`FLOAT` for money.
@@ -134,12 +145,13 @@ players
   team              TEXT
   position          TEXT
 
-prop_markets                          -- conceptual market, book-agnostic
+prop_markets                          -- conceptual market, book-agnostic;
+                                       -- deliberately has no line/price/
+                                       -- pushability field of its own
   id                UUID PK
   game_id           UUID FK -> games
   player_id         UUID FK -> players
   stat_type         TEXT             passing_yards | receptions | ...
-  is_pushable       BOOLEAN          derived from canonical line at research eligibility check time
   created_at        TIMESTAMPTZ
 
 prop_quotes                           -- append-only, immutable per snapshot
@@ -170,6 +182,19 @@ market_snapshots                      -- frozen consensus/canonical read at a po
   number_of_books           INT
   is_valid_canonical_baseline BOOLEAN   -- per constitution §19 checklist
 ```
+
+**`is_pushable` fix:** an earlier version of this table stored
+`is_pushable` directly on `prop_markets`. That reintroduces exactly the
+mistake the settlement redesign (§8) exists to avoid: the conceptual
+market is book/time-independent, but the *line* is not — a receiving-
+yards market can be quoted at 74.5 (non-pushable) at Opening and move to
+75 (pushable) by Final. There is no single correct pushability value to
+store on the market itself. Pushability is now computed at the point
+where a specific line is in play: from `market_snapshot.canonical_line`
+when checking Forecast Lab eligibility (RULES.md §22), and from
+`ticket.observed_line` when checking Competition eligibility (RULES.md
+§6a) — both via the same pure rule (a whole-number line is pushable, a
+half-point line is not), never a stored flag.
 
 ## 3. News / injuries / weather / events
 
@@ -280,19 +305,42 @@ forecast_observations                 -- append-only; revisions are new rows
   exclusion_reason              TEXT NULL   -- enum, RULES.md §15
   agent_session_id              UUID FK -> agent_sessions
 
-benchmark_slates
+benchmark_slate_plans                 -- committed once per week, before
+                                       -- any game's OPENING window opens
   id                UUID PK
-  week_id           UUID FK -> weeks
-  checkpoint_type   TEXT               currently only OPENING builds a slate;
-                                        MID/FINAL reforecast the same markets
-  constructed_at    TIMESTAMPTZ
-  selection_method  TEXT
+  week_id           UUID FK -> weeks UNIQUE
+  target_slot_count INT               -- e.g. 10
+  allocation_method TEXT              -- deterministic algorithm identifier/version
+  committed_at      TIMESTAMPTZ
 
-benchmark_slate_entries
-  id                UUID PK
-  slate_id          UUID FK -> benchmark_slates
-  market_id         UUID FK -> prop_markets
+benchmark_slots                       -- one row per planned slot;
+                                       -- resolved asynchronously, per game,
+                                       -- at that game's own OPENING window
+  id                  UUID PK
+  plan_id             UUID FK -> benchmark_slate_plans
+  slot_index          INT             -- fixed at commit time, e.g. 1..10
+  game_id             UUID FK -> games            -- fixed at commit time
+  target_stat_type    TEXT            -- fixed at commit time
+  fallback_stat_types TEXT[]          -- fixed at commit time, priority order
+  status              TEXT            PENDING | RESOLVED | UNFILLABLE
+  resolved_market_id  UUID NULL FK -> prop_markets
+  resolved_at         TIMESTAMPTZ NULL
+  UNIQUE (plan_id, slot_index)
 ```
+
+**Async slate resolution (ARCHITECTURE.md §4a):** `benchmark_slates`/
+`benchmark_slate_entries` (v1) assumed one synchronous construction event
+covering the whole week — impossible once checkpoints are per-game
+(§4): a Thursday game's OPENING window can close before a Monday game's
+even opens. `benchmark_slate_plans` fixes the *shape* of the week's slate
+(slot count, one game + target stat type per slot) mechanically, before
+any game's window opens; each `benchmark_slots` row then resolves to an
+actual `prop_market` only when its own game's OPENING `checkpoint_run`
+fires. A `season_competitor`'s benchmark forecast for a slot is simply a
+`forecast_observations` row with `source_type = BENCHMARK` and
+`market_id = benchmark_slots.resolved_market_id` — no separate FK needed
+on `forecast_observations` for this, since that join is enough to answer
+"which slot was this."
 
 Each `forecast_observation.canonical_line` is copied at the moment the
 forecast was made and never updated afterward. This is what lets Opening
@@ -393,7 +441,11 @@ tickets                               -- executable ticket (Pounce or standard)
   observed_price            INT                                -- the price at `side`, at issuance
   market_snapshot_id        UUID FK -> market_snapshots         -- exact snapshot the line/price came from
   acceptable_line_boundary  NUMERIC(6,2) NULL
-  maximum_acceptable_price  INT NULL
+  worst_acceptable_price    INT NULL    -- renamed from maximum_acceptable_price:
+                                         -- "maximum" is ambiguous once
+                                         -- positive prices are in play —
+                                         -- see ARCHITECTURE.md §4's note
+                                         -- on price_is_acceptable()
   why_market                TEXT
   why_side                  TEXT
   why_price                 TEXT

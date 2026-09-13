@@ -161,6 +161,92 @@ for one competitor requires or blocks any other competitor's state, and
 nothing about it requires any particular Forecast Lab checkpoint to have
 run.
 
+**Ticket execution validation.** `record_execution` (the Phase 1
+implementation of the `TICKET_PENDING → BET_EXECUTED` transition above) is
+the sole authoritative gate for turning a ticket into a real wager — every
+hard constraint the ticket carries is enforced there, not left to
+whatever recorded the human's execution input: the ticket must still be
+`ISSUED` and unexpired; `actual_stake` must be within both the ticket's
+`final_allowed_stake` *and* current available bankroll (the two can
+diverge if bankroll moved between issuance and execution), at least
+`minimum_stake`, and a whole multiple of `stake_increment`; `actual_line`
+must not have moved past `acceptable_line_boundary` in the side-aware
+direction (worse for OVER means higher, worse for UNDER means lower); and
+`actual_price` must be at least as good as `worst_acceptable_price` (the
+DATABASE.md §7 rename from "maximum" — American odds aren't ordered by
+raw magnitude once sign is involved, e.g. -125 is worse than -120 but
+that's not simply "a bigger negative number," so this compares via
+decimal/implied-probability odds, `price_is_acceptable()` in
+`backend/app/domain/risk.py`, rather than comparing the raw integers or
+their magnitudes).
+
+## 4a. Benchmark slate: precommitted, resolved asynchronously per game
+
+Axis 1 above (per-game checkpoint progression) creates a real conflict for
+the benchmark slate: constitution §20 requires all three competitors to
+forecast the exact same ~10-prop slate, but a Thursday game's OPENING
+window can close (T-96h before its kickoff) several days before a Monday
+game's OPENING window even *opens*. Waiting for the whole week's slate to
+be fully known before forecasting anything would mean missing TNF's
+Opening checkpoint entirely — defeating the purpose of a kickoff-relative
+Opening window. Two-phase construction resolves this: **commit the slot
+plan mechanically before any game's window opens; resolve each slot's
+actual market only when that slot's own game reaches OPENING.**
+
+**Phase 1 — commit the plan** (`commit_benchmark_slate_plan(week)`, runs
+once, as part of `open_week`, which always happens well before the
+week's earliest game reaches T-144h):
+
+1. List the week's games ordered by `kickoff_at`.
+2. Allocate `benchmark_slate_size` (10) slots across games by a fixed,
+   deterministic rule — e.g. round-robin over games-by-kickoff-order,
+   remainder to the earliest games — so no game is favored by anything
+   other than schedule position.
+3. Assign each slot a `target_stat_type` (cycling through
+   `supported_prop_types`) plus a fixed `fallback_stat_types` priority
+   order, so a game missing its target type still has a deterministic
+   next choice, decided now rather than when the slot resolves.
+4. Persist `benchmark_slate_plans` (one row) and `benchmark_slots` (one
+   row per slot, `status = PENDING`, `resolved_market_id = NULL`).
+
+Every decision in this phase depends only on the schedule and the fixed
+prop-type list — never on odds, forecasts, or anything that could look
+like cherry-picking after the fact.
+
+**Phase 2 — resolve each game's slots at its own OPENING window**
+(folded into the existing `capture_checkpoint(game, OPENING)` job, §6):
+
+1. Find this plan's `PENDING` slots where `game_id` = this game.
+2. For each, pick the qualifying `prop_market` for
+   `(game, target_stat_type)` — canonical market available, two-sided
+   priced, non-pushable (RULES.md §6a/§22), sufficient data quality —
+   using one fixed tiebreak rule (exact rule TBD/frozen in Week 0, e.g.
+   lowest `player_id`); mark the slot `RESOLVED` with `resolved_market_id`.
+3. If `target_stat_type` has no qualifying market for this game, try each
+   `fallback_stat_types` entry in order; if none qualify, mark the slot
+   `UNFILLABLE`.
+4. The now-`RESOLVED` slots' markets are included in this game's
+   `run_benchmark_forecast(game, OPENING, ...)` call alongside whatever
+   else that job does — all three competitors see the identical resolved
+   market at the identical Opening snapshot for that slot, they just see
+   it on that game's own schedule rather than the whole week's.
+
+**`UNFILLABLE` slots are not reallocated to another game.** A more
+elaborate overflow rule (roll a dead slot's budget onto the next
+unresolved game) was considered and rejected for V1: it adds a second
+layer of "the algorithm decided who gets the extra slot" that itself
+invites the appearance of cherry-picking, for a problem this project
+already has a standard answer to — report coverage rather than
+manufacture completeness (RULES.md §16 does exactly this for the
+common-coverage cohort). A week's realized benchmark slate may therefore
+land under 10 props; that's reported, not backfilled. Revisit only if
+Week 0 testing shows `UNFILLABLE` slots are chronically common enough to
+matter.
+
+MID and FINAL never re-run this algorithm — they simply reforecast
+whichever market each slot already resolved to, at that game's own
+MID/FINAL `checkpoint_run` (Axis 1).
+
 ## 5. AI orchestration
 
 `CompetitorAgent` (constitution §53) is the only interface `competition/`

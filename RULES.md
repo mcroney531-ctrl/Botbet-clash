@@ -139,11 +139,21 @@ Both may return in a later phase behind real three-outcome pricing.
 
 Non-pushable (half-point or otherwise non-integer) lines are
 `research_eligible = true` candidates for the primary binary research
-cohort. Integer lines remain valid **Competition** wagers but are excluded
-from the primary research cohort with
-`exclusion_reason = RESEARCH_INELIGIBLE_PUSHABLE_LINE`. Eligibility is
-determined pregame and never revised based on whether the line actually
-pushed.
+cohort; a pushable (whole-number) line gets
+`research_eligible = false`, `exclusion_reason =
+RESEARCH_INELIGIBLE_PUSHABLE_LINE`. Eligibility is determined pregame and
+never revised based on whether the line actually pushed.
+
+**Since §6a, this is no longer just a Forecast Lab rule — it's the same
+non-pushable requirement for both.** An earlier version of this document
+said integer lines "remain valid Competition wagers," which directly
+contradicted §6a; that sentence is gone. For V1 there is exactly one
+pushability rule, applied at both the Forecast Lab eligibility check and
+the Competition ticket-issuance check: non-pushable only. Pushability
+itself is never stored on the market — see DATABASE.md §2's note on
+`prop_markets` — it's computed from the specific line in play
+(`market_snapshot.canonical_line` for Forecast Lab eligibility,
+`ticket.observed_line` for Competition eligibility) at the point of use.
 
 ## 9. Checkpoints (kickoff-relative)
 
