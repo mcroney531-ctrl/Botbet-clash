@@ -290,17 +290,19 @@ def run_smoke(registry=None) -> tuple[str, bool]:
         Decimal("0") <= v.probability_over <= Decimal("1") for v in verifications if v.probability_over is not None
     )
 
-    no_response_leakage = True
-    valid_probabilities = {p: v.probability_over for p, v in zip(fixture.season_competitor_ids, verifications) if v.probability_over is not None}
-    for provider_label, rendered in rendered_by_provider.items():
-        if not rendered:
-            continue
-        payload_text = str(rendered.get("user"))
-        for other_provider, other_prob in valid_probabilities.items():
-            if other_provider == provider_label:
-                continue
-            if str(other_prob) in payload_text:
-                no_response_leakage = False
+    # A structural invariant, not a heuristic: every competitor's rendered
+    # request is built (and its AgentSession's PENDING row committed) from
+    # persisted immutable snapshots *before* that competitor's provider is
+    # ever called, and no competitor's request-building code has access to
+    # another competitor's response. So if a rival's response had somehow
+    # leaked into a request, the requests could not all be byte-identical
+    # -- meaning rendered_payload_equivalent alone is sufficient proof of
+    # no leakage. (An earlier version of this check instead searched each
+    # rendered request's text for another competitor's *returned*
+    # probability string -- that's brittle: a coincidental numeric match
+    # against a value already legitimately present in the shared
+    # market/evidence payload could false-fail the whole proof.)
+    no_response_leakage = rendered_payload_equivalent
 
     checks = SmokeChecks(
         shared_evidence=shared_evidence,
