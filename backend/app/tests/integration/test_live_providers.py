@@ -15,6 +15,7 @@ from decimal import Decimal
 import pytest
 from sqlalchemy import select
 
+from app.ai.live_smoke import LIVE_MODEL_IDENTIFIERS
 from app.ai.orchestrator import AIOrchestrator
 from app.ai.registry import ProviderRegistry, live_registry
 from app.ai.session_service import build_audit_receipt
@@ -29,19 +30,10 @@ from app.services.season_commissioner import SeasonCommissioner
 
 pytestmark = pytest.mark.live_provider
 
-# Small/cheap model identifiers, deliberately not the season's eventual
-# production roster (RULES.md's "known Week 0 questions... roster/version"
-# is explicitly not decided here) -- update if a provider retires one.
-# Current as of 2026-09: claude-3-5-haiku-20241022 (retired Feb 2026) ->
-# claude-haiku-4-5 (current API models take no date suffix); gemini-2.0-flash
-# (shut down June 2026) -> gemini-2.5-flash (itself scheduled to shut down
-# Oct 16 2026 -- recheck before then). gpt-4o-mini unconfirmed either way;
-# verify against your OpenAI dashboard before a real run.
-LIVE_MODEL_IDENTIFIERS = {
-    "openai": "gpt-4o-mini",
-    "anthropic": "claude-haiku-4-5",
-    "google": "gemini-2.5-flash",
-}
+# Model identifiers live in app/ai/live_smoke.py -- that module has no
+# pytest dependency (it must run standalone in production), so it's the
+# canonical source; this test file imports from it rather than keeping
+# its own copy.
 
 HAS_OPENAI_KEY = bool(os.environ.get("OPENAI_API_KEY"))
 HAS_ANTHROPIC_KEY = bool(os.environ.get("ANTHROPIC_API_KEY"))
