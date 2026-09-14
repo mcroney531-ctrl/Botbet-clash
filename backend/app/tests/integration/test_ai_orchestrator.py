@@ -271,3 +271,80 @@ def test_ai_orchestrator_mock_path_end_to_end():
     with session_scope() as session:
         repo = AgentSessionRepository(session)
         assert repo.get(b_session_ids[gpt_id]).status == "VALID"
+
+
+class _ExplodingAdapter:
+    """A real adapter that misbehaves: raises a raw, unnormalized
+    exception instead of catching it and returning a ProviderCallResult.
+    Proves the orchestrator's backstop (found via a live Gemini run that
+    let an uncaught httpx.ConnectError escape) still reaches a terminal
+    FAILED status rather than leaving the session stuck at CALLING."""
+
+    provider_name = "openai"
+
+    def __init__(self, model_identifier: str) -> None:
+        self.model_identifier = model_identifier
+
+    def forecast_benchmark(self, request):
+        raise RuntimeError("simulated: adapter forgot to catch its own SDK's exception")
+
+
+def test_an_adapter_that_raises_still_reaches_a_terminal_failed_status():
+    commissioner = SeasonCommissioner.create_season(name="Orchestrator Backstop", year=2026, rules=make_rules())
+
+    with session_scope() as session:
+        active_rules_row = SeasonRepository(session).get_active_rules(commissioner.season_id)
+        windows_config = dict(active_rules_row.checkpoint_windows)
+        canonical_book = active_rules_row.canonical_sportsbook
+
+    sc_id = uuid.UUID(
+        commissioner.register_competitor(
+            competitor_id="openai", provider="openai", display_name="OPENAI",
+            model_identifier="openai-mock-model", model_version="v1",
+        )
+    )
+    commissioner.open_week(week_number=1, is_real_money=False)
+    now = datetime.now(timezone.utc)
+    kickoff = now + timedelta(hours=100)
+
+    with session_scope() as session:
+        market_repo = MarketRepository(session)
+        game = market_repo.create_game(
+            external_ref="backstop-game", season_id=commissioner.season_id, week_number=1,
+            home_team="KC", away_team="BUF", kickoff_at=kickoff,
+        )
+        player = market_repo.create_player(external_ref="backstop-player", name="Player X", team="KC", position="WR")
+        market = market_repo.create_prop_market(game_id=game.id, player_id=player.id, stat_type="receiving_yards")
+        market_repo.add_quote(
+            market_id=market.id, sportsbook=canonical_book, line=Decimal("74.5"),
+            over_price=-115, under_price=-105, retrieved_at=now - timedelta(hours=1),
+        )
+        game_id, market_id = game.id, market.id
+
+    with session_scope() as session:
+        game_row = MarketRepository(session).get_game(game_id)
+        run = _capture_market(session, game=game_row, checkpoint_type="OPENING", windows_config=windows_config, now=now, canonical_book=canonical_book)
+        run_id = run.id
+        evidence_id = session.execute(
+            select(EvidenceSnapshot.id).where(EvidenceSnapshot.market_id == market_id, EvidenceSnapshot.checkpoint_type == "OPENING")
+        ).scalar_one()
+
+    exploding_registry = type(
+        "ExplodingRegistry", (), {"for_competitor": staticmethod(lambda session, sc_id: _ExplodingAdapter("openai-mock-model"))}
+    )()
+    orchestrator = AIOrchestrator(season_id=commissioner.season_id, registry=exploding_registry)
+
+    agent_session_id = orchestrator.run_benchmark_forecast(
+        season_competitor_id=sc_id, checkpoint_run_id=run_id, evidence_snapshot_ids=[evidence_id],
+    )
+
+    with session_scope() as session:
+        agent_session = session.get(AgentSession, agent_session_id)
+        assert agent_session.status == "FAILED"  # not stuck at CALLING
+        assert agent_session.is_valid is False
+        assert agent_session.error_category == "UNKNOWN_PROVIDER_ERROR"
+        assert "RuntimeError" in agent_session.error_message
+        obs_count = session.query(ForecastObservation).filter(
+            ForecastObservation.agent_session_id == agent_session_id
+        ).count()
+        assert obs_count == 0

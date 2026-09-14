@@ -47,6 +47,17 @@ class GeminiAdapter:
             return self._error(category="PROVIDER_UNAVAILABLE", message=str(exc))
         except httpx.TimeoutException as exc:
             return self._error(category="TIMEOUT", message=str(exc))
+        except httpx.TransportError as exc:
+            # Anything else at the transport layer -- DNS failure, connection
+            # refused, TLS handshake failure, etc. Unlike ClientError/
+            # ServerError (raised from a completed HTTP response),
+            # google-genai never wraps these into its own error types, since
+            # there's no response to wrap; they propagate as raw httpx
+            # exceptions. Caught broadly here so a call that never got an
+            # HTTP response still ends in a normalized FAILED AgentSession
+            # instead of an unhandled exception leaving the session stuck at
+            # CALLING.
+            return self._error(category="PROVIDER_UNAVAILABLE", message=str(exc))
         except genai_errors.APIError as exc:
             return self._error(category="UNKNOWN_PROVIDER_ERROR", message=str(exc))
 

@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 
 from app.ai.prompts.benchmark_forecasting import render_benchmark_prompt
 from app.ai.prompts.versions import BENCHMARK_PROMPT_VERSION, FORECAST_SCHEMA_VERSION
-from app.ai.providers.base import CompetitorAdapter, ProviderCallResult
+from app.ai.providers.base import CompetitorAdapter, ProviderCallResult, ProviderError
 from app.ai.registry import ProviderRegistry
 from app.ai.schemas.benchmark_forecast import BenchmarkForecastRequest, MarketContext, MarketInput
 from app.ai.session_service import AgentSessionRepository, build_orchestration_key
@@ -260,13 +260,40 @@ class AIOrchestrator:
         max_attempts = self.max_correction_retries + 1
         transport_retry_count = 0
         for attempt_number in range(1, max_attempts + 1):
-            result = adapter.forecast_benchmark(request)
+            result = self._invoke_adapter(adapter, request)
             if result.error is not None:
                 return result, None, transport_retry_count, attempt_number - 1
             validation = validate_benchmark_response(request, result.parsed_payload)
             if validation.is_valid or attempt_number == max_attempts:
                 return result, validation, transport_retry_count, attempt_number - 1
         raise AssertionError("unreachable")  # pragma: no cover
+
+    @staticmethod
+    def _invoke_adapter(adapter, request: BenchmarkForecastRequest) -> ProviderCallResult:
+        """Backstop around every adapter call: an adapter is expected to
+        catch its own provider's exceptions and return a normalized
+        ProviderCallResult, but a gap in that handling (a raw exception
+        type the adapter didn't anticipate) must never leave an
+        AgentSession stuck at CALLING forever -- it must still reach a
+        terminal FAILED state. This is defense in depth, not a substitute
+        for correct per-adapter error handling.
+        """
+
+        try:
+            return adapter.forecast_benchmark(request)
+        except Exception as exc:  # noqa: BLE001 -- intentional catch-all backstop
+            return ProviderCallResult(
+                provider=getattr(adapter, "provider_name", "unknown"),
+                model_identifier=getattr(adapter, "model_identifier", "unknown"),
+                raw_response=None,
+                parsed_payload=None,
+                provider_request_id=None,
+                usage_metadata=None,
+                error=ProviderError(
+                    category="UNKNOWN_PROVIDER_ERROR",
+                    message=f"adapter raised an unhandled {type(exc).__name__}: {exc}",
+                ),
+            )
 
     def _require_competitor_in_season(self, session: Session, season_competitor_id: uuid.UUID) -> SeasonCompetitor:
         season_competitor = session.get(SeasonCompetitor, season_competitor_id)
