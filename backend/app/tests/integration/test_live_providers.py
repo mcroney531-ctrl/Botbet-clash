@@ -32,10 +32,15 @@ pytestmark = pytest.mark.live_provider
 # Small/cheap model identifiers, deliberately not the season's eventual
 # production roster (RULES.md's "known Week 0 questions... roster/version"
 # is explicitly not decided here) -- update if a provider retires one.
+# Current as of 2026-09: claude-3-5-haiku-20241022 (retired Feb 2026) ->
+# claude-haiku-4-5 (current API models take no date suffix); gemini-2.0-flash
+# (shut down June 2026) -> gemini-2.5-flash (itself scheduled to shut down
+# Oct 16 2026 -- recheck before then). gpt-4o-mini unconfirmed either way;
+# verify against your OpenAI dashboard before a real run.
 LIVE_MODEL_IDENTIFIERS = {
     "openai": "gpt-4o-mini",
-    "anthropic": "claude-3-5-haiku-20241022",
-    "google": "gemini-2.0-flash",
+    "anthropic": "claude-haiku-4-5",
+    "google": "gemini-2.5-flash",
 }
 
 HAS_OPENAI_KEY = bool(os.environ.get("OPENAI_API_KEY"))
