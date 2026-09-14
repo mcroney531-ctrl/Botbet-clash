@@ -16,11 +16,19 @@ from sqlalchemy.orm import Session, sessionmaker
 
 def database_url() -> str:
     url = os.environ.get("DATABASE_URL")
-    if url:
-        return url
-    # Local/test default: matches the botbet_test database provisioned
-    # for this environment's Postgres 16 cluster.
-    return "postgresql+psycopg://postgres:postgres@localhost:5432/botbet_test"
+    if not url:
+        # Local/test default: matches the botbet_test database provisioned
+        # for this environment's Postgres 16 cluster.
+        return "postgresql+psycopg://postgres:postgres@localhost:5432/botbet_test"
+    # Railway (and most managed Postgres providers) hand back a bare
+    # `postgresql://` URL with no driver suffix, which makes SQLAlchemy
+    # default to psycopg2 -- a driver this project never declares as a
+    # dependency (it depends on psycopg[binary], i.e. psycopg3). Normalize
+    # to the driver we actually ship, rather than requiring every deploy
+    # target to know to rewrite its own DATABASE_URL by hand.
+    if url.startswith("postgresql://"):
+        url = "postgresql+psycopg://" + url[len("postgresql://") :]
+    return url
 
 
 _engine: Engine | None = None
