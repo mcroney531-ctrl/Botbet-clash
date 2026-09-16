@@ -1,0 +1,9 @@
+node_modules
+.next
+package-lock.json
+public
+AGENTS.md
+CLAUDE.md
+test-results
+
+next-env.d.ts
