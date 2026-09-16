@@ -460,12 +460,14 @@ unavailable; valid result after one correction retry; still-invalid
 result after the correction retry is exhausted (rejected, zero
 `ForecastObservation`s created).
 
-**Test count**: 94 passed, 4 skipped (the 4 `live_provider` tests, no
-credentials configured in this environment) — up from 80 at the end of
-Phase 2. New: 13 pure tests (`test_ai_validation.py`), 1 mock-path
-integration test (`test_ai_orchestrator.py`, Postgres), 4 live-provider
-integration tests (`test_live_providers.py`, Postgres + real API keys,
-currently skipped). Zero regressions in any Phase 1/2 test.
+**Test count**: 102 passed, 4 skipped (the 4 `live_provider` tests, no
+credentials configured in *this* environment — they are not the live
+proof, see below) — up from 80 at the end of Phase 2. New: 18 pure tests
+(`test_ai_validation.py`, `test_ai_live_smoke.py`), 3 mock-path
+integration tests (`test_ai_orchestrator.py`, `test_live_smoke.py`,
+Postgres), 4 live-provider integration tests (`test_live_providers.py`,
+Postgres + real API keys, skipped here). Zero regressions in any
+Phase 1/2 test.
 
 **Mock-path acceptance result** (`test_ai_orchestrator.py`): one season,
 three season-competitors (openai/anthropic/google), one captured OPENING
@@ -484,30 +486,57 @@ simulated timeout (`FAILED`, `raw_response` is `None`, zero
 `ForecastObservation`s) — and the first competitor's success is
 unaffected by the other two's failures in the same round.
 
-**Real provider path status**: implemented and unit-import-clean
-(`OpenAIAdapter`/`AnthropicAdapter`/`GeminiAdapter` all construct and
-route through the same `AIOrchestrator`/`validation.py`/`session_service.py`
-as MockAdapter), but **not live-verified** — this environment has no
-`OPENAI_API_KEY`/`ANTHROPIC_API_KEY`/`GEMINI_API_KEY`/`GOOGLE_API_KEY`
-configured, so the 4 `live_provider` tests in `test_live_providers.py`
-skip rather than run. Whoever has credentials should run
-`pytest -q -m live_provider` (with `DATABASE_URL` set) to complete steps
-15–24 of the acceptance test for real; the code path exercising every
-one of those steps already exists and passes its mock-equivalent.
+**Real provider path status: PASSED live (2026-09-16).** Run from inside
+the deployed Railway container via
+`railway ssh --service Botbet-clash --environment production -- /opt/venv/bin/python -m app.ai.live_smoke`
+(see `app/ai/live_smoke.py` — a production-safe CLI, not pytest, since
+pytest is a dev-only dependency and a public endpoint firing billable
+provider calls would be its own bad idea):
 
-**Do not read anything into forecast differences yet** — no live call has
-been made in this environment, and even once one is, three models
-forecasting one test market is a connectivity check, not a research
-result. Model comparison is explicitly out of scope for Phase 3.
+```
+OPENAI     VALID   session=b8d256a2-…   p_over=.52000
+ANTHROPIC  VALID   session=573e9fc1-…   p_over=.51000
+GOOGLE     VALID   session=1fb599f9-…   p_over=.50800
+
+shared_evidence=true          three_valid_sessions=true
+three_forecast_observations=true    audit_receipts_valid=true
+rendered_payload_equivalent=true    no_response_leakage=true
+probabilities_in_range=true
+
+PHASE 3 LIVE PROVIDER PROOF: PASS
+```
+
+Three real providers, one identical frozen `EvidenceSnapshot`, three
+independent `AgentSession`s, three `ForecastObservation`s, audit receipts
+reconstructing from a fresh session. Four real bugs surfaced only by
+running it for real, each fixed and pushed: `GeminiAdapter` let an
+uncaught `httpx.ConnectError` escape and strand a session at `CALLING`
+(orchestrator now has a catch-all backstop); Anthropic's
+structured-outputs JSON Schema dialect rejects `minimum`/`maximum` on
+number properties; `gemini-2.5-flash` had been retired out from under the
+account; and once those schema keywords were removed, nothing carried the
+1–10 confidence scale any more and all three providers returned it as a
+0–1 value (→ prompt `benchmark-v2`).
+
+The 4 `live_provider` pytest tests remain the local-development
+equivalent and still skip without credentials; they are not what proved
+this.
+
+**Do not read anything into the forecast differences above.** `.52000`
+/ `.51000` / `.50800` on a single synthetic market, all clustered near
+the canonical de-vigged baseline, is a connectivity check — n=1, one
+fabricated market, mocked evidence. It says nothing about calibration or
+which model forecasts better. Model comparison is explicitly out of scope
+for Phase 3.
 
 **Known Week 0 decisions still intentionally unresolved** (unchanged from
 Phase 2, plus the two Phase 3 added): `BATCH_10`/`BATCH_SMALL`/`ISOLATED`
 benchmark batching (the schema already supports 1..N markets per call —
 `AIOrchestrator._build_market_batch` takes an arbitrary list of
 `evidence_snapshot_ids` — but the production choice isn't frozen), and the
-exact production model roster/version per provider (the `live_provider`
-smoke tests use small/cheap models — `gpt-4o-mini`,
-`claude-3-5-haiku-20241022`, `gemini-2.0-flash` — deliberately not
+exact production model roster/version per provider (the smoke proof uses
+small/cheap models — `gpt-4o-mini`,
+`claude-haiku-4-5`, `gemini-3.8-flash` — deliberately not
 presented as the season's real roster). All the Phase 2 items
 (checkpoint window tuning, benchmark-slate game-order allocator, same-stat
 tiebreak, `kelly_fraction`, weekly decision deadline) remain open too.
