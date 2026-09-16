@@ -711,12 +711,13 @@ telemetry is per-response.
 ## 17. Schema delta
 
 ```
-PropQuote    + as_of_at            NOT NULL
-             + source              NOT NULL
-             + provider_call_id    FK NOT NULL
-             + ingestion_run_id    FK
+PropQuote    + as_of_at                    NOT NULL
+             + source                      NOT NULL
+             + provider_call_id            FK NOT NULL
+             + ingestion_run_id            FK
+             + provider_market_updated_at  nullable
              + parser_version
-             + fingerprint         CHAR(64) UNIQUE
+             + fingerprint                 CHAR(64) UNIQUE
              (NO composite UNIQUE on market/book/source/as_of — see §10.1)
 
 PropMarket   + UNIQUE(game_id, player_id, stat_type)
@@ -727,6 +728,11 @@ new tables   ingestion_runs
              provider_calls        (raw body + sha256 + bytes + quota telemetry)
 
 later        GamePlayer            (post-probe, §12.2)
+
+             (`provider_market_updated_at` was required by the time model in
+             §3 and by the ProviderQuote DTO in §9 from the start; its absence
+             from this summary was a documentation omission, corrected during
+             Phase 4A.1 implementation rather than treated as a decision.)
 
 migration    additive, per Phase 3 policy.
              Existing PropQuote rows get as_of_at = retrieved_at (correct: every

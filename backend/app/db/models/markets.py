@@ -50,9 +50,26 @@ class PropMarket(Base):
     stat_type: Mapped[str] = mapped_column(String, nullable=False)
     created_at: Mapped[datetime] = created_at_column()
 
+    # The natural key. Real ingestion get-or-creates against this on every
+    # poll, so without the constraint a concurrent or retried run would
+    # fork a market in two and split its quote history.
+    __table_args__ = (UniqueConstraint("game_id", "player_id", "stat_type", name="natural_key"),)
+
 
 class PropQuote(Base):
-    """Append-only, immutable per snapshot — never overwritten."""
+    """Append-only, immutable per observation — never overwritten.
+
+    A row means: *at `as_of_at`, this provider showed us this book /
+    player / stat / line / price state.* It deliberately does NOT mean
+    "the market last changed at this time" — that is
+    `provider_market_updated_at`, which is diagnostic only and must never
+    drive checkpoint selection (see the seam doc §3).
+
+    Repeated unchanged observations are RETAINED (§4). Keeping only the
+    first of two identical quotes would make "market genuinely unchanged
+    and freshly observed" indistinguishable from "our feed stopped seeing
+    that book," which is exactly a checkpoint-freshness question.
+    """
 
     __tablename__ = "prop_quotes"
 
@@ -62,7 +79,29 @@ class PropQuote(Base):
     line: Mapped[Decimal] = mapped_column(Numeric(6, 2), nullable=False)
     over_price: Mapped[int] = mapped_column(Integer, nullable=False)
     under_price: Mapped[int] = mapped_column(Integer, nullable=False)
+    # The time this observation represents. Current pull: one stable
+    # capture timestamp for the accepted fetch. Historical pull: the
+    # provider's returned snapshot time, never our clock. This is the
+    # field quote selection filters on.
+    as_of_at: Mapped[datetime] = mapped_column(nullable=False)
+    # When our process received and persisted the response. Operational
+    # provenance; never used for market-state eligibility.
     retrieved_at: Mapped[datetime] = mapped_column(nullable=False)
+    # Vendor market-level `last_update`. Diagnostic/freshness metadata only.
+    provider_market_updated_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    # Which market-data provider supplied this. Pinned against
+    # SeasonRules.market_data_provider so a vendor switch cannot silently
+    # blend two feeds into one consensus.
+    source: Mapped[str] = mapped_column(String, nullable=False)
+    provider_call_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("provider_calls.id"), nullable=False)
+    ingestion_run_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("ingestion_runs.id"), nullable=True)
+    # Provenance ONLY. Quote selection does not filter by this: a global
+    # "newest parser wins" filter would let a v2 deployment erase every
+    # week still parsed by v1 until each archived response was replayed,
+    # and a bug fix must never be able to delete history. The
+    # supersession policy is deferred until parser replay actually exists.
+    parser_version: Mapped[str] = mapped_column(String, nullable=False)
+    fingerprint: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
 
 
 class MarketSnapshot(Base):

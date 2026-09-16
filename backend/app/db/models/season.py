@@ -38,6 +38,12 @@ class SeasonRules(Base):
     rules_version: Mapped[str] = mapped_column(String, unique=True, nullable=False)
     starting_bankroll_cents: Mapped[int] = mapped_column(BigInteger, nullable=False)
     canonical_sportsbook: Mapped[str] = mapped_column(String, nullable=False)
+    # Which market-data provider supplies this season's quote history.
+    # Frozen alongside canonical_sportsbook and for the same reason: a
+    # midseason vendor switch must not be able to silently change the
+    # research baseline by blending two feeds into one consensus. Quote
+    # selection pins on this value.
+    market_data_provider: Mapped[str] = mapped_column(String, nullable=False)
     research_settlement_provider: Mapped[str] = mapped_column(String, nullable=False)
     research_settlement_delay_hours: Mapped[int] = mapped_column(Integer, nullable=False)
     supported_prop_types: Mapped[list[str]] = mapped_column(ARRAY(String), nullable=False)

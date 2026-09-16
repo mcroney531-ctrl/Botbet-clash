@@ -10,6 +10,12 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db.models.markets import Game, MarketSnapshot, Player, PropMarket, PropQuote
+from app.marketdata.provenance import (
+    SYNTHETIC_PARSER_VERSION,
+    SYNTHETIC_SOURCE,
+    ensure_synthetic_provenance,
+    legacy_fingerprint,
+)
 
 
 class MarketRepository:
@@ -81,28 +87,86 @@ class MarketRepository:
         over_price: int,
         under_price: int,
         retrieved_at: datetime,
+        as_of_at: datetime | None = None,
     ) -> PropQuote:
+        """Write a SYNTHETIC quote — fabricated market state with no
+        provider behind it.
+
+        Real ingestion does not come through here: it goes through
+        `app/marketdata/ingestion.py`, which carries genuine provider
+        provenance and a real fingerprint. This path exists for tests and
+        `live_smoke.py`, and it stamps every row it writes as SYNTHETIC so
+        the two populations can never be confused in a query. Quote
+        selection is source-pinned, so these rows are also invisible to a
+        season configured against a real provider.
+        """
+
+        as_of = as_of_at if as_of_at is not None else retrieved_at
+        if as_of > retrieved_at:
+            raise ValueError("as_of_at must not be later than retrieved_at")
+
+        # The id is generated here rather than left to the column default:
+        # `uuid_pk()`'s `default=uuid.uuid4` is a SQLAlchemy column default,
+        # evaluated at INSERT, so `row.id` is still None at construction --
+        # and the legacy fingerprint is derived from the id, so reading it
+        # early would hash "legacy:None" and collide every synthetic quote
+        # against the UNIQUE constraint.
+        quote_id = uuid.uuid4()
         row = PropQuote(
+            id=quote_id,
             market_id=market_id,
             sportsbook=sportsbook,
             line=line,
             over_price=over_price,
             under_price=under_price,
+            as_of_at=as_of,
             retrieved_at=retrieved_at,
+            source=SYNTHETIC_SOURCE,
+            provider_call_id=ensure_synthetic_provenance(self.session),
+            parser_version=SYNTHETIC_PARSER_VERSION,
+            fingerprint=legacy_fingerprint(quote_id),
         )
         self.session.add(row)
         self.session.flush()
         return row
 
-    def quotes_as_of(self, market_id: uuid.UUID, as_of: datetime) -> list[PropQuote]:
-        """Every quote for this market retrieved at or before `as_of` —
-        the raw input a MarketSnapshotService needs to freeze a canonical
-        read at a point in time (ARCHITECTURE.md §4, atomic checkpoints)."""
+    def quotes_as_of(self, market_id: uuid.UUID, *, source: str, as_of: datetime) -> list[PropQuote]:
+        """Every quote for this market that was *observed* at or before
+        `as_of`, from the pinned market-data source — the raw input
+        MarketSnapshotService needs to freeze a canonical read at a point
+        in time (ARCHITECTURE.md §4, atomic checkpoints).
+
+        Filters on `as_of_at`, never `retrieved_at`. Those are different
+        facts (seam doc §3): a backfill retrieved on 20 September for a
+        5 September snapshot represents 5 September market state. Ordering
+        by retrieval would exclude it from the checkpoint it belongs to and
+        silently admit it to every later one, presenting two-week-old
+        prices as current.
+
+        `source` is required rather than optional so that adding a second
+        provider cannot quietly blend two feeds into one consensus — the
+        caller must always say which history it means.
+
+        Ordering is fully deterministic: `as_of_at` decides, `retrieved_at`
+        breaks a tie between the same market state observed twice, and `id`
+        guarantees a stable answer when even that ties. Callers downstream
+        take the first row per sportsbook, so an unstable sort here would
+        make the canonical baseline — and every de-vigged probability built
+        on it — non-reproducible.
+        """
 
         stmt = (
             select(PropQuote)
-            .where(PropQuote.market_id == market_id, PropQuote.retrieved_at <= as_of)
-            .order_by(PropQuote.retrieved_at.desc())
+            .where(
+                PropQuote.market_id == market_id,
+                PropQuote.source == source,
+                PropQuote.as_of_at <= as_of,
+            )
+            .order_by(
+                PropQuote.as_of_at.desc(),
+                PropQuote.retrieved_at.desc(),
+                PropQuote.id.desc(),
+            )
         )
         return list(self.session.execute(stmt).scalars())
 

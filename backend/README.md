@@ -1,4 +1,4 @@
-# Backend — Phase 1 domain, Phase 2 persistence & Forecast Lab core, Phase 3 AI adapter layer
+# Backend — Phase 1 domain, Phase 2 persistence & Forecast Lab core, Phase 3 AI adapter layer, Phase 4A.1 market-data seam
 
 Implements constitution §117 **Phase 1** (`Season`, `SeasonRules`, `Week`,
 `Competitor`, the bankroll ledger, `Ticket`, `Wager`, `Settlement`,
@@ -460,7 +460,7 @@ unavailable; valid result after one correction retry; still-invalid
 result after the correction retry is exhausted (rejected, zero
 `ForecastObservation`s created).
 
-**Test count**: 102 passed, 4 skipped (the 4 `live_provider` tests, no
+**Test count** (as of Phase 3): 102 passed, 4 skipped (the 4 `live_provider` tests, no
 credentials configured in *this* environment — they are not the live
 proof, see below) — up from 80 at the end of Phase 2. New: 18 pure tests
 (`test_ai_validation.py`, `test_ai_live_smoke.py`), 3 mock-path
@@ -555,3 +555,129 @@ placement, the weekly production scheduler, `OPEN_MARKET_RESEARCH`/
 `STAKE_SIZING`/`FINAL_DECISION`/`POSTMORTEM`/`PUBLIC_COMMENTARY`/
 `TRASH_TALK` prompt families, the Show layer, and Astra/arena
 integration.
+
+
+## Phase 4A.1 readout — real market-data ingestion seam
+
+**Status: the provider boundary exists and is proven against a mock. No
+real market data has been ingested, and none can be until the
+provider-validation probe runs.** The authoritative design contract is
+[`docs/phase4-ingestion-seam.md`](docs/phase4-ingestion-seam.md); where
+this readout and that document disagree, the document wins.
+
+### What shipped
+
+`app/marketdata/` mirrors `app/ai/` deliberately, so the model-provider
+and market-data boundaries read the same way:
+
+    base.py             MarketDataProvider Protocol, ProviderFetchResult,
+                        MarketDataError, ProviderDiagnostic
+    dto.py              frozen normalized DTOs
+    mapping.py          vendor market key -> StatFamily (tentative/verified split)
+    registry.py         provider name -> adapter
+    ingestion.py        IngestionService: the only writer of Game/Player/
+                        PropMarket/PropQuote from external data
+    telemetry.py        ingestion_runs / provider_calls, quota, sanitization
+    provenance.py       synthetic provenance for non-provider quotes
+    providers/
+      the_odds_api.py   the ONLY module that may know vendor JSON exists
+      mock.py           12 deterministic scenarios
+    validation_probe.py the free-tier discovery CLI
+
+Adapters never touch the database. `IngestionService` owns every mapping
+into our persistence conventions, so swapping providers cannot change how
+our rows are shaped.
+
+### Two corrections to shipped Phase 2B code
+
+**`quotes_as_of` now selects on observation time, not retrieval time.**
+`PropQuote` had exactly one timestamp, `retrieved_at`, and quote selection
+filtered and ordered on it. A backfill retrieved on 20 September for a
+5 September snapshot would have been excluded from the 5 September
+checkpoint and silently included in every checkpoint after the 20th,
+presenting two-week-old prices as current market state. `as_of_at` is now
+the market-state clock; `retrieved_at` remains as operational provenance.
+The load-bearing comment in `market_snapshot_service.py` moved with it.
+
+**Quote selection is source-pinned.** `SeasonRules.market_data_provider`
+is frozen alongside `canonical_sportsbook`, and `quotes_as_of` requires a
+source rather than accepting one optionally — so a second provider cannot
+silently blend two feeds into one consensus, and a midseason vendor switch
+cannot change the research baseline behind our backs.
+
+`capture_checkpoint` was deliberately left alone. It is a live-window
+operation that marks a run `MISSED` when `now` is past `window_end`, so it
+cannot serve a backfill; historical reconstruction gets its own Phase 4B
+entry point rather than weakening the live rules.
+
+### Observations, not polls
+
+Repeated unchanged observations are retained. Two polls four hours apart
+are two rows even when nothing moved, because keeping only the first makes
+"market genuinely unchanged and freshly observed" indistinguishable from
+"our feed stopped seeing that book" — a checkpoint-freshness question.
+
+Idempotency comes from provenance instead: `PropQuote.provider_call_id`
+plus a fingerprint over `(provider_call_id, event, player, stat_family,
+sportsbook, line, prices, parser_version)`. Reprocessing a stored response
+reuses its original call id and is a no-op; a fresh poll is a new call id
+and legitimately records another observation.
+
+`parser_version` is stored and fingerprinted but **quote selection does
+not filter on it**. A global "newest parser wins" filter would make every
+week still parsed by v1 vanish the moment v2 deployed. The supersession
+policy is deferred until parser replay actually exists.
+
+### What is deliberately NOT implemented
+
+`TheOddsApiProvider.fetch_quotes` raises `NotImplementedError`. This is
+the point, not an omission. Five things about the vendor's player-prop
+payload are unknown — the exact market keys, whether a stable player id
+exists, whether team and position appear at all, whether alternate lines
+are separate keys or extra lines in one key, and the level at which
+`last_update` is reported — and each one changes what the parser should
+be. Writing it against assumptions is what the seam exists to prevent.
+
+The tentative/verified mapping split enforces this mechanically rather
+than by convention: `VERIFIED_MARKET_KEYS` is empty, and asking for
+verified keys raises `UnverifiedMarketMappingError`. Production cannot run
+on a guess even if someone forgets why.
+
+### Credential handling
+
+The Odds API authenticates with an `apiKey` **query parameter**, which
+makes the request URL itself a secret — and means the ordinary reflex of
+surfacing `str(exc)` is a credential leak, since httpx embeds the full URL
+in transport exception text. Every `except` in the adapter constructs its
+own fixed message. `telemetry.sanitize_message` strips URLs and
+credential-shaped assignments as a second line of defence, and regression
+tests assert a sentinel key never reaches an exception message, a result
+object, a persisted row, or probe output.
+
+The backend boots and serves `/health` with `THE_ODDS_API_KEY` absent; the
+key is required only when the adapter is actually invoked.
+
+### Test count
+
+**154 passed, 4 skipped** (up from 102/4 at the end of Phase 3, zero
+regressions). The migration was verified against a populated database: two
+byte-identical legacy quotes received distinct fingerprints via the
+documented `sha256("legacy:" + id)` exception, which a content hash would
+have collided.
+
+### What must happen next
+
+The probe runs **inside Railway** (`railway ssh`), on the free tier, at
+roughly 5 credits, with research persistence off. It answers the nine
+deliverables in `docs/phase4-ingestion-seam.md` §15 — most importantly
+whether the provider supplies player team and position at all, since
+`Player.team` and `Player.position` are `NOT NULL` and placeholder values
+like `"UNKNOWN"` are prohibited outright. If it supplies neither,
+production Week-0 ingestion is blocked pending a roster source or a schema
+decision, and that is the correct outcome rather than a problem to code
+around.
+
+Phase 4 makes the **market** component real. It does not make recent player
+stats, injuries, news, weather, or team context real — those remain mocked
+Phase-2 payload content, and an `EvidenceSnapshot` must not be described as
+"fully real" merely because its `MarketSnapshot` is.

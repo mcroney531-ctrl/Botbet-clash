@@ -13,6 +13,7 @@ from app.db.models.season import Season as SeasonRow
 from app.db.models.season import SeasonRules as SeasonRulesRow
 from app.db.models.season import Week as WeekRow
 from app.domain.models import SeasonRules as DomainSeasonRules
+from app.marketdata.provenance import SYNTHETIC_SOURCE
 
 
 class SeasonRepository:
@@ -26,13 +27,19 @@ class SeasonRepository:
         return row
 
     def create_season_rules(
-        self, *, season_id: uuid.UUID, rules: DomainSeasonRules, effective_from: datetime
+        self,
+        *,
+        season_id: uuid.UUID,
+        rules: DomainSeasonRules,
+        effective_from: datetime,
+        market_data_provider: str = SYNTHETIC_SOURCE,
     ) -> SeasonRulesRow:
         row = SeasonRulesRow(
             season_id=season_id,
             rules_version=rules.rules_version,
             starting_bankroll_cents=rules.starting_bankroll.cents,
             canonical_sportsbook="DRAFTKINGS",
+            market_data_provider=market_data_provider,
             research_settlement_provider="NFL_OFFICIAL_STATS",
             research_settlement_delay_hours=72,
             supported_prop_types=["passing_yards", "passing_touchdowns", "rushing_yards", "receptions", "receiving_yards"],

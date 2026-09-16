@@ -15,6 +15,7 @@ from app.db.models.forecast_lab import (
 from app.db.models.competition import PassDecision, StakeRecommendation, Ticket, Wager
 from app.db.models.settlement import BankrollTransaction, ResearchSettlement, Settlement
 from app.db.models.events import CompetitionEvent
+from app.db.models.ingestion import IngestionRun, ProviderCall
 
 __all__ = [
     "Season",
@@ -42,4 +43,6 @@ __all__ = [
     "ResearchSettlement",
     "BankrollTransaction",
     "CompetitionEvent",
+    "IngestionRun",
+    "ProviderCall",
 ]

@@ -96,3 +96,20 @@ class CompetitionEventType(StrEnum):
     SPORTSBOOK_SETTLED = "SPORTSBOOK_SETTLED"
     WEEK_SETTLED = "WEEK_SETTLED"
     WEEK_CLOSED = "WEEK_CLOSED"
+
+
+class StatFamily(StrEnum):
+    """The five prop families this competition forecasts.
+
+    These values ARE the strings stored in `PropMarket.stat_type` and
+    listed in `SeasonRules.supported_prop_types` — they are the project's
+    own vocabulary, not any vendor's. Market-data adapters translate a
+    provider's market keys into these and nothing above the adapter ever
+    sees a vendor spelling.
+    """
+
+    PASSING_YARDS = "passing_yards"
+    PASSING_TOUCHDOWNS = "passing_touchdowns"
+    RUSHING_YARDS = "rushing_yards"
+    RECEPTIONS = "receptions"
+    RECEIVING_YARDS = "receiving_yards"

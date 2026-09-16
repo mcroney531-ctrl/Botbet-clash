@@ -21,6 +21,7 @@ from app.db.repositories.checkpoint_repository import CheckpointRepository
 from app.db.repositories.market_repository import MarketRepository
 from app.forecast_lab.evidence_service import create_evidence_snapshot, mock_evidence_payload
 from app.forecast_lab.market_snapshot_service import MarketSnapshotService
+from app.marketdata.provenance import SYNTHETIC_SOURCE
 
 
 def compute_window(kickoff_at: datetime, checkpoint_type: str, windows_config: dict) -> tuple[datetime, datetime, datetime]:
@@ -41,6 +42,7 @@ def capture_checkpoint(
     now: datetime,
     canonical_sportsbook: str,
     devig_method: str = "PROPORTIONAL_V1",
+    market_data_provider: str = SYNTHETIC_SOURCE,
 ) -> CheckpointRun:
     """Idempotent: a second call after `status == "CAPTURED"` is a pure
     no-op that returns the existing row untouched — no new snapshots, no
@@ -72,7 +74,9 @@ def capture_checkpoint(
         return run
 
     market_repo = MarketRepository(session)
-    snapshot_service = MarketSnapshotService(session, devig_method=devig_method)
+    snapshot_service = MarketSnapshotService(
+        session, devig_method=devig_method, market_data_provider=market_data_provider
+    )
     for market in market_repo.markets_for_game(game.id):
         snapshot = snapshot_service.build_snapshot(market_id=market.id, canonical_sportsbook=canonical_sportsbook, taken_at=now)
         create_evidence_snapshot(

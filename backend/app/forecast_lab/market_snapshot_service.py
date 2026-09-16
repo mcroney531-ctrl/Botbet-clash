@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 
 from app.db.models.markets import MarketSnapshot
 from app.db.repositories.market_repository import MarketRepository
+from app.marketdata.provenance import SYNTHETIC_SOURCE
 from app.forecast_lab.market_math import (
     BookQuote,
     canonical_baseline_is_valid,
@@ -24,16 +25,32 @@ from app.forecast_lab.market_math import (
 
 
 class MarketSnapshotService:
-    def __init__(self, session: Session, *, devig_method: str = "PROPORTIONAL_V1") -> None:
+    def __init__(
+        self,
+        session: Session,
+        *,
+        devig_method: str = "PROPORTIONAL_V1",
+        market_data_provider: str = SYNTHETIC_SOURCE,
+    ) -> None:
         self.session = session
         self.devig_method = devig_method
+        # Both of these are season configuration, resolved by the caller
+        # from the active SeasonRules row and passed in. Forecast Lab must
+        # not know that vendors exist, let alone which one — it receives a
+        # frozen string and pins quote selection to it.
+        self.market_data_provider = market_data_provider
 
     def build_snapshot(self, *, market_id: uuid.UUID, canonical_sportsbook: str, taken_at: datetime) -> MarketSnapshot:
         repo = MarketRepository(self.session)
-        quote_rows = repo.quotes_as_of(market_id, taken_at)
+        quote_rows = repo.quotes_as_of(market_id, source=self.market_data_provider, as_of=taken_at)
 
-        # One quote per book: the most recent as-of `taken_at` (quote_rows
-        # is already ordered retrieved_at desc).
+        # One quote per book: the most recent observation as of `taken_at`.
+        # `quotes_as_of` orders as_of_at desc, then retrieved_at desc, then
+        # id desc -- deterministic all the way down, which this loop relies
+        # on: it takes the first row it sees per sportsbook, so an unstable
+        # sort would make the canonical baseline non-reproducible. It
+        # orders on OBSERVATION time, not retrieval time; see the docstring
+        # on quotes_as_of for why that distinction is load-bearing.
         latest_by_book: dict[str, BookQuote] = {}
         for q in quote_rows:
             if q.sportsbook not in latest_by_book:
