@@ -118,6 +118,18 @@ def benchmark_response_json_schema() -> dict:
     others. This is intentionally hand-written rather than derived from
     the pydantic models above, whose Decimal fields would otherwise
     surface as schema type "string".
+
+    Deliberately does NOT constrain numeric ranges (`minimum`/`maximum`)
+    or array length (`maxItems`) here -- found live, against real
+    Anthropic: its structured-outputs JSON Schema dialect is a stricter
+    subset than OpenAI's/Gemini's and 400s on `minimum`/`maximum` for a
+    `number` property ("output_config.format.schema: For 'number' type,
+    properties maximum..."). These were never load-bearing anyway --
+    app/ai/validation.py's pydantic model independently re-validates
+    every returned value's range and every list's length regardless of
+    what a provider's own schema enforces -- so dropping them keeps one
+    genuinely shared schema across all three providers instead of
+    special-casing Anthropic.
     """
 
     forecast_item_schema = {
@@ -134,11 +146,11 @@ def benchmark_response_json_schema() -> dict:
         ],
         "properties": {
             "market_id": {"type": "string"},
-            "probability_over": {"type": "number", "minimum": 0, "maximum": 1},
-            "confidence": {"type": "number", "minimum": 1, "maximum": 10},
+            "probability_over": {"type": "number"},
+            "confidence": {"type": "number"},
             "uncertainty": {"type": "string", "enum": ["LOW", "MEDIUM", "HIGH"]},
             "public_reasoning": {"type": "string"},
-            "key_factors": {"type": "array", "items": {"type": "string"}, "maxItems": 5},
+            "key_factors": {"type": "array", "items": {"type": "string"}},
             "primary_concern": {"type": "string"},
         },
     }

@@ -44,10 +44,13 @@ from app.services.season_commissioner import SeasonCommissioner
 # if a provider retires one. This is the single canonical copy;
 # app/tests/integration/test_live_providers.py imports it from here
 # rather than keeping its own.
+# gemini-2.5-flash confirmed dead live (2026-09-16): "This model
+# models/gemini-2.5-flash is no longer available to new users" ->
+# gemini-3.8-flash (current stable GA flash model, launched 2026-09-02).
 LIVE_MODEL_IDENTIFIERS = {
     "openai": "gpt-4o-mini",
     "anthropic": "claude-haiku-4-5",
-    "google": "gemini-2.5-flash",
+    "google": "gemini-3.8-flash",
 }
 
 PROVIDER_LABELS = {"openai": "OPENAI", "anthropic": "ANTHROPIC", "google": "GOOGLE"}
