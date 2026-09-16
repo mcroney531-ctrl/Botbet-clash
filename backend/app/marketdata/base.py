@@ -183,3 +183,44 @@ def error_result(
         call_metadata=call_metadata,
         diagnostics=tuple(diagnostics),
     )
+
+
+@dataclass(frozen=True)
+class ProviderShapeReport:
+    """A provider's payload shape, described in OUR vocabulary.
+
+    The validation probe needs to learn things about a vendor payload that
+    we have not yet committed to parsing. That inspection is unavoidably
+    vendor-specific, so it happens inside the provider adapter and comes
+    back as this -- a neutral report the CLI can print without ever
+    knowing a vendor field name.
+
+    Field values may quote vendor strings (a market key IS the answer to
+    "which market keys came back"), but the SHAPE is ours. Nothing above
+    the adapter indexes into vendor JSON.
+    """
+
+    market_keys_returned: tuple[str, ...] = ()
+    books_seen: tuple[str, ...] = ()
+    canonical_book_present: bool = False
+    families_quoted_by_canonical: tuple[str, ...] = ()
+
+    # Player identity, deliberately three-valued. "An identifier exists"
+    # and "an identifier whose semantics are player identity" are different
+    # claims, and only the second may drive a persistence decision.
+    player_identity: str = "UNDETERMINED"
+    player_identifier_field: str | None = None
+    player_identity_verified: bool = False
+    team_available: bool = False
+    position_available: bool = False
+
+    alternate_line_shape: str = "UNDETERMINED"
+    last_update_levels: tuple[str, ...] = ()
+    market_last_update_sample: str | None = None
+
+    # DELIVERABLE 9: a genuinely normalized quote -- a matched Over/Under
+    # pair at one line -- or None with the reason stated.
+    sample_quote: ProviderQuote | None = None
+    sample_quote_unavailable_reason: str | None = None
+
+    diagnostics: tuple[ProviderDiagnostic, ...] = ()

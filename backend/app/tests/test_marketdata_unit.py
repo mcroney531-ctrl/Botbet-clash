@@ -414,3 +414,166 @@ def test_probe_report_never_claims_pass():
     report = render_report(ProbeFindings())
     assert "COMPLETE — REVIEW REQUIRED" in report
     assert "PHASE 4: PASS" not in report
+
+
+# --- Shape discovery: vendor parsing stays inside the adapter ----------
+
+
+def _odds_payload(*, outcomes, market_key="player_reception_yds", book="draftkings",
+                  market_last_update="2026-09-16T11:52:00Z",
+                  book_last_update="2026-09-16T11:50:00Z"):
+    market = {"key": market_key, "outcomes": outcomes}
+    if market_last_update is not None:
+        market["last_update"] = market_last_update
+    bookmaker = {"key": book, "markets": [market]}
+    if book_last_update is not None:
+        bookmaker["last_update"] = book_last_update
+    return {"id": "evt-1", "bookmakers": [bookmaker]}
+
+
+def _discover(payload, *, families=(StatFamily.RECEIVING_YARDS,)):
+    import httpx
+
+    from app.marketdata.providers.the_odds_api import TheOddsApiProvider
+
+    client = httpx.Client(
+        transport=httpx.MockTransport(lambda r: httpx.Response(200, json=payload))
+    )
+    provider = TheOddsApiProvider(api_key=SENTINEL_KEY, client=client)
+    return provider.discover_event_shape(
+        event=ProviderEventRef(provider="THE_ODDS_API", external_event_id="evt-1"),
+        stat_families=list(families),
+        now=NOW,
+    )
+
+
+def test_deliverable_nine_is_a_matched_over_under_pair_not_one_outcome():
+    """The contract is a normalized ProviderQuote, which needs BOTH sides."""
+
+    _, shape = _discover(
+        _odds_payload(
+            outcomes=[
+                {"name": "Over", "description": "A Player", "point": 74.5, "price": -115},
+                {"name": "Under", "description": "A Player", "point": 74.5, "price": -105},
+            ]
+        )
+    )
+    quote = shape.sample_quote
+    assert quote is not None, shape.sample_quote_unavailable_reason
+    assert isinstance(quote, ProviderQuote)
+    assert quote.line == Decimal("74.5")
+    assert quote.over_price == -115 and quote.under_price == -105
+    assert quote.stat_family is StatFamily.RECEIVING_YARDS
+    assert quote.sportsbook == "DRAFTKINGS"
+    # market-level last_update is what we bind, not the bookmaker-level one
+    assert quote.provider_market_updated_at.isoformat() == "2026-09-16T11:52:00+00:00"
+
+
+def test_an_unpaired_outcome_is_reported_as_unavailable_not_as_a_quote():
+    _, shape = _discover(
+        _odds_payload(
+            outcomes=[
+                {"name": "Over", "description": "A Player", "point": 74.5, "price": -115},
+            ]
+        )
+    )
+    assert shape.sample_quote is None
+    assert "unpaired" in (shape.sample_quote_unavailable_reason or "")
+    assert any(d.category == "INCOMPLETE_PRICE_PAIR" for d in shape.diagnostics)
+
+
+def test_a_generic_id_is_not_treated_as_a_stable_player_identifier():
+    """A bare `id` could key an outcome rather than a person; guessing wrong
+    silently merges or splits real people in Player.external_ref."""
+
+    _, shape = _discover(
+        _odds_payload(
+            outcomes=[
+                {"name": "Over", "description": "A Player", "point": 74.5, "price": -115,
+                 "id": "abc123"},
+                {"name": "Under", "description": "A Player", "point": 74.5, "price": -105,
+                 "id": "def456"},
+            ]
+        )
+    )
+    assert shape.player_identity_verified is False
+    assert "UNCLASSIFIED_IDENTIFIER" in shape.player_identity
+    assert "STABLE_PLAYER_ID" not in shape.player_identity
+    # ...and it must not become part of the persisted identity.
+    assert shape.sample_quote.player.external_player_id is None
+    assert shape.sample_quote.player.as_external_ref().startswith("THE_ODDS_API:name:")
+
+
+def test_an_explicitly_player_semantic_id_does_qualify():
+    _, shape = _discover(
+        _odds_payload(
+            outcomes=[
+                {"name": "Over", "description": "A Player", "point": 74.5, "price": -115,
+                 "player_id": "p-9"},
+                {"name": "Under", "description": "A Player", "point": 74.5, "price": -105,
+                 "player_id": "p-9"},
+            ]
+        )
+    )
+    assert shape.player_identity_verified is True
+    assert "STABLE_PLAYER_ID (field=player_id)" == shape.player_identity
+    assert shape.sample_quote.player.as_external_ref() == "THE_ODDS_API:id:p-9"
+
+
+def test_both_last_update_levels_are_reported_when_the_vendor_sends_both():
+    _, shape = _discover(
+        _odds_payload(
+            outcomes=[
+                {"name": "Over", "description": "A Player", "point": 74.5, "price": -115},
+                {"name": "Under", "description": "A Player", "point": 74.5, "price": -105},
+            ]
+        )
+    )
+    assert set(shape.last_update_levels) == {"BOOKMAKER", "MARKET"}
+    assert shape.market_last_update_sample == "2026-09-16T11:52:00Z"
+
+
+def test_multiple_lines_in_one_market_key_are_flagged():
+    _, shape = _discover(
+        _odds_payload(
+            outcomes=[
+                {"name": "Over", "description": "A Player", "point": 74.5, "price": -115},
+                {"name": "Under", "description": "A Player", "point": 74.5, "price": -105},
+                {"name": "Over", "description": "A Player", "point": 79.5, "price": 130},
+                {"name": "Under", "description": "A Player", "point": 79.5, "price": -160},
+            ]
+        )
+    )
+    assert shape.alternate_line_shape.startswith("MULTIPLE_LINES_WITHIN_ONE_MARKET_KEY")
+
+
+def test_the_probe_module_does_not_reference_vendor_json_field_names():
+    """The seam says vendor field names live only in the provider adapter.
+    Diagnostic code is not exempt — that exemption is how schema leakage
+    starts."""
+
+    import inspect
+
+    from app.marketdata import validation_probe
+
+    source = inspect.getsource(validation_probe)
+    # Strip docstrings/comments: the module may DISCUSS these names in prose.
+    code_only = "\n".join(
+        line.split("#")[0] for line in source.splitlines() if not line.strip().startswith("#")
+    )
+    for vendor_field in ('"bookmakers"', '"outcomes"', '"markets"', '"last_update"', '"point"'):
+        assert vendor_field not in code_only, f"{vendor_field} leaked above the provider boundary"
+
+
+def test_every_call_reports_telemetry_not_just_the_last():
+    results, _ = _discover(
+        _odds_payload(
+            outcomes=[
+                {"name": "Over", "description": "A Player", "point": 74.5, "price": -115},
+                {"name": "Under", "description": "A Player", "point": 74.5, "price": -105},
+            ]
+        ),
+        families=tuple(StatFamily),
+    )
+    assert len(results) == 5, "one call per family, each with its own quota telemetry"
+    assert all(r.call_metadata.raw_response_sha256 for r in results)

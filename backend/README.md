@@ -641,7 +641,19 @@ be. Writing it against assumptions is what the seam exists to prevent.
 The tentative/verified mapping split enforces this mechanically rather
 than by convention: `VERIFIED_MARKET_KEYS` is empty, and asking for
 verified keys raises `UnverifiedMarketMappingError`. Production cannot run
-on a guess even if someone forgets why.
+on an unobserved spelling even if someone forgets why.
+
+All five market keys are now documented by the vendor, and alternates are
+documented under separate `_alternate` keys — so the mapping needs no
+alternate-handling logic, since unlisted keys are simply never mapped. But
+documented is not observed: the gate tracks whether a live payload has
+actually returned them, which is a different and stronger claim.
+
+Payload inspection for the probe lives in the adapter as
+`discover_event_shape()` and returns a neutral `ProviderShapeReport`. The
+CLI never indexes into vendor JSON — including in diagnostic code, since
+exempting diagnostics is how schema leakage starts. A unit test asserts the
+probe module contains no vendor field names.
 
 ### Credential handling
 

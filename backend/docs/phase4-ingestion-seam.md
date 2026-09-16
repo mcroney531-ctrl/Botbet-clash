@@ -121,10 +121,16 @@ A `PropQuote` row therefore means:
 
 It explicitly does **not** mean "this is when the provider believes the
 underlying market last changed." That is a different fact, it lives in
-`provider_market_updated_at`, and it MUST NOT drive checkpoint selection. The
-vendor exposes `last_update` at the *market* level for event and player-prop
-responses, not the bookmaker level; §14 requires the probe to prove our adapter
-binds it at the correct level.
+`provider_market_updated_at`, and it MUST NOT drive checkpoint selection.
+
+The vendor's current NFL example exposes `last_update` at **both** the bookmaker
+level and the market level. We deliberately bind the MARKET-level value, because
+that is the granularity at which a specific prop market moves; a bookmaker-level
+stamp says only that something in that book changed. The probe reports which
+levels are actually present so the binding can be confirmed against a real
+payload rather than assumed. (An earlier revision of this document asserted the
+bookmaker-level field did not exist. That was too absolute — it does, we simply
+do not persist it.)
 
 **Invariants.** `as_of_at <= retrieved_at`, always — a provider claiming a
 snapshot from the future is a malformed response, not a quote. All timestamps are
@@ -254,8 +260,16 @@ app/marketdata/
   validation_probe.py   the probe CLI (§14), sibling of app/ai/live_smoke.py
 ```
 
-**Enforced by review:** `providers/the_odds_api.py` is the only file permitted to
-import `httpx` or reference a vendor field name. Everything above it sees DTOs.
+**Enforced by review and by test:** `providers/the_odds_api.py` is the only file
+permitted to import `httpx` or reference a vendor field name. Everything above it
+sees DTOs.
+
+This applies to DIAGNOSTIC code as well as to the ingestion path. The validation
+probe needs to inspect a payload shape we have not committed to parsing, but that
+inspection lives in the adapter as `discover_event_shape()` and returns a neutral
+`ProviderShapeReport`; the CLI never indexes into vendor JSON. Exempting
+"it's only diagnostics" is how schema leakage starts, so a unit test asserts the
+probe module contains no vendor field names.
 
 ---
 
@@ -376,11 +390,19 @@ VENDOR_MARKET_KEYS: Mapping[str, StatFamily] = {
 }
 ```
 
-> **These five key spellings are UNVERIFIED.** Two of them (`player_pass_tds`,
-> `player_rush_yds`) were confirmed against vendor documentation; the full set was
-> not, because the vendor's docs are unreachable from the development sandbox.
-> The probe (§14) MUST print the actual keys returned and this table MUST be
-> corrected from a real payload before any paid call.
+> **All five spellings are now documented by the vendor** (confirmed by review
+> against The Odds API's current primary docs, 2026-09-16). They are no longer
+> guesses. They are still not *observed*: no live payload has returned them to
+> us, and `VERIFIED_MARKET_KEYS` therefore stays empty until the probe prints
+> what actually comes back. Documentation and observation are different
+> evidence, and the mechanical gate tracks the second.
+>
+> The same docs show alternate NFL player props under **separate `_alternate`
+> market keys**, which supports the V1 rule below: the mapping simply does not
+> list them, so alternates never enter. The ingestion-level ambiguity quarantine
+> in §10.1 stays as defence in depth — it costs nothing when alternates are
+> separately keyed, and it is the only thing standing between us and an
+> arbitrary canonical baseline if that ever changes.
 
 **Quarantine, never coercion.** An unrecognized vendor key is never mapped to a
 nearby family. It is counted in `ingestion_runs.markets_quarantined`, its key
@@ -664,7 +686,12 @@ Every one of these is a decision blocker. None may be guessed at in code.
 
 1. The exact vendor market keys returned, verbatim (corrects §10).
 2. Is `DRAFTKINGS` present, and which of the five families does it quote?
-3. Player identity: a stable id, or a display name only?
+3. Player identity: a stable id, or a display name only? An identifier being
+   PRESENT and an identifier MEANING player identity are separate claims; only
+   an explicitly player-semantic field (`player_id`, `participant_id`) counts as
+   stable. A bare `id` is reported as an unclassified identifier, because
+   guessing its semantics would silently merge or split real people in
+   `Player.external_ref`.
 4. Player metadata: does the response carry team? position? (§12.2)
 5. Alternate lines: a separate market key, or multiple outcomes within one key?
    (§10.1)
@@ -672,7 +699,10 @@ Every one of these is a decision blocker. None may be guessed at in code.
    proving the adapter binds it at the correct level (§3).
 7. Quota headers: used, remaining, cost for this call.
 8. Raw response size in bytes (§11.1).
-9. One fully normalized `ProviderQuote`, printed as a DTO.
+9. One fully normalized `ProviderQuote`, printed as a DTO — meaning a matched
+   Over/Under pair at a single line with both prices, not one outcome. If no
+   valid pair exists, that MUST be reported as unavailable with the reason,
+   never satisfied by presenting a single unpaired outcome.
 
 Exits non-zero on failure with the normalized error category.
 

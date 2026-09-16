@@ -11,11 +11,17 @@ telemetry; a bad coercion does not.
 
 TENTATIVE vs VERIFIED
 ---------------------
-The five spellings below are NOT production-trusted. Two of them were
-confirmed against vendor documentation; the full set was not, because the
-docs are unreachable from the development sandbox. They live in
-TENTATIVE_MARKET_KEYS until the live validation probe prints the keys the
-API actually returns.
+All five spellings below are documented by the vendor (confirmed against
+The Odds API's current primary docs, 2026-09-16). They are no longer
+guesses -- but they are still not OBSERVED: no live payload has returned
+them to us. Documentation and observation are different evidence, and this
+gate tracks the second, so they stay in TENTATIVE_MARKET_KEYS until the
+probe prints what actually comes back.
+
+Alternate NFL player props are documented under separate `_alternate`
+market keys. That is why this table needs no alternate-handling logic:
+unlisted keys are simply never mapped. The ingestion-level ambiguity
+quarantine remains as defence in depth.
 
 The split is mechanical, not advisory: `verified_market_keys()` returns
 the empty mapping, so any code path that requires verified keys refuses
@@ -39,11 +45,11 @@ TENTATIVE_MARKET_KEYS: Mapping[str, StatFamily] = MappingProxyType(
         "player_reception_yds": StatFamily.RECEIVING_YARDS,
     }
 )
-"""Candidate spellings, used ONLY to build probe requests. Never a basis
-for production persistence."""
+"""Vendor-documented spellings, used to build probe requests. Documented
+is not observed, so these are never a basis for production persistence."""
 
 VERIFIED_MARKET_KEYS: Mapping[str, StatFamily] = MappingProxyType({})
-"""Spellings proven against a real payload. Empty until the probe runs;
+"""Spellings observed in a real payload. Empty until the probe runs;
 populating it is a deliberate act, reviewed alongside the probe report."""
 
 
