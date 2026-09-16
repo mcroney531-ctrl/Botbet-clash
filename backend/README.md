@@ -331,7 +331,7 @@ OpenAI/Anthropic/Gemini SDKs.
   not derived from the pydantic models, whose `Decimal` fields would
   otherwise surface as schema type `"string"` — used by all three real
   adapters to constrain provider output).
-- `app/ai/prompts/versions.py` (`benchmark-v1` / `forecast-v1`),
+- `app/ai/prompts/versions.py` (`benchmark-v2` / `forecast-v1`),
   `benchmark_forecasting.py` (the neutral system instruction, verbatim
   from the brief, plus `render_benchmark_prompt()` which returns the
   exact dict persisted as `AgentSession.rendered_request` — the rendered
@@ -401,8 +401,16 @@ Exceptions from each SDK are mapped to the 8 normalized categories
 safety/refusal finish reason → `CONTENT_REFUSAL`, unparseable/empty
 content → `INVALID_PROVIDER_RESPONSE`, anything else → `UNKNOWN_PROVIDER_ERROR`).
 
-**Prompt/schema versions**: `prompt_version = "benchmark-v1"`,
-`schema_version = "forecast-v1"`. Only `BENCHMARK_FORECASTING` exists;
+**Prompt/schema versions**: `prompt_version = "benchmark-v2"`,
+`schema_version = "forecast-v1"`. (v2 moved the output-field semantics —
+confidence's 1–10 conviction scale, `key_factors`' five-item cap,
+`probability_over`'s 0–1 range — out of the request JSON Schema and into
+the instruction text, after Anthropic's structured-outputs dialect turned
+out to reject `minimum`/`maximum`/`maxItems`. Found live: with those
+keywords gone and nothing else carrying the meaning, all three providers
+independently returned `confidence` as a 0–1 value. The response schema
+itself did not change, so `schema_version` stayed at v1.)
+Only `BENCHMARK_FORECASTING` exists;
 `OPEN_MARKET_RESEARCH`/`STAKE_SIZING`/`FINAL_DECISION`/etc. are not
 implemented. The system instruction is neutral and identical for all
 three competitors — no personality, no "be conservative"/"be aggressive"
@@ -436,7 +444,7 @@ provider is contacted, together with its `agent_session_evidence_snapshots`
 input rows) → `CALLING` (committed in its own transaction just before the
 external call) → `VALID`/`INVALID`/`FAILED`. No DB transaction is ever
 held open across a network call. Idempotency: `orchestration_key =
-f"{season_competitor_id}:{checkpoint_run_id}:BENCHMARK_FORECASTING:benchmark-v1"`,
+f"{season_competitor_id}:{checkpoint_run_id}:BENCHMARK_FORECASTING:benchmark-v2"`,
 `UNIQUE`-constrained; a rerun that already produced a `VALID` session for
 that key returns the existing session id without ever resolving an
 adapter or touching a provider — proven with a "poison" registry in the
