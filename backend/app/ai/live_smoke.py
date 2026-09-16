@@ -57,8 +57,12 @@ PROVIDER_LABELS = {"openai": "OPENAI", "anthropic": "ANTHROPIC", "google": "GOOG
 
 
 def _smoke_rules() -> SeasonRules:
+    # Unique per run, same as the season name and every external_ref
+    # below -- season_rules.rules_version is UNIQUE at the DB level, and
+    # a second real run would otherwise collide with the first's row
+    # before ever reaching a provider call.
     return SeasonRules(
-        rules_version="2026-live-smoke",
+        rules_version=f"2026-live-smoke-{uuid.uuid4()}",
         starting_bankroll=Money.from_dollars_str("15.00"),
         kelly_fraction=Decimal("0.20"),
         standard_max_bankroll_fraction=Decimal("0.20"),
