@@ -32,7 +32,7 @@ from sqlalchemy import select
 
 from app.db.models.ingestion import IngestionRun, ProviderCall
 from app.db.models.markets import Game, Player
-from app.db.models.season import Season
+from app.db.models.season import Season, SeasonRules
 from app.db.repositories.market_repository import MarketRepository
 from app.db.session import session_scope
 from app.domain.enums import StatFamily
@@ -57,6 +57,7 @@ CANONICAL_BOOK = "DRAFTKINGS"
 
 @dataclass
 class Report:
+    season: str | None = None
     event_label: str | None = None
     game_id: str | None = None
     home: str | None = None
@@ -80,6 +81,63 @@ class Report:
     failures: list[str] = field(default_factory=list)
 
 
+class PreflightFailure(SystemExit):
+    """The run refused to write. Raised before any research row exists."""
+
+
+def _verify_target_season(session, *, season_id: uuid.UUID, week_number: int) -> Season:
+    """Fail closed before a single research row is written.
+
+    `Game.external_ref` is globally UNIQUE, so the first write of a real
+    provider event fixes that event's identity forever. Attaching it to
+    the wrong season -- or to week 0 -- would mean every later, correct
+    ingestion silently finds and reuses the bad row. There is no clean
+    unwind, which is why this is checked rather than defaulted.
+
+    Selecting by year is specifically NOT allowed: `Season.year` is not
+    unique and Phase 3's live smoke deliberately creates throwaway 2026
+    seasons, so `.first()` could hand back a smoke season.
+    """
+
+    if week_number < 1:
+        raise PreflightFailure(
+            f"--week-number must be a real NFL week (got {week_number}). Week 0 "
+            "would permanently mis-scope this event's globally unique external_ref."
+        )
+
+    season = session.get(Season, season_id)
+    if season is None:
+        raise PreflightFailure(f"no season {season_id}")
+
+    rules = session.execute(
+        select(SeasonRules)
+        .where(SeasonRules.season_id == season_id, SeasonRules.superseded_by.is_(None))
+        .order_by(SeasonRules.effective_from.desc())
+    ).scalars().first()
+    if rules is None:
+        raise PreflightFailure(f"season {season_id} has no active SeasonRules")
+
+    expected = {
+        "market_data_provider": ODDS_PROVIDER,
+        "roster_data_provider": ROSTER_PROVIDER,
+        "canonical_sportsbook": CANONICAL_BOOK,
+    }
+    wrong = {
+        field: (getattr(rules, field), want)
+        for field, want in expected.items()
+        if getattr(rules, field) != want
+    }
+    if wrong:
+        detail = "; ".join(f"{f}={got!r} (expected {want!r})" for f, (got, want) in wrong.items())
+        raise PreflightFailure(
+            f"season {season_id} ({season.name}) is not pinned to the real providers: "
+            f"{detail}.\nRefusing to write real research rows into a season whose "
+            "rules point somewhere else. Create an intentional research season with "
+            "these rules, or pass the right --season-id."
+        )
+    return season
+
+
 def _require_key() -> None:
     if not os.environ.get(API_KEY_ENV_VAR):
         raise SystemExit(
@@ -89,10 +147,15 @@ def _require_key() -> None:
         )
 
 
-def run(*, season_year: int, sport: str = DEFAULT_SPORT) -> Report:
+def run(*, season_id: uuid.UUID, week_number: int, sport: str = DEFAULT_SPORT) -> Report:
     report = Report()
     _require_key()
     now = datetime.now(timezone.utc)
+
+    with session_scope() as session:
+        season = _verify_target_season(session, season_id=season_id, week_number=week_number)
+        season_year = season.year
+        report.season = f"{season.name} ({season.year}) week {week_number}"
 
     odds = TheOddsApiProvider()
     roster_provider = NflverseRosterProvider()
@@ -188,19 +251,17 @@ def run(*, season_year: int, sport: str = DEFAULT_SPORT) -> Report:
         return report
 
     accepted, alt_diagnostics = partition_ambiguous_lines(quotes_result.payload)
+    # The snapshot MUST be taken at (or after) the quotes' own observation
+    # time. `now` was captured before the roster download and both provider
+    # calls, so building the snapshot at `now` would make quotes_as_of --
+    # which filters as_of_at <= taken_at -- exclude the very rows this run
+    # just wrote, and the acceptance would "prove" an empty baseline.
+    snapshot_taken_at = max((q.as_of_at for q in accepted), default=now)
     report.quotes_observed = len(quotes_result.payload)
     report.ambiguous = [f"{d.sportsbook}/{d.player_display_name}" for d in alt_diagnostics]
 
     # --- 4. persist ---------------------------------------------------
     with session_scope() as session:
-        season = session.execute(
-            select(Season).where(Season.year == season_year)
-        ).scalars().first()
-        if season is None:
-            season = Season(year=season_year, name=f"{season_year} live", status="ACTIVE")
-            session.add(season)
-            session.flush()
-
         repo = MarketRepository(session)
         game = session.execute(
             select(Game).where(Game.external_ref == event.ref.as_external_ref())
@@ -208,8 +269,8 @@ def run(*, season_year: int, sport: str = DEFAULT_SPORT) -> Report:
         if game is None:
             game = repo.create_game(
                 external_ref=event.ref.as_external_ref(),
-                season_id=season.id,
-                week_number=0,
+                season_id=season_id,
+                week_number=week_number,
                 home_team=event.home_team,
                 away_team=event.away_team,
                 home_team_canonical=home.value,
@@ -288,7 +349,9 @@ def run(*, season_year: int, sport: str = DEFAULT_SPORT) -> Report:
         service = MarketSnapshotService(session, market_data_provider=ODDS_PROVIDER)
         for market in markets:
             snap = service.build_snapshot(
-                market_id=market.id, canonical_sportsbook=CANONICAL_BOOK, taken_at=now
+                market_id=market.id,
+                canonical_sportsbook=CANONICAL_BOOK,
+                taken_at=snapshot_taken_at,
             )
             if snap.is_valid_canonical_baseline:
                 player = session.get(Player, market.player_id)
@@ -319,6 +382,7 @@ def render(report: Report) -> str:
     add("=" * 72)
     add("PHASE 4A.2 — REAL CURRENT INGESTION")
     add("=" * 72)
+    add(f"season:       {report.season}")
     add(f"event:        {report.event_label}  ({report.away} @ {report.home})")
     add(f"game_id:      {report.game_id}")
     add("")
@@ -371,11 +435,19 @@ def render(report: Report) -> str:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Phase 4A.2 real current ingestion")
-    parser.add_argument("--season", type=int, default=datetime.now(timezone.utc).year)
+    parser.add_argument(
+        "--season-id", required=True, type=uuid.UUID,
+        help="the intentional research season. Never selected by year: Season.year "
+             "is not unique and smoke seasons share it.",
+    )
+    parser.add_argument(
+        "--week-number", required=True, type=int,
+        help="the real NFL week. Week 0 is refused -- external_ref is global and permanent.",
+    )
     parser.add_argument("--sport", default=DEFAULT_SPORT)
     args = parser.parse_args(argv)
 
-    report = run(season_year=args.season, sport=args.sport)
+    report = run(season_id=args.season_id, week_number=args.week_number, sport=args.sport)
     print(render(report))
     return 1 if report.failures or not report.quotes_written else 0
 

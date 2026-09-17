@@ -274,9 +274,15 @@ class TheOddsApiProvider:
         ONE observation timestamp is stamped for the whole accepted
         response and shared by every quote in it (seam §3), so a retry
         within the same logical observation does not scatter as_of values.
+
+        That timestamp is taken AFTER the response arrives, not before the
+        request goes out. `retrieved_at` is defined as when our system
+        received the response, so a pre-request clock would make every
+        quote claim it was retrieved before it existed -- and would also
+        violate the as_of_at <= retrieved_at invariant the moment the two
+        were ever derived differently.
         """
 
-        observed = now or _utcnow()
         market_keys = vendor_keys_for(stat_families, verified_only=True)
 
         response, meta, failure = self._request(
@@ -304,6 +310,10 @@ class TheOddsApiProvider:
                 message="event-odds response was not a JSON object",
                 call_metadata=meta,
             )
+
+        # Post-response, shared by every quote in this accepted response.
+        # `now` remains overridable for deterministic tests only.
+        observed = now or meta.responded_at or _utcnow()
 
         quotes, diagnostics = self._normalize_event_odds(
             decoded, event=event, observed=observed, books=books

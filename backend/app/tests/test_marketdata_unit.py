@@ -608,3 +608,75 @@ def test_every_call_reports_telemetry_not_just_the_last():
     )
     assert len(results) == 5, "one call per family, each with its own quota telemetry"
     assert all(r.call_metadata.raw_response_sha256 for r in results)
+
+
+# --- Current-pull timestamps must not predate the response -------------
+
+
+def test_current_quote_timestamps_are_taken_after_the_response():
+    """`retrieved_at` means "when we received the response".
+
+    The first implementation stamped it from a clock read BEFORE the
+    request was sent, so every quote would have claimed it was retrieved
+    before it existed. Caught in review before any immutable real row was
+    written.
+    """
+
+    import httpx
+
+    from app.marketdata.providers.the_odds_api import TheOddsApiProvider
+
+    payload = _odds_payload(
+        outcomes=[
+            {"name": "Over", "description": "A Player", "point": 74.5, "price": -115},
+            {"name": "Under", "description": "A Player", "point": 74.5, "price": -105},
+        ]
+    )
+
+    def handler(request):
+        return httpx.Response(200, json=payload)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    provider = TheOddsApiProvider(api_key=SENTINEL_KEY, client=client)
+
+    before = datetime.now(timezone.utc)
+    result = provider.fetch_quotes(
+        event=ProviderEventRef(provider="THE_ODDS_API", external_event_id="evt-1"),
+        stat_families=[StatFamily.RECEIVING_YARDS],
+    )
+    assert result.ok and result.payload
+
+    requested_at = result.call_metadata.requested_at
+    responded_at = result.call_metadata.responded_at
+    for quote in result.payload:
+        assert quote.retrieved_at >= requested_at, "retrieved_at predates the request"
+        assert quote.retrieved_at == responded_at, "must be the post-response capture"
+        assert quote.as_of_at <= quote.retrieved_at, "invariant"
+        assert quote.as_of_at >= before
+
+
+def test_one_observation_timestamp_is_shared_across_the_whole_response():
+    """A single accepted response is ONE observation. Scattering as_of
+    across its quotes would make a retry look like several polls."""
+
+    import httpx
+
+    from app.marketdata.providers.the_odds_api import TheOddsApiProvider
+
+    payload = _odds_payload(
+        outcomes=[
+            {"name": "Over", "description": "Player One", "point": 74.5, "price": -115},
+            {"name": "Under", "description": "Player One", "point": 74.5, "price": -105},
+            {"name": "Over", "description": "Player Two", "point": 51.5, "price": -110},
+            {"name": "Under", "description": "Player Two", "point": 51.5, "price": -110},
+        ]
+    )
+    client = httpx.Client(
+        transport=httpx.MockTransport(lambda r: httpx.Response(200, json=payload))
+    )
+    result = TheOddsApiProvider(api_key=SENTINEL_KEY, client=client).fetch_quotes(
+        event=ProviderEventRef(provider="THE_ODDS_API", external_event_id="evt-1"),
+        stat_families=[StatFamily.RECEIVING_YARDS],
+    )
+    assert len({q.as_of_at for q in result.payload}) == 1
+    assert len({q.retrieved_at for q in result.payload}) == 1

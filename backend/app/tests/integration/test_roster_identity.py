@@ -252,3 +252,159 @@ def test_an_invalid_roster_basis_is_rejected_by_the_database():
                     resolved_team="DET", resolver_version="x", observed_at=NOW,
                 )
             )
+
+
+# --- live_ingest preflight and snapshot clock -------------------------
+
+
+def _rules(session, season_id, **overrides):
+    from decimal import Decimal
+
+    from app.db.models.season import SeasonRules
+
+    values = dict(
+        season_id=season_id,
+        rules_version=f"rules-{uuid.uuid4()}",
+        starting_bankroll_cents=1500,
+        canonical_sportsbook="DRAFTKINGS",
+        market_data_provider="THE_ODDS_API",
+        roster_data_provider="NFLVERSE",
+        research_settlement_provider="NFL_OFFICIAL_STATS",
+        research_settlement_delay_hours=72,
+        supported_prop_types=["receiving_yards"],
+        devig_method="PROPORTIONAL_V1",
+        benchmark_slate_size=10,
+        batch_methodology="BATCH_SMALL",
+        checkpoint_windows={},
+        kelly_fraction=Decimal("0.25"),
+        standard_max_bankroll_fraction=Decimal("0.10"),
+        exceptional_max_bankroll_fraction=Decimal("0.20"),
+        minimum_stake_cents=25,
+        stake_increment_cents=25,
+        pounce_limit=1,
+        attribution_confidence_threshold=Decimal("0.700"),
+        weekly_decision_deadline_rule={},
+        effective_from=NOW,
+    )
+    values.update(overrides)
+    row = SeasonRules(**values)
+    session.add(row)
+    session.flush()
+    return row
+
+
+def test_live_ingest_refuses_a_season_not_pinned_to_the_real_providers():
+    """Fail closed BEFORE any research row exists.
+
+    Game.external_ref is globally unique, so the first write of a real
+    provider event fixes that event's identity permanently. Attaching it
+    to a Phase-3 smoke season would mean every later correct ingestion
+    silently reuses the bad row, and there is no clean unwind.
+    """
+
+    from app.marketdata.live_ingest import PreflightFailure, _verify_target_season
+
+    with session_scope() as session:
+        season = Season(year=2026, name="phase-3 smoke", status="ACTIVE")
+        session.add(season)
+        session.flush()
+        _rules(session, season.id, market_data_provider="SYNTHETIC", roster_data_provider="SYNTHETIC")
+
+        with pytest.raises(PreflightFailure, match="not pinned to the real providers"):
+            _verify_target_season(session, season_id=season.id, week_number=3)
+
+
+def test_live_ingest_refuses_week_zero():
+    from app.marketdata.live_ingest import PreflightFailure, _verify_target_season
+
+    with session_scope() as session:
+        season = Season(year=2026, name="real research", status="ACTIVE")
+        session.add(season)
+        session.flush()
+        _rules(session, season.id)
+        with pytest.raises(PreflightFailure, match="real NFL week"):
+            _verify_target_season(session, season_id=season.id, week_number=0)
+
+
+def test_live_ingest_accepts_a_correctly_pinned_season():
+    from app.marketdata.live_ingest import _verify_target_season
+
+    with session_scope() as session:
+        season = Season(year=2026, name="real research", status="ACTIVE")
+        session.add(season)
+        session.flush()
+        _rules(session, season.id)
+        assert _verify_target_season(session, season_id=season.id, week_number=3).id == season.id
+
+
+def test_a_snapshot_taken_at_the_quote_observation_time_sees_those_quotes():
+    """The snapshot clock regression.
+
+    live_ingest captured `now` before the roster download and both
+    provider calls, then built the MarketSnapshot at that stale `now`.
+    Since quotes_as_of filters as_of_at <= taken_at, the quotes the run
+    had just written were invisible and the acceptance would have
+    "proved" an empty baseline.
+    """
+
+    from decimal import Decimal
+
+    from app.db.models.markets import PropMarket
+    from app.forecast_lab.market_snapshot_service import MarketSnapshotService
+    from app.marketdata.dto import ProviderEventRef, ProviderPlayerRef, ProviderQuote
+    from app.marketdata.ingestion import IngestionService
+    from app.domain.enums import StatFamily
+
+    with session_scope() as session:
+        game = _game(session, "snapclock")
+        snap = _snapshot(GOFF)
+        roster_call = _roster_call(session, tag="snapclock")
+        gp = resolve_and_record(
+            session, game_id=game.id, resolution=_resolve("Jared Goff", snap),
+            display_name="Jared Goff", snapshot=snap,
+            roster_provider_call_id=roster_call.id, observed_at=NOW,
+        )
+
+        market = PropMarket(game_id=game.id, player_id=gp.player_id, stat_type="passing_yards")
+        session.add(market)
+        session.flush()
+
+        run_started = NOW                      # what live_ingest used to use
+        quote_observed = NOW + timedelta(minutes=4)   # after the network work
+
+        quote_call = _roster_call(session, tag="snapclock-quotes")
+        service = IngestionService(session)
+        for book, over, under in (("DRAFTKINGS", -113, -111), ("FANDUEL", -110, -110)):
+            service.persist_quote(
+                quote=ProviderQuote(
+                    event=ProviderEventRef(provider="THE_ODDS_API", external_event_id="e1"),
+                    player=ProviderPlayerRef(provider="THE_ODDS_API", display_name="Jared Goff"),
+                    stat_family=StatFamily.PASSING_YARDS,
+                    vendor_market_key="player_pass_yds",
+                    sportsbook=book,
+                    line=Decimal("266.5"),
+                    over_price=over,
+                    under_price=under,
+                    as_of_at=quote_observed,
+                    retrieved_at=quote_observed,
+                    source="THE_ODDS_API",
+                ),
+                market_id=market.id,
+                provider_call=quote_call,
+            )
+
+        svc = MarketSnapshotService(session, market_data_provider="THE_ODDS_API")
+
+        stale = svc.build_snapshot(
+            market_id=market.id, canonical_sportsbook="DRAFTKINGS", taken_at=run_started
+        )
+        assert stale.number_of_books == 0, "the old clock could not see its own quotes"
+        assert stale.is_valid_canonical_baseline is False
+
+        correct = svc.build_snapshot(
+            market_id=market.id, canonical_sportsbook="DRAFTKINGS", taken_at=quote_observed
+        )
+        assert correct.number_of_books == 2
+        assert correct.is_valid_canonical_baseline is True
+        assert correct.canonical_line == Decimal("266.50")
+        assert correct.canonical_over_probability is not None
