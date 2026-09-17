@@ -146,6 +146,33 @@ from one doc example that they always will. Different endpoint shapes and future
 vendor changes can differ; the probe reports which levels are present so the
 binding is confirmed rather than assumed.
 
+### 3.1 Two different ages — never conflate them
+
+This distinction was got wrong once, in the analysis of the first real
+ingestion run, and the error is easy to repeat because both numbers are
+measured in seconds and both feel like "freshness".
+
+| metric | formula | role |
+| --- | --- | --- |
+| **observation age** | `checkpoint/snapshot taken_at − PropQuote.as_of_at` | how old OUR OBSERVATION is when a checkpoint consumes it. **This** is what a live freshness rule is built on. |
+| **provider market-change age** | `PropQuote.as_of_at − provider_market_updated_at` | how long since the BOOK last moved this market. **Diagnostic only.** |
+
+The second MUST NOT drive checkpoint eligibility, and a threshold MUST NOT
+be derived from it. A book can leave a line untouched for forty-five
+minutes; if we successfully re-fetch it one second before `FINAL`, that is
+a **fresh observation of a quiet market**, not a stale quote. Treating
+market-change age as staleness would reject exactly the markets that are
+most settled.
+
+This is the same fact §4 relies on when it retains repeated unchanged
+observations: an unchanged market observed again is new information about
+our feed, not a duplicate.
+
+Where the live design fetches immediately before a snapshot or checkpoint
+capture, the observation age is near zero by construction. The tolerance
+is therefore an **operational stale-data guard** for a failed or missed
+refresh — not a measure of how recently a sportsbook changed its odds.
+
 **Invariants.** `as_of_at <= retrieved_at`, always — a provider claiming a
 snapshot from the future is a malformed response, not a quote. All timestamps are
 timezone-aware UTC at the boundary; the adapter converts, and nothing downstream

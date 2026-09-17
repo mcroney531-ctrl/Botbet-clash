@@ -78,7 +78,20 @@ class Report:
     unresolved: list[str] = field(default_factory=list)
     ambiguous: list[str] = field(default_factory=list)
     conflicts: list[str] = field(default_factory=list)
-    quote_age_seconds: list[float] = field(default_factory=list)
+    # TWO DIFFERENT AGES. Conflating them is a methodology error, so they
+    # are never merged into one list or one label.
+    #
+    # observation_age = snapshot taken_at - quote.as_of_at
+    #     How old OUR OBSERVATION is when a checkpoint consumes it. This is
+    #     the candidate input to the eventual live freshness rule.
+    #
+    # provider_market_change_age = quote.as_of_at - provider_market_updated_at
+    #     How long since the BOOK last moved this market. Diagnostic only;
+    #     the seam forbids it from driving checkpoint eligibility, because a
+    #     market left unchanged for an hour and successfully re-fetched one
+    #     second ago is a FRESH observation of a quiet market.
+    observation_age_seconds: list[float] = field(default_factory=list)
+    provider_market_change_age_seconds: list[float] = field(default_factory=list)
     snapshot: dict | None = None
     books: list[str] = field(default_factory=list)
     quota_remaining: int | None = None
@@ -349,7 +362,11 @@ def run(
             name = quote.player.display_name
             if name not in resolved_cache:
                 resolution = resolve_player(
-                    odds_display_name=name, home_team=home, away_team=away, snapshot=snapshot
+                    odds_display_name=name,
+                    home_team=home,
+                    away_team=away,
+                    snapshot=snapshot,
+                    provider=ODDS_PROVIDER,
                 )
                 if not resolution.resolved:
                     resolved_cache[name] = None
@@ -387,7 +404,7 @@ def run(
             else:
                 report.quotes_written += 1
                 if quote.provider_market_updated_at:
-                    report.quote_age_seconds.append(
+                    report.provider_market_change_age_seconds.append(
                         (quote.as_of_at - quote.provider_market_updated_at).total_seconds()
                     )
             if quote.sportsbook not in report.books:
@@ -404,6 +421,10 @@ def run(
         game_id = game.id
 
     # --- 5. one real MarketSnapshot ----------------------------------
+    report.observation_age_seconds = [
+        (snapshot_taken_at - q.as_of_at).total_seconds() for q in accepted
+    ]
+
     with session_scope() as session:
         repo = MarketRepository(session)
         markets = repo.markets_for_game(game_id)
@@ -467,12 +488,28 @@ def render(report: Report) -> str:
     add(f"  quotes written:      {report.quotes_written}")
     add(f"  quotes deduplicated: {report.quotes_deduplicated}")
     add(f"  books:               {', '.join(report.books)}")
-    if report.quote_age_seconds:
-        ages = sorted(report.quote_age_seconds)
-        add(f"  quote age vs vendor last_update (seconds):")
+    add("")
+    add("--- (A) OBSERVATION AGE — candidate freshness metric ----------------")
+    add("  snapshot taken_at - quote.as_of_at, in seconds.")
+    add("  How old OUR OBSERVATION was when the snapshot consumed it. THIS is")
+    add("  the age a live checkpoint freshness rule should be built on.")
+    if report.observation_age_seconds:
+        ages = sorted(report.observation_age_seconds)
+        add(f"    min {ages[0]:.1f} | median {ages[len(ages)//2]:.1f} | max {ages[-1]:.1f}")
+    else:
+        add("    (none)")
+    add("")
+    add("--- (B) PROVIDER MARKET-CHANGE AGE — DIAGNOSTIC ONLY ---------------")
+    add("  quote.as_of_at - provider_market_updated_at, in seconds.")
+    add("  How long since the BOOK last moved this market. This is NOT quote")
+    add("  freshness and MUST NOT drive checkpoint eligibility: a market left")
+    add("  unchanged for an hour and successfully re-fetched one second ago is")
+    add("  a fresh observation of a quiet market, not a stale quote.")
+    if report.provider_market_change_age_seconds:
+        ages = sorted(report.provider_market_change_age_seconds)
         add(f"    min {ages[0]:.0f} | median {ages[len(ages)//2]:.0f} | max {ages[-1]:.0f}")
-        add("    (evidence for the Week-0 quote-freshness threshold, which is")
-        add("     deliberately NOT invented here)")
+    else:
+        add("    (none)")
     add("")
     add("--- real MarketSnapshot --------------------------------------------")
     if report.snapshot:

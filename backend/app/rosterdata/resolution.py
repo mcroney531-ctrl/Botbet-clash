@@ -16,13 +16,18 @@ from collections import defaultdict
 from typing import Mapping, Sequence
 
 from app.marketdata.dto import normalize_player_name
+from app.rosterdata.aliases import alias_target
 from app.rosterdata.base import PlayerResolution, RosterEntry, RosterSnapshot
 from app.rosterdata.teams import CanonicalTeam
 
-RESOLVER_VERSION = "two-team-exact-v1"
+RESOLVER_VERSION = "two-team-exact-alias-v2"
 """The roster equivalent of PropQuote.parser_version. If normalization or
 matching logic changes, we must be able to tell which logic produced an
-old observation. Provenance only -- nothing filters on it."""
+old observation. Provenance only -- nothing filters on it.
+
+v1 -> v2: added the explicit provider alias pass (app/rosterdata/aliases.py)
+after the first real run measured one genuine miss. Exact matching still
+wins; the alias is only consulted when exact matching finds nothing."""
 
 
 def stable_player_external_ref(stable_id: str) -> str:
@@ -49,12 +54,26 @@ def index_by_team(
     return index
 
 
+def index_by_stable_id(
+    snapshot: RosterSnapshot, teams: Sequence[CanonicalTeam]
+) -> Mapping[str, list[RosterEntry]]:
+    """Stable-id index over ONLY the given teams' entries."""
+
+    wanted = set(teams)
+    index: dict[str, list[RosterEntry]] = defaultdict(list)
+    for entry in snapshot.entries:
+        if entry.team in wanted and (entry.stable_id or "").strip():
+            index[entry.stable_id].append(entry)
+    return index
+
+
 def resolve_player(
     *,
     odds_display_name: str,
     home_team: CanonicalTeam,
     away_team: CanonicalTeam,
     snapshot: RosterSnapshot,
+    provider: str | None = None,
 ) -> PlayerResolution:
     """Resolve one odds name against one game's two rosters.
 
@@ -66,6 +85,31 @@ def resolve_player(
 
     index = index_by_team(snapshot, (home_team, away_team))
     candidates = index.get(normalize_player_name(odds_display_name), [])
+    via_alias = False
+
+    if not candidates and provider is not None:
+        # Second pass ONLY. Exact matching always wins, so an alias can never
+        # override a real roster name -- it can only rescue a name that
+        # matched nothing.
+        target = alias_target(provider=provider, display_name=odds_display_name)
+        if target is not None:
+            # The alias names a stable identity, but that identity must still
+            # be present on one of THIS event's two teams. An alias can never
+            # pull a player into a game he is not in, and it stops working the
+            # moment he changes teams -- which is the intended behaviour, not
+            # a limitation.
+            by_id = index_by_stable_id(snapshot, (home_team, away_team))
+            candidates = by_id.get(target, [])
+            via_alias = True
+            if not candidates:
+                return PlayerResolution(
+                    outcome="UNRESOLVED_PLAYER",
+                    detail=(
+                        f"alias maps {odds_display_name!r} to {target}, but that "
+                        f"identity is not on {home_team.value} or {away_team.value} "
+                        "in this roster snapshot; refusing to force it into the game"
+                    ),
+                )
 
     if not candidates:
         return PlayerResolution(
@@ -116,6 +160,9 @@ def resolve_player(
         team=entry.team,
         position=(entry.position or None),
         opponent=opponent,
+        detail=(
+            f"resolved via explicit alias to {entry.stable_id}" if via_alias else ""
+        ),
     )
 
 

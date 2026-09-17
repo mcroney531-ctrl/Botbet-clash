@@ -331,3 +331,144 @@ def test_a_genuinely_stale_snapshot_still_exceeds_the_tolerance():
     checked_at = NOW
     stale = _snapshot(GOFF, retrieved_at=NOW - timedelta(hours=37))
     assert stale.age_hours(at=checked_at) > LIVE_ROSTER_MAX_AGE_HOURS
+
+
+# --- explicit alias: narrow by construction ----------------------------
+
+PALMER = RosterEntry("00-0036988", "Josh Palmer", CanonicalTeam.BUF, "WR", 2026, None)
+ODDS = "THE_ODDS_API"
+
+
+def _resolve(name, snapshot, provider=ODDS, home=CanonicalTeam.BUF, away=CanonicalTeam.DET):
+    return resolve_player(
+        odds_display_name=name,
+        home_team=home,
+        away_team=away,
+        snapshot=snapshot,
+        provider=provider,
+    )
+
+
+def test_the_measured_alias_resolves_to_the_stable_identity():
+    """Measured 2026-09-17: Odds API "Joshua Palmer" vs nflverse
+    "Josh Palmer". One miss in fifteen players, 11 quotes lost."""
+
+    r = _resolve("Joshua Palmer", _snapshot(PALMER, ALLEN))
+    assert r.outcome == "RESOLVED"
+    assert r.stable_id == "00-0036988"
+    assert r.team is CanonicalTeam.BUF
+    assert r.opponent is CanonicalTeam.DET
+    assert "explicit alias" in r.detail
+
+
+def test_exact_matching_still_wins_before_the_alias_is_consulted():
+    r = _resolve("Josh Palmer", _snapshot(PALMER, ALLEN))
+    assert r.outcome == "RESOLVED"
+    assert r.stable_id == "00-0036988"
+    assert r.detail == "", "an exact hit must not be attributed to the alias pass"
+
+
+def test_josh_allen_is_untouched_by_the_palmer_alias():
+    """No nickname rule was added, so the Josh/Joshua pair in this very
+    game stays unaffected."""
+
+    r = _resolve("Josh Allen", _snapshot(PALMER, ALLEN))
+    assert r.outcome == "RESOLVED"
+    assert r.stable_id == "00-0034857"
+    assert _resolve("Joshua Allen", _snapshot(PALMER, ALLEN)).outcome == "UNRESOLVED_PLAYER", (
+        "there is no Josh <-> Joshua expansion; only the reviewed alias exists"
+    )
+
+
+def test_an_alias_cannot_pull_a_player_into_a_game_he_is_not_in():
+    """The alias names an identity; that identity must still be found on
+    one of THIS event's two teams."""
+
+    r = _resolve("Joshua Palmer", _snapshot(GOFF, ALLEN))  # no Palmer on the pool
+    assert r.outcome == "UNRESOLVED_PLAYER"
+    assert "refusing to force it into the game" in r.detail
+
+
+def test_an_alias_stops_working_when_the_player_changes_teams():
+    """Intended behaviour, not a limitation: the two-team constraint is
+    applied to the alias target exactly as to an exact match."""
+
+    r = _resolve(
+        "Joshua Palmer",
+        _snapshot(PALMER, GOFF),
+        home=CanonicalTeam.KC,
+        away=CanonicalTeam.SF,
+    )
+    assert r.outcome == "UNRESOLVED_PLAYER"
+
+
+def test_the_alias_is_scoped_to_one_provider():
+    assert _resolve("Joshua Palmer", _snapshot(PALMER), provider="SOME_OTHER_FEED").outcome == (
+        "UNRESOLVED_PLAYER"
+    )
+    assert _resolve("Joshua Palmer", _snapshot(PALMER), provider=None).outcome == (
+        "UNRESOLVED_PLAYER"
+    )
+
+
+def test_no_general_nickname_fuzzy_or_suffix_logic_was_introduced():
+    """Checks EXECUTABLE code only.
+
+    The module's own prose says "no fuzzy matching, no nickname handling",
+    so a naive substring scan over the whole source matches the very
+    statement that the techniques are absent.
+    """
+
+    import ast
+    import inspect
+
+    from app.rosterdata import resolution
+
+    tree = ast.parse(inspect.getsource(resolution))
+    # Drop every docstring, then unparse back to pure code.
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef)):
+            body = node.body
+            if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+                if isinstance(body[0].value.value, str):
+                    node.body = body[1:] or [ast.Pass()]
+    code = ast.unparse(tree).lower()
+
+    for forbidden in ("difflib", "levenshtein", "fuzz", "nickname", "startswith", "soundex"):
+        assert forbidden not in code, f"{forbidden} appeared in resolver CODE"
+
+
+def test_resolver_version_records_the_alias_behaviour():
+    assert RESOLVER_VERSION == "two-team-exact-alias-v2"
+
+
+# --- the two ages are never conflated ----------------------------------
+
+
+def test_live_ingest_reports_observation_age_separately_from_market_change_age():
+    """The methodology correction.
+
+    provider_market_updated_at is diagnostic only per the market seam §3.
+    A market left unchanged for an hour and successfully re-fetched one
+    second ago is a FRESH observation of a quiet market -- so vendor
+    last_update age must never be presented as quote freshness.
+    """
+
+    import inspect
+
+    from app.marketdata import live_ingest
+
+    report = live_ingest.Report()
+    assert hasattr(report, "observation_age_seconds")
+    assert hasattr(report, "provider_market_change_age_seconds")
+    assert not hasattr(report, "quote_age_seconds"), "the ambiguous field is gone"
+
+    rendered = live_ingest.render(report)
+    assert "OBSERVATION AGE" in rendered
+    assert "PROVIDER MARKET-CHANGE AGE — DIAGNOSTIC ONLY" in rendered
+    assert "MUST NOT drive checkpoint eligibility" in rendered
+
+    source = inspect.getsource(live_ingest)
+    assert "snapshot_taken_at - q.as_of_at" in source, (
+        "observation age must be measured against the snapshot clock"
+    )

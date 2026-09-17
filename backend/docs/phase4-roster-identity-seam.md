@@ -391,10 +391,34 @@ Never create a `Player` from an unresolved odds name. Once this resolver exists,
 the `THE_ODDS_API:name:<name>` fallback is **never** used for production
 ingestion — it remains only as the probe's shape-discovery output.
 
-**Alias table: deferred.** It would be justified by a measured miss rate and we
-do not have one. Correct sequence: run 4A.2, let `UNRESOLVED_PLAYER` diagnostics
-accumulate in telemetry, build an alias table only if the misses prove real and
-repeating.
+### 7.1 Explicit aliases — added on measurement, 2026-09-17
+
+The deferral said: build an alias table only once a real miss rate exists.
+The first real ingestion run produced one — `Joshua Palmer` (The Odds API) against
+`Josh Palmer` (nflverse), `GSIS:00-0036988`, BUF WR. One miss in fifteen players,
+costing 11 otherwise valid quotes.
+
+What was **not** built: `Josh ↔ Joshua` expansion, a nickname dictionary, fuzzy
+matching, or suffix manipulation. That same game contained a **Josh Allen** — a
+nickname rule is safe there by luck, and generalising from one observation is how
+a resolver stops being trustworthy.
+
+What was built: `app/rosterdata/aliases.py`, a source-controlled table keyed on
+`(provider, normalized spelling) → GSIS id`, where every entry cites the run that
+measured it.
+
+Two safety properties are preserved by construction:
+
+- An alias names a **stable identity**, never another display name, so it cannot
+  chain or drift.
+- The alias target must still be found in the event's **own two-team roster pool**
+  at resolution time. An alias can never pull a player into a game he is not in,
+  and it stops working the moment he changes teams — intended, not a limitation.
+
+Exact matching always runs first; the alias is consulted only when exact matching
+finds nothing, so an alias can never override a real roster name.
+`RESOLVER_VERSION` moved to `two-team-exact-alias-v2` so every
+`GamePlayerObservation` records which behaviour produced it.
 
 ---
 
