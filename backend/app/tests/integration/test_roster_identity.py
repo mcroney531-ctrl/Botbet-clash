@@ -508,3 +508,27 @@ def test_smoke_seasons_stay_synthetic_and_are_never_eligible():
         assert existing_research_seasons(session) == []
         with pytest.raises(PreflightFailure, match="not pinned to the real providers"):
             _verify_target_season(session, season_id=smoke.id, week_number=3)
+
+
+def test_the_inspector_is_read_only_and_reports_revalidation_invariants():
+    """The acceptance report describes one RUN; the invariants are about
+    the TABLES across runs. Re-running paid ingestion to check them would
+    cost credits and mutate the state being inspected."""
+
+    import ast
+    import inspect
+
+    from app.marketdata import inspect_ingestion
+
+    tree = ast.parse(inspect.getsource(inspect_ingestion))
+    writes = [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Call)
+        and getattr(n.func, "attr", None) in {"add", "add_all", "delete", "commit", "flush"}
+        and getattr(getattr(n.func, "value", None), "id", None) == "session"
+    ]
+    assert writes == [], "the inspector must never write"
+
+    source = inspect.getsource(inspect_ingestion)
+    for forbidden in ("TheOddsApiProvider", "fetch_quotes", "list_events", "httpx"):
+        assert forbidden not in source, f"{forbidden} would spend credits"
