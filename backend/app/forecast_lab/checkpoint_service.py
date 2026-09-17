@@ -43,6 +43,7 @@ def capture_checkpoint(
     canonical_sportsbook: str,
     devig_method: str = "PROPORTIONAL_V1",
     market_data_provider: str = SYNTHETIC_SOURCE,
+    max_observation_age_seconds: int | None = None,
 ) -> CheckpointRun:
     """Idempotent: a second call after `status == "CAPTURED"` is a pure
     no-op that returns the existing row untouched — no new snapshots, no
@@ -74,8 +75,16 @@ def capture_checkpoint(
         return run
 
     market_repo = MarketRepository(session)
+    # `now` is the capture clock for BOTH the snapshots and run.captured_at
+    # below, so quote observation age is measured against when the capture
+    # actually happened -- never against `target_time`, which is scheduling
+    # intent and can be hours away from it. The gap between the two is a
+    # separate, separately-named quantity (scheduler offset).
     snapshot_service = MarketSnapshotService(
-        session, devig_method=devig_method, market_data_provider=market_data_provider
+        session,
+        devig_method=devig_method,
+        market_data_provider=market_data_provider,
+        max_observation_age_seconds=max_observation_age_seconds,
     )
     for market in market_repo.markets_for_game(game.id):
         snapshot = snapshot_service.build_snapshot(market_id=market.id, canonical_sportsbook=canonical_sportsbook, taken_at=now)

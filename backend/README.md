@@ -790,3 +790,142 @@ called "fully real" merely because its `MarketSnapshot` is.
 ### Test count
 
 **214 passed, 4 skipped.**
+
+---
+
+## Phase 4A.3 readout — quote freshness is now a decision the snapshot records
+
+Phase 4A.2 left one thing explicitly owed: the live quote-freshness
+tolerance. 4A.3 does not set it. It builds the mechanism that can, and
+makes every decision the mechanism takes visible on the row it took it on.
+
+### The correction that opened the phase
+
+The 4A.2 readout said to measure `checkpoint time − latest eligible
+as_of_at`, and elsewhere named that clock `CheckpointRun.target_time`.
+That is wrong, and it is the kind of wrong that would have looked fine in
+production.
+
+`target_time` is **scheduling intent** — where a capture wanted to land.
+`captured_at` is when it actually ran. A capture that fires an hour late
+is still a real capture, and the observations it consumed are stale only
+relative to when it ran. Measuring against `target_time` would have
+reported the scheduler's lateness as market staleness and excluded quotes
+that were perfectly fresh at capture.
+
+Two quantities, named apart so they cannot be merged by accident:
+
+| metric | formula |
+| --- | --- |
+| quote observation age | `MarketSnapshot.taken_at − selected PropQuote.as_of_at` |
+| scheduler offset | `CheckpointRun.captured_at − CheckpointRun.target_time` |
+
+`capture_checkpoint` passes one `now` into both `build_snapshot(taken_at=)`
+and `run.captured_at`, so the snapshot clock and the capture clock are the
+same value by construction, not by convention.
+
+### What the gate does
+
+Freshness is evaluated **per selected sportsbook quote** — the newest
+observation from each book as of `taken_at` — on observation age and
+nothing else. `provider_market_updated_at` is never consulted.
+
+- A **stale non-canonical book** is excluded from the whole snapshot:
+  consensus, `market_median/min/max_line`, and `number_of_books`. Its
+  `PropQuote` row is untouched — exclusion is a read-side decision, never
+  a retraction of an observation we genuinely made.
+- A **stale canonical book** invalidates the baseline and promotes nobody
+  (RULES.md §16). The fresh books still supply market context; that is
+  diagnostic, not a baseline.
+- `canonical_quote_stale` is recorded **separately** from
+  `is_valid_canonical_baseline = false`. "The book was quoting, we just
+  had nothing recent enough" and "the book was not in the feed at all" are
+  different failures and only one is an ingestion problem.
+
+### Four new columns, and why each one exists
+
+```
+max_observation_age_seconds   the threshold IN FORCE when this snapshot was built
+stale_books_excluded          how many books the gate refused
+canonical_quote_stale         whether the canonical book was one of them
+selected_quotes  (JSONB)      the exact PropQuote ids consumed and refused
+```
+
+`max_observation_age_seconds` is not bookkeeping. Without it, changing a
+season's tolerance later makes every historical snapshot's include/exclude
+decision unreproducible — you can no longer tell which rule produced it.
+Pre-4A.3 rows keep `NULL`, which is the honest value (no gate was in
+force) and is **not** the same as `0`.
+
+`selected_quotes` is frozen into the row rather than re-derived. The query
+filters `as_of_at <= taken_at`, which *looks* reproducible. It is not: a
+Phase 4B backfill can legitimately insert an observation whose `as_of_at`
+predates a snapshot already taken, and the same query then returns a
+different answer for the same snapshot. There is a test that does exactly
+this and asserts the stored record does not move.
+
+**Invariant:** `number_of_books + stale_books_excluded` equals the number
+of books that had any quote. A book must never fall out of both counts —
+that is how "the feed dropped a book" becomes a snapshot that merely looks
+thin.
+
+### There is deliberately no default threshold
+
+`max_observation_age_seconds` is a caller-supplied parameter on
+`MarketSnapshotService`, `capture_checkpoint`, and `live_ingest`
+(`--max-observation-age-seconds`). `None` disables the gate and is the
+default, reproducing Phase-2 behaviour exactly.
+
+It is **not** a `SeasonRules` column yet, and that is the point. The two
+real DET @ BUF runs are 15h51m36s apart, which says what a *missed*
+refresh looks like and nothing about what a normal one does. A
+plausible-looking default picked now would be a guess frozen into the
+research record. The mechanism is observable first; the number comes from
+real captures.
+
+### Acceptance
+
+Twelve integration tests against real Postgres, **zero Odds API credits**.
+They use the two genuine observation timestamps from the live runs
+(`04:19:20.012177Z` and `20:10:56.225032Z`) with captures placed at
+controlled times against them — a fixture of "now" and "now minus ten
+seconds" would pass without ever exercising a realistic staleness spread.
+
+The tests were checked by mutation, not just by passing:
+
+| break the implementation | what went red |
+| --- | --- |
+| boundary `>` → `>=` | the inclusive-boundary test |
+| age read from `provider_market_updated_at` | the vendor-field test |
+| promote a fresh book when canonical is stale | both canonical-staleness tests |
+| omit the selection record | 11 of 12 |
+
+The migration (`d2b9f45c1a7e`) was applied to a clean database through the
+full chain and round-tripped down and back up; the resulting schema shows
+no drift against `Base.metadata` and no leftover `server_default`.
+
+### Still owed
+
+The tolerance itself. That needs live captures where quotes were fetched
+meaningfully earlier than the checkpoint fired — which the mechanism now
+records, and previously could not.
+
+Also open, and deliberately NOT decided here: whether a stale-book
+exclusion should be visible in the `EvidenceSnapshot` payload the
+competitors see. Today it is not — a model shown `number_of_books: 3`
+cannot tell that two books were dropped. That may well be the wrong
+answer, but the evidence payload is prompt-versioned and frozen per
+season, so changing what competitors are shown is a competition decision,
+not an ingestion one. It is recorded on the snapshot either way; only the
+hand-off is undecided. (The canonical market already reads as null when
+the canonical book is stale, so nothing is silently substituted in the
+payload.)
+
+Unchanged from 4A.2: Phase 4B historical reconstruction is out of scope
+and needs the paid tier, and Phase 4 still makes only the **market**
+component real. Recent player stats, injuries, news and team context are
+still mocked Phase-2 payload content.
+
+### Test count
+
+**226 passed, 4 skipped.**

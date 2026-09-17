@@ -94,6 +94,14 @@ class Report:
     provider_market_change_age_seconds: list[float] = field(default_factory=list)
     snapshot: dict | None = None
     books: list[str] = field(default_factory=list)
+    # Phase 4A.3 freshness gate, as APPLIED by this run's snapshots. None
+    # means no gate was configured, which is not the same as a gate that
+    # excluded nothing -- the report says which it was.
+    max_observation_age_seconds: int | None = None
+    snapshots_built: int = 0
+    snapshots_valid_baseline: int = 0
+    snapshots_canonical_stale: int = 0
+    stale_books_excluded: int = 0
     quota_remaining: int | None = None
     quota_cost: int = 0
     failures: list[str] = field(default_factory=list)
@@ -166,9 +174,15 @@ def _require_key() -> None:
 
 
 def run(
-    *, season_id: uuid.UUID, week_number: int, event_id: str, sport: str = DEFAULT_SPORT
+    *,
+    season_id: uuid.UUID,
+    week_number: int,
+    event_id: str,
+    sport: str = DEFAULT_SPORT,
+    max_observation_age_seconds: int | None = None,
 ) -> Report:
     report = Report()
+    report.max_observation_age_seconds = max_observation_age_seconds
     _require_key()
     now = datetime.now(timezone.utc)
 
@@ -428,14 +442,26 @@ def run(
     with session_scope() as session:
         repo = MarketRepository(session)
         markets = repo.markets_for_game(game_id)
-        service = MarketSnapshotService(session, market_data_provider=ODDS_PROVIDER)
+        service = MarketSnapshotService(
+            session,
+            market_data_provider=ODDS_PROVIDER,
+            max_observation_age_seconds=max_observation_age_seconds,
+        )
         for market in markets:
             snap = service.build_snapshot(
                 market_id=market.id,
                 canonical_sportsbook=CANONICAL_BOOK,
                 taken_at=snapshot_taken_at,
             )
-            if snap.is_valid_canonical_baseline:
+            # Counted over EVERY snapshot, not just the one displayed
+            # below. A gate strict enough to invalidate every baseline
+            # would otherwise leave the report saying nothing at all,
+            # which is the one case where it most needs to speak.
+            report.snapshots_built += 1
+            report.snapshots_valid_baseline += int(snap.is_valid_canonical_baseline)
+            report.snapshots_canonical_stale += int(snap.canonical_quote_stale)
+            report.stale_books_excluded += snap.stale_books_excluded
+            if snap.is_valid_canonical_baseline and report.snapshot is None:
                 player = session.get(Player, market.player_id)
                 report.snapshot = {
                     "player": player.name,
@@ -453,8 +479,8 @@ def run(
                     "min_line": str(snap.market_min_line),
                     "max_line": str(snap.market_max_line),
                     "number_of_books": snap.number_of_books,
+                    "stale_books_excluded": snap.stale_books_excluded,
                 }
-                break
     return report
 
 
@@ -511,6 +537,14 @@ def render(report: Report) -> str:
     else:
         add("    (none)")
     add("")
+    add("--- freshness gate (Phase 4A.3) ------------------------------------")
+    gate = report.max_observation_age_seconds
+    add(f"  max_observation_age_seconds: {gate if gate is not None else 'None (no gate applied)'}")
+    add(f"  snapshots built:             {report.snapshots_built}")
+    add(f"  valid canonical baseline:    {report.snapshots_valid_baseline}")
+    add(f"  canonical quote STALE:       {report.snapshots_canonical_stale}")
+    add(f"  stale book-quotes excluded:  {report.stale_books_excluded}")
+    add("")
     add("--- real MarketSnapshot --------------------------------------------")
     if report.snapshot:
         for k, v in report.snapshot.items():
@@ -549,6 +583,13 @@ def main(argv: Sequence[str] | None = None) -> int:
              "permanent decision made by accident.",
     )
     parser.add_argument("--sport", default=DEFAULT_SPORT)
+    parser.add_argument(
+        "--max-observation-age-seconds", type=int, default=None,
+        help="per-book observation freshness gate for the snapshots this run "
+             "builds. Omitted means NO gate -- which is the honest default until "
+             "real captures say what live staleness looks like. Never derived "
+             "from provider_market_updated_at.",
+    )
     args = parser.parse_args(argv)
 
     report = run(
@@ -556,6 +597,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         week_number=args.week_number,
         event_id=args.event_id,
         sport=args.sport,
+        max_observation_age_seconds=args.max_observation_age_seconds,
     )
     print(render(report))
     return 1 if report.failures or not report.quotes_written else 0

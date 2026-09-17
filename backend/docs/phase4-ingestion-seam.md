@@ -178,6 +178,90 @@ snapshot from the future is a malformed response, not a quote. All timestamps ar
 timezone-aware UTC at the boundary; the adapter converts, and nothing downstream
 sees a naive datetime or a vendor date string.
 
+### 3.2 The freshness rule — Phase 4A.3
+
+Freshness is decided **per selected sportsbook quote**, on observation age
+and on nothing else.
+
+`MarketSnapshotService` already selects the newest quote per book as of
+`taken_at`. The gate is applied to that selection:
+
+```
+age = taken_at − quote.as_of_at
+stale if age > max_observation_age_seconds
+```
+
+Three consequences, all recorded on the snapshot row rather than left to
+be re-derived:
+
+1. **A stale non-canonical book is excluded from the whole snapshot** —
+   consensus probability *and* `market_median/min/max_line` *and*
+   `number_of_books`. Half-excluding it would leave a sixteen-hour-old
+   price widening a line context that reads as "what the market looks like
+   right now." Its `PropQuote` row is untouched: exclusion is a read-side
+   decision, never a retraction of an observation we genuinely made.
+
+2. **A stale canonical book invalidates the baseline and promotes
+   nobody.** RULES.md §16 forbids silently substituting another
+   sportsbook, and "too old to trust" is a form of unavailable. The fresh
+   books still supply market context — that is diagnostic, not a baseline,
+   so losing canonical does not have to blind the snapshot.
+
+3. **`canonical_quote_stale` is separate from
+   `is_valid_canonical_baseline == false`.** "The book was quoting, we
+   just had nothing recent enough" and "the book was not in the feed at
+   all" are different failures, and only one of them is an ingestion
+   problem. A single validity flag cannot tell them apart.
+
+**Measured against `captured_at`, never `target_time`.** `target_time` is
+scheduling *intent*. A capture that fires an hour late is still a real
+capture, and its observations are only stale relative to when it actually
+ran. Measuring against `target_time` would report the scheduler's lateness
+as market staleness and throw out quotes that were fresh at capture. The
+gap between the two is a separate, separately-named quantity:
+
+| metric | formula |
+| --- | --- |
+| quote observation age | `MarketSnapshot.taken_at − selected PropQuote.as_of_at` |
+| scheduler offset | `CheckpointRun.captured_at − CheckpointRun.target_time` |
+
+`capture_checkpoint` passes one `now` to both `build_snapshot(taken_at=)`
+and `run.captured_at`, so these are the same clock by construction.
+
+**The threshold is not frozen yet, and there is deliberately no default.**
+`max_observation_age_seconds` is a caller-supplied parameter on
+`MarketSnapshotService` and `capture_checkpoint`; `None` disables the gate
+and is the default, which reproduces the Phase-2 behaviour exactly. It is
+*not* a `SeasonRules` column yet. No defensible number exists — the two
+real DET @ BUF runs are 15h51m apart, which says what a missed refresh
+looks like but nothing about what a normal one does. A plausible-looking
+default chosen now would be a guess frozen into the research record, and
+the column that records which threshold was in force exists precisely so
+that guess could never be silently rewritten later.
+
+#### Selection provenance
+
+`MarketSnapshot.selected_quotes` (JSONB, schema
+`market_snapshot_selection_v1`) freezes the exact `PropQuote` ids the
+snapshot consumed and the ones it refused, each with its `as_of_at` and
+computed age.
+
+Re-deriving the selection later is **not** a safe substitute. The query
+filters `as_of_at <= taken_at`, which looks reproducible — but a
+historical backfill (Phase 4B) can legitimately insert rows with an
+`as_of_at` *earlier* than a snapshot already taken, and the same query
+then returns a different answer for the same snapshot. A record that
+happens to be right today would be indistinguishable from one that has
+since drifted.
+
+It is written whether or not a gate is in force: provenance is not
+conditional on a rule being active.
+
+**Invariant:** `number_of_books + stale_books_excluded` equals the number
+of books that had any quote at `taken_at`. A book must never fall out of
+both counts — that is how "the feed dropped a book" turns into a snapshot
+that merely looks thin.
+
 ---
 
 ## 4. Observation retention
@@ -800,6 +884,13 @@ new tables   ingestion_runs
 
 later        GamePlayer            (post-probe, §12.2)
 
+4A.3         MarketSnapshot  + max_observation_age_seconds  nullable (threshold IN FORCE)
+                             + stale_books_excluded         NOT NULL
+                             + canonical_quote_stale        NOT NULL
+                             + selected_quotes              JSONB (the frozen selection)
+             Additive, no backfill. Pre-4A.3 rows keep NULL, which is the honest
+             value -- no threshold was in force -- and is NOT the same as 0.
+
              (`provider_market_updated_at` was required by the time model in
              §3 and by the ProviderQuote DTO in §9 from the start; its absence
              from this summary was a documentation omission, corrected during
@@ -833,6 +924,13 @@ Separately, and not blocked on the probe: the authoritative parser
 supersession / correction-selection policy (§6) MUST be defined before
 parser-correction replay is used in production.
 
+Also not blocked on the probe, and opened by Phase 4A.3 (§3.2): whether a
+stale-book exclusion should surface in the `EvidenceSnapshot` payload the
+competitors are shown. It currently does not. The evidence payload is
+prompt-versioned and frozen per season, so this is a competition decision
+rather than an ingestion one, and it MUST be settled before a season runs
+with the gate enabled.
+
 ---
 
 ## 19. Decision log
@@ -844,6 +942,11 @@ reasoning is not lost.
 | --- | --- |
 | State-change suppression of unchanged quotes | **Rejected.** Retain every observation (§4). Suppression makes "unchanged" indistinguishable from "feed stopped seeing the book." |
 | `UNIQUE(market_id, sportsbook, source, as_of_at)` | **Rejected.** Assumes one line per book per snapshot, which alternate lines may violate (§10.1). |
+| Derive the live freshness threshold from `provider_market_updated_at` | **Rejected.** That is market-change age, not observation age (§3.1). A quiet market re-fetched one second ago would be thrown out; a feed that went dark would read fresh until it moved. |
+| Measure quote staleness against `CheckpointRun.target_time` | **Rejected.** `target_time` is scheduling intent. A late capture is still a real capture; measuring against intent reports the scheduler's lateness as market staleness (§3.2). |
+| A default `max_observation_age_seconds` | **Deferred, deliberately.** No defensible number exists yet, so the gate is opt-in and off by default. The recorded threshold column exists so whatever number eventually lands in `SeasonRules` can never be retroactively rewritten (§3.2). |
+| Re-derive a snapshot's quote selection on demand instead of storing it | **Rejected.** A Phase 4B backfill can insert an `as_of_at` earlier than a snapshot already taken, so the same query returns a different answer for the same snapshot (§3.2). |
+| Substitute another sportsbook when the canonical book's quote is stale | **Rejected.** RULES.md §16. "Too old to trust" is a form of unavailable; the baseline goes invalid and `canonical_quote_stale` says which failure it was. |
 | `as_of_at` derived from vendor `last_update` | **Rejected.** Wrong granularity (market-level, not bookmaker-level) and, more importantly, the wrong meaning: a quote row records an observation, not the vendor's belief about market change (§3). |
 | Timestamp-based retry idempotency | **Replaced** by `provider_call_id` + fingerprint (§5). Provenance beats inference. |
 | Hash-only raw retention for successful runs | **Rejected.** A hash cannot reconstruct a bad normalization (§11.1). |

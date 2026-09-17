@@ -7,6 +7,7 @@ from datetime import datetime
 from decimal import Decimal
 
 from sqlalchemy import CheckConstraint, ForeignKey, Integer, Numeric, String, UniqueConstraint
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base, created_at_column, uuid_pk
@@ -145,6 +146,32 @@ class MarketSnapshot(Base):
     market_max_line: Mapped[Decimal | None] = mapped_column(Numeric(6, 2), nullable=True)
     number_of_books: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     is_valid_canonical_baseline: Mapped[bool] = mapped_column(nullable=False, default=False)
+
+    # --- observation freshness (Phase 4A.3) --------------------------
+    #
+    # The threshold IN FORCE when this snapshot was built. Recording it is
+    # not optional bookkeeping: without it, changing the season's tolerance
+    # later makes every historical snapshot's include/exclude decision
+    # unreproducible, because you can no longer tell which rule produced it.
+    # NULL means no freshness gate was applied (synthetic/Phase-2 path).
+    max_observation_age_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    stale_books_excluded: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # True when the canonical book's newest observation was itself too old.
+    # Distinct from "canonical absent": the book was quoting, we just had
+    # nothing recent enough to trust.
+    canonical_quote_stale: Mapped[bool] = mapped_column(nullable=False, default=False)
+    # The exact PropQuote rows this snapshot consumed, and the ones it
+    # refused. Frozen INTO the snapshot rather than kept in a join table:
+    # a MarketSnapshot is an immutable artifact, and its selection record
+    # is part of the artifact, not a live relation to be re-queried.
+    #
+    # Re-deriving the selection later is NOT a safe substitute. Quote
+    # selection filters as_of_at <= taken_at, which looks reproducible --
+    # but a historical backfill can legitimately insert rows with an
+    # as_of_at EARLIER than a snapshot already taken, silently changing
+    # what the same query returns. Storing the ids makes the record
+    # answer-for-itself.
+    selected_quotes: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
     __table_args__ = (
         CheckConstraint(
