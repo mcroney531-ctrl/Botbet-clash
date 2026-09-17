@@ -1,7 +1,13 @@
 # Phase 4 — Real Market Data Ingestion Seam
 
-**Status:** ACCEPTED. Frozen enough to build against.
-**Scope:** the provider boundary only. No implementation exists yet.
+**Status:** ACCEPTED. Market-side questions closed by the 2026-09-17 validation
+probe. Implemented in Phase 4A.1.
+**Scope:** the market-data provider boundary.
+
+Player identity, team and position are **out of scope here** and are governed by
+the companion document
+[`phase4-roster-identity-seam.md`](phase4-roster-identity-seam.md) — the probe
+confirmed this vendor supplies a display name only.
 
 This document is an engineering contract, not a proposal. It is the product of a
 design-only review round conducted before any Phase 4 code was written,
@@ -123,14 +129,22 @@ It explicitly does **not** mean "this is when the provider believes the
 underlying market last changed." That is a different fact, it lives in
 `provider_market_updated_at`, and it MUST NOT drive checkpoint selection.
 
-The vendor's current NFL example exposes `last_update` at **both** the bookmaker
-level and the market level. We deliberately bind the MARKET-level value, because
-that is the granularity at which a specific prop market moves; a bookmaker-level
-stamp says only that something in that book changed. The probe reports which
-levels are actually present so the binding can be confirmed against a real
-payload rather than assumed. (An earlier revision of this document asserted the
-bookmaker-level field did not exist. That was too absolute — it does, we simply
-do not persist it.)
+The rule is: **bind the market-level value when present.** That is the
+granularity at which a specific prop market moves; a bookmaker-level stamp says
+only that something in that book changed.
+
+Evidence, kept deliberately at the level of certainty it actually has:
+
+- The vendor's documented NFL example shows `last_update` at both the bookmaker
+  level and the market level.
+- The 2026-09-17 validation probe observed **market-level only** in that
+  particular event-odds payload — no bookmaker-level field was present.
+
+Neither observation defines the endpoint's contract. Do not infer from one
+payload that bookmaker-level timestamps cannot appear here, and do not infer
+from one doc example that they always will. Different endpoint shapes and future
+vendor changes can differ; the probe reports which levels are present so the
+binding is confirmed rather than assumed.
 
 **Invariants.** `as_of_at <= retrieved_at`, always — a provider claiming a
 snapshot from the future is a malformed response, not a quote. All timestamps are
@@ -390,12 +404,12 @@ VENDOR_MARKET_KEYS: Mapping[str, StatFamily] = {
 }
 ```
 
-> **All five spellings are now documented by the vendor** (confirmed by review
-> against The Odds API's current primary docs, 2026-09-16). They are no longer
-> guesses. They are still not *observed*: no live payload has returned them to
-> us, and `VERIFIED_MARKET_KEYS` therefore stays empty until the probe prints
-> what actually comes back. Documentation and observation are different
-> evidence, and the mechanical gate tracks the second.
+> **All five spellings are now OBSERVED.** The 2026-09-17 validation probe
+> requested them against a real NFL event and the vendor returned all five
+> verbatim, with DraftKings quoting every one of the five internal families.
+> Promoting them into `VERIFIED_MARKET_KEYS` is authorised and is Phase 4A.2
+> item 1; the table is left empty here so that promotion is a reviewed,
+> deliberate commit rather than a side effect of this document changing.
 >
 > The same docs show alternate NFL player props under **separate `_alternate`
 > market keys**, which supports the V1 rule below: the mapping simply does not
