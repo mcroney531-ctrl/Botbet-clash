@@ -1,4 +1,4 @@
-# Backend — Phase 1 domain, Phase 2 persistence & Forecast Lab core, Phase 3 AI adapter layer, Phase 4A.1 market-data seam
+# Backend — Phase 1 domain, Phase 2 persistence & Forecast Lab core, Phase 3 AI adapter layer, Phase 4A real market + roster ingestion
 
 Implements constitution §117 **Phase 1** (`Season`, `SeasonRules`, `Week`,
 `Competitor`, the bankroll ledger, `Ticket`, `Wager`, `Settlement`,
@@ -693,3 +693,100 @@ Phase 4 makes the **market** component real. It does not make recent player
 stats, injuries, news, weather, or team context real — those remain mocked
 Phase-2 payload content, and an `EvidenceSnapshot` must not be described as
 "fully real" merely because its `MarketSnapshot` is.
+
+
+## Phase 4A.2 readout — real market data, real player identity
+
+**Status: CLOSED.** Real NFL market data and real player identity are
+persisted end to end, proven by two live runs against a real game.
+
+Two external boundaries, one internal model:
+
+    The Odds API    -> what market exists, and at what price
+    nflverse        -> who that human is, and which side of the game
+    BotBet Clash    -> the canonical identity and team model in between
+
+Neither provider defines our vocabulary. Design contracts:
+[`docs/phase4-ingestion-seam.md`](docs/phase4-ingestion-seam.md) and
+[`docs/phase4-roster-identity-seam.md`](docs/phase4-roster-identity-seam.md).
+
+### What two live runs proved
+
+One real game (`DET @ BUF`, week 3), sampled twice ~16 hours apart, the
+second inside the `FINAL` checkpoint window. Verified afterwards with a
+read-only inspector that spends no credits:
+
+| | |
+| --- | --- |
+| `GamePlayer` rows | 16 |
+| `GamePlayerObservation` rows | 30 (14 + 16) |
+| per relationship | 14 with two observations, 2 with one |
+| distinct roster provider calls | 2 |
+| resolver versions | `two-team-exact-v1` (14), `two-team-exact-alias-v2` (16) |
+| **relationships whose observations disagree with the accepted team** | **0** |
+| `PropQuote` rows | 336 (164 + 172) |
+| distinct market provider calls | 2 |
+| distinct `as_of_at` observation times | 2 |
+
+The revalidation contract holds on real data: the second run **appended**
+thirty observations' worth of evidence without rewriting a single accepted
+relationship.
+
+### The retention rule, demonstrated both ways
+
+Of 152 book/market pairs present at both observation times, **127 moved**
+and **25 held identical**. Both cases produced two rows.
+
+The 25 are the point. DraftKings held Josh Allen passing touchdowns at
+1.50 / −165 / +129 across both runs — the identical 0.58777 de-vigged
+probability — while the six-book consensus drifted 0.59362 → 0.60296.
+Under state-change suppression we would have written nothing for
+DraftKings the second time and lost the evidence that it was *still
+quoting* at kickoff minus four hours. That is exactly the "still observed"
+versus "dropped out of the feed" distinction the seam was written to
+preserve.
+
+### Aliases: added on measurement, not anticipation
+
+The first run produced exactly one resolver miss — The Odds API's
+`Joshua Palmer` against nflverse's `Josh Palmer` (`GSIS:00-0036988`) —
+costing 11 otherwise valid quotes. The response was **not** a
+`Josh ↔ Joshua` rule: that same game contained a **Josh Allen**, and
+generalising from one observation is how a resolver stops being
+trustworthy.
+
+Instead, `app/rosterdata/aliases.py` holds one source-controlled entry
+keyed `(provider, normalized spelling) → GSIS id`. It resolves to a stable
+identity rather than another display name, so it cannot chain; the target
+must still be present in the event's own two-team roster pool, so it
+cannot pull a player into a game he is not in; and exact matching always
+runs first, so it can never override a real roster name. The second run
+resolved 16 of 16 with zero unresolved.
+
+### What this does NOT close
+
+**The live quote-freshness tolerance is still owed**, and neither run can
+set it:
+
+- Run one offered vendor `last_update` ages. The seam forbids deriving
+  eligibility from those — a market untouched for an hour and successfully
+  re-fetched a second ago is a *fresh observation of a quiet market*.
+- Run two offered observation age, which `live_ingest` forces to exactly
+  `0.0` because it takes the snapshot at the quotes' own `as_of_at`. That
+  number was measured against itself.
+
+Observation age only becomes meaningful when `taken_at` comes from a real
+`CheckpointRun.target_time` with quotes fetched earlier. **That is the one
+remaining Week-0 market-data gate**: wire real checkpoint consumption,
+measure `checkpoint time − latest eligible as_of_at`, then freeze the
+tolerance. It is owed explicitly, not dissolved into "ingestion works".
+
+Also unchanged: Phase 4B historical reconstruction remains out of scope
+and needs the paid tier. And Phase 4 still makes only the **market**
+component real — recent player stats, injuries, news and team context are
+still mocked Phase-2 payload content, so no `EvidenceSnapshot` may be
+called "fully real" merely because its `MarketSnapshot` is.
+
+### Test count
+
+**214 passed, 4 skipped.**

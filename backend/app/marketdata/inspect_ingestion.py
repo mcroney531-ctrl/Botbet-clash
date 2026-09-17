@@ -132,14 +132,43 @@ def main(argv: Sequence[str] | None = None) -> int:
             add("--- movement between first and last observation --------------------")
             add(f"  book/market pairs present in both: {len(shared)}")
             add(f"  pairs whose line or price CHANGED: {len(moved)}")
-            for market_id, book in sorted(moved, key=lambda k: k[1])[:8]:
+            unchanged = [k for k in shared if a[k] == b[k]]
+            add(f"  pairs that stayed IDENTICAL:       {len(unchanged)}")
+            add("")
+
+            # Sample ACROSS books, not alphabetically. Taking the first N of a
+            # name-sorted list showed eight BETMGM rows and made league-wide
+            # movement look like one book's activity.
+            add("  sample of movement, one per book:")
+            seen: set[str] = set()
+            for market_id, book in sorted(moved, key=lambda k: k[1]):
+                if book in seen:
+                    continue
+                seen.add(book)
                 market = session.get(PropMarket, market_id)
                 player = session.get(Player, market.player_id)
                 add(f"    {book:12} {player.name} {market.stat_type}: "
                     f"{a[(market_id, book)]} -> {b[(market_id, book)]}")
+
+            if unchanged:
+                add("")
+                add("  sample of IDENTICAL re-observations (the retention rule's whole")
+                add("  point: these produced a second row anyway, proving the book was")
+                add("  still quoting rather than having dropped out of the feed):")
+                seen_same: set[str] = set()
+                for market_id, book in sorted(unchanged, key=lambda k: k[1]):
+                    if book in seen_same:
+                        continue
+                    seen_same.add(book)
+                    market = session.get(PropMarket, market_id)
+                    player = session.get(Player, market.player_id)
+                    add(f"    {book:12} {player.name} {market.stat_type}: "
+                        f"{a[(market_id, book)]} (unchanged, 2 rows)")
+            else:
+                add("    (no shared pair held steady; every one moved)")
             if not moved:
-                add("    (none — every shared quote was an identical re-observation,")
-                add("     which still produced a new row: that is the retention rule)")
+                add("    (none moved — every shared quote was an identical")
+                add("     re-observation, which still produced a new row)")
         add("")
         add("=" * 72)
 
