@@ -16,6 +16,7 @@ from app.db.models.competition import PassDecision, StakeRecommendation, Ticket,
 from app.db.models.settlement import BankrollTransaction, ResearchSettlement, Settlement
 from app.db.models.events import CompetitionEvent
 from app.db.models.ingestion import IngestionRun, ProviderCall
+from app.db.models.roster import GamePlayer, GamePlayerObservation
 
 __all__ = [
     "Season",
@@ -45,4 +46,6 @@ __all__ = [
     "CompetitionEvent",
     "IngestionRun",
     "ProviderCall",
+    "GamePlayer",
+    "GamePlayerObservation",
 ]

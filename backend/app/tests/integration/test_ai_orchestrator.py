@@ -87,6 +87,7 @@ def test_ai_orchestrator_mock_path_end_to_end():
             home_team="KC", away_team="BUF", kickoff_at=kickoff_a,
         )
         player_a = market_repo.create_player(external_ref="ai-orch-player-a", name="Player A", team="KC", position="WR")
+        market_repo.create_game_player(game_id=game_a.id, player_id=player_a.id, team=game_a.home_team_canonical)
         market_a = market_repo.create_prop_market(game_id=game_a.id, player_id=player_a.id, stat_type="receiving_yards")
         market_repo.add_quote(
             market_id=market_a.id, sportsbook=canonical_book, line=Decimal("74.5"),
@@ -202,6 +203,7 @@ def test_ai_orchestrator_mock_path_end_to_end():
             home_team="SF", away_team="DAL", kickoff_at=kickoff_b,
         )
         player_b = market_repo.create_player(external_ref="ai-orch-player-b", name="Player B", team="SF", position="QB")
+        market_repo.create_game_player(game_id=game_b.id, player_id=player_b.id, team=game_b.home_team_canonical)
         market_b = market_repo.create_prop_market(game_id=game_b.id, player_id=player_b.id, stat_type="passing_yards")
         market_repo.add_quote(
             market_id=market_b.id, sportsbook=canonical_book, line=Decimal("225.5"),
@@ -314,6 +316,7 @@ def test_an_adapter_that_raises_still_reaches_a_terminal_failed_status():
             home_team="KC", away_team="BUF", kickoff_at=kickoff,
         )
         player = market_repo.create_player(external_ref="backstop-player", name="Player X", team="KC", position="WR")
+        market_repo.create_game_player(game_id=game.id, player_id=player.id, team=game.home_team_canonical)
         market = market_repo.create_prop_market(game_id=game.id, player_id=player.id, stat_type="receiving_yards")
         market_repo.add_quote(
             market_id=market.id, sportsbook=canonical_book, line=Decimal("74.5"),

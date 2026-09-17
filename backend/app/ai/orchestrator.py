@@ -17,6 +17,8 @@ import uuid
 
 from sqlalchemy.orm import Session
 
+from sqlalchemy import select
+
 from app.ai.prompts.benchmark_forecasting import render_benchmark_prompt
 from app.ai.prompts.versions import BENCHMARK_PROMPT_VERSION, FORECAST_SCHEMA_VERSION
 from app.ai.providers.base import CompetitorAdapter, ProviderCallResult, ProviderError
@@ -24,6 +26,9 @@ from app.ai.registry import ProviderRegistry
 from app.ai.schemas.benchmark_forecast import BenchmarkForecastRequest, MarketContext, MarketInput
 from app.ai.session_service import AgentSessionRepository, build_orchestration_key
 from app.ai.validation import ValidationResult, validate_benchmark_response
+from app.db.models.roster import GamePlayer
+from app.rosterdata.resolution import derive_opponent
+from app.rosterdata.teams import CanonicalTeam
 from app.db.models.markets import Player
 from app.db.models.season import Competitor, SeasonCompetitor
 from app.db.repositories.ledger_repository import LedgerRepository
@@ -347,12 +352,41 @@ class AIOrchestrator:
             season_years.add(season)
             week_numbers.add(game.week_number)
 
-            opponent = game.away_team if player.team == game.home_team else game.home_team
+            # Team and opponent come from the GAME-SCOPED relationship, never
+            # from Player.team.
+            #
+            # The previous version of this line was:
+            #     opponent = game.away_team if player.team == game.home_team else game.home_team
+            # a string equality between a roster team and a market team. With
+            # synthetic data both sides were "KC" so it passed. With real data
+            # it compares "BUF" to "Buffalo Bills", never matches, and returns
+            # game.home_team for EVERY player -- so half the slate would have
+            # been told it faces its own team, with no crash and no failing
+            # test. `derive_opponent` raises TeamGameMismatch instead of
+            # falling through to a plausible-looking wrong answer.
+            game_player = session.execute(
+                select(GamePlayer).where(
+                    GamePlayer.game_id == game.id,
+                    GamePlayer.player_id == prop_market.player_id,
+                )
+            ).scalar_one_or_none()
+            if game_player is None:
+                raise ValueError(
+                    f"no GamePlayer for player {prop_market.player_id} in game "
+                    f"{game.id}: a market cannot enter a benchmark request until "
+                    "the player's identity and team for that game are resolved"
+                )
+            team = CanonicalTeam(game_player.team)
+            opponent = derive_opponent(
+                team=team,
+                home_team=CanonicalTeam(game.home_team_canonical),
+                away_team=CanonicalTeam(game.away_team_canonical),
+            )
             market_input = MarketInput(
                 market_id=str(prop_market.id),
                 player=player.name,
-                team=player.team,
-                opponent=opponent,
+                team=team.value,
+                opponent=opponent.value,
                 stat_type=prop_market.stat_type,
                 canonical_line=market_snapshot.canonical_line,
                 canonical_over_price=market_snapshot.canonical_over_price,

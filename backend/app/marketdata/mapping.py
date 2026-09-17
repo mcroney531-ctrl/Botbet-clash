@@ -48,9 +48,22 @@ TENTATIVE_MARKET_KEYS: Mapping[str, StatFamily] = MappingProxyType(
 """Vendor-documented spellings, used to build probe requests. Documented
 is not observed, so these are never a basis for production persistence."""
 
-VERIFIED_MARKET_KEYS: Mapping[str, StatFamily] = MappingProxyType({})
-"""Spellings observed in a real payload. Empty until the probe runs;
-populating it is a deliberate act, reviewed alongside the probe report."""
+VERIFIED_MARKET_KEYS: Mapping[str, StatFamily] = MappingProxyType(
+    {
+        "player_pass_yds": StatFamily.PASSING_YARDS,
+        "player_pass_tds": StatFamily.PASSING_TOUCHDOWNS,
+        "player_rush_yds": StatFamily.RUSHING_YARDS,
+        "player_receptions": StatFamily.RECEPTIONS,
+        "player_reception_yds": StatFamily.RECEIVING_YARDS,
+    }
+)
+"""Spellings OBSERVED in a real payload.
+
+Promoted 2026-09-17 by the live validation probe (ingestion_run
+16f44ea0-3664-404e-85ab-2d33140e6625), which requested all five against a
+real NFL event and received all five back verbatim, with DraftKings
+quoting every one of the five internal families. Documentation alone was
+never sufficient to populate this table -- observation was."""
 
 
 class UnverifiedMarketMappingError(RuntimeError):

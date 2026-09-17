@@ -94,9 +94,12 @@ def test_mocked_research_week_survives_a_full_reload():
         # Game A: one clean, eligible market (the benchmark target) plus
         # one market that intentionally fails canonical-market eligibility
         # (step 11 - no DRAFTKINGS quote at all, only a non-canonical book).
+        market_repo.create_game_player(game_id=game_a.id, player_id=player_a.id, team=game_a.home_team_canonical)
         market_good = market_repo.create_prop_market(game_id=game_a.id, player_id=player_a.id, stat_type="passing_yards")
         market_repo.add_quote(market_id=market_good.id, sportsbook=canonical_book, line=Decimal("225.5"), over_price=-115, under_price=-105, retrieved_at=now - timedelta(hours=1))
         market_repo.add_quote(market_id=market_good.id, sportsbook="FANDUEL", line=Decimal("225.5"), over_price=-110, under_price=-110, retrieved_at=now - timedelta(hours=1))
+
+        market_repo.create_game_player(game_id=game_a.id, player_id=player_a2.id, team=game_a.home_team_canonical)
 
         market_no_canonical = market_repo.create_prop_market(game_id=game_a.id, player_id=player_a2.id, stat_type="receiving_yards")
         market_repo.add_quote(market_id=market_no_canonical.id, sportsbook="FANDUEL", line=Decimal("60.5"), over_price=-110, under_price=-110, retrieved_at=now - timedelta(hours=1))
@@ -104,6 +107,7 @@ def test_mocked_research_week_survives_a_full_reload():
         # Game D: single market, deliberately pushable (whole-number line)
         # -> ineligible, and it's the only market in the game, so its
         # assigned benchmark slot has nothing to fall back to (step 12).
+        market_repo.create_game_player(game_id=game_d.id, player_id=player_d.id, team=game_d.home_team_canonical)
         market_pushable = market_repo.create_prop_market(game_id=game_d.id, player_id=player_d.id, stat_type="passing_touchdowns")
         market_repo.add_quote(market_id=market_pushable.id, sportsbook=canonical_book, line=Decimal("2"), over_price=-120, under_price=100, retrieved_at=now - timedelta(hours=1))
 

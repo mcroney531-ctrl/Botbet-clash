@@ -38,7 +38,7 @@ from app.marketdata.base import (
     error_result,
 )
 from app.marketdata.dto import ProviderEvent, ProviderEventRef, ProviderPlayerRef, ProviderQuote
-from app.marketdata.mapping import TENTATIVE_MARKET_KEYS
+from app.marketdata.mapping import TENTATIVE_MARKET_KEYS, resolve_stat_family, vendor_keys_for
 from app.marketdata.telemetry import sha256_hex
 
 PROVIDER_NAME = "THE_ODDS_API"
@@ -249,16 +249,194 @@ class TheOddsApiProvider:
                 continue
         return ProviderFetchResult(payload=events, error=None, call_metadata=meta)
 
-    def fetch_quotes(self, *, event, stat_families, books=None):
-        raise NotImplementedError(
-            "Quote normalization is deliberately not implemented in Phase 4A.1. "
-            "The vendor's payload shape for player props -- stable player id, "
-            "team/position availability, alternate-line structure, and the level "
-            "at which last_update is reported -- are all OPEN questions that the "
-            "validation probe must answer from a real response first. Writing a "
-            "parser against assumptions now is exactly what the seam exists to "
-            "prevent. See backend/docs/phase4-ingestion-seam.md §18."
+    def fetch_quotes(
+        self,
+        *,
+        event: ProviderEventRef,
+        stat_families: Sequence[StatFamily],
+        books: Sequence[str] | None = None,
+        sport: str = DEFAULT_SPORT,
+        now: datetime | None = None,
+    ) -> ProviderFetchResult[list[ProviderQuote]]:
+        """Current event odds for the requested internal stat families.
+
+        Uses VERIFIED market keys only -- spellings observed in a real
+        payload, not merely documented. `vendor_keys_for(verified_only=True)`
+        raises rather than silently requesting fewer families, because a
+        request that quietly drops three of five would look like
+        "DraftKings doesn't offer those" in the resulting data.
+
+        `books=None` means every book the provider carries. Requesting
+        DraftKings alone would destroy the number_of_books, median, min and
+        max that MarketSnapshot computes; DraftKings is selected as
+        canonical downstream, not requested exclusively upstream.
+
+        ONE observation timestamp is stamped for the whole accepted
+        response and shared by every quote in it (seam §3), so a retry
+        within the same logical observation does not scatter as_of values.
+        """
+
+        observed = now or _utcnow()
+        market_keys = vendor_keys_for(stat_families, verified_only=True)
+
+        response, meta, failure = self._request(
+            capability="FETCH_QUOTES",
+            path=f"/sports/{sport}/events/{event.external_event_id}/odds",
+            params={
+                "regions": self.region,
+                "markets": ",".join(market_keys),
+                "oddsFormat": ODDS_FORMAT,
+            },
         )
+        if failure is not None:
+            return error_result(category=failure[0], message=failure[1], call_metadata=meta)
+        try:
+            decoded = response.json()
+        except ValueError:
+            return error_result(
+                category="MALFORMED_RESPONSE",
+                message="event-odds response was not valid JSON",
+                call_metadata=meta,
+            )
+        if not isinstance(decoded, dict):
+            return error_result(
+                category="MALFORMED_RESPONSE",
+                message="event-odds response was not a JSON object",
+                call_metadata=meta,
+            )
+
+        quotes, diagnostics = self._normalize_event_odds(
+            decoded, event=event, observed=observed, books=books
+        )
+        return ProviderFetchResult(
+            payload=quotes, error=None, call_metadata=meta, diagnostics=tuple(diagnostics)
+        )
+
+    def _normalize_event_odds(
+        self,
+        decoded: dict,
+        *,
+        event: ProviderEventRef,
+        observed: datetime,
+        books: Sequence[str] | None,
+    ) -> tuple[list[ProviderQuote], list[ProviderDiagnostic]]:
+        """Vendor JSON -> ProviderQuote. The only normalization path."""
+
+        wanted_books = {b.upper() for b in books} if books else None
+        quotes: list[ProviderQuote] = []
+        diagnostics: list[ProviderDiagnostic] = []
+
+        for bookmaker in decoded.get("bookmakers") or []:
+            if not isinstance(bookmaker, dict):
+                continue
+            book = str(bookmaker.get("key", "")).upper()
+            if wanted_books is not None and book not in wanted_books:
+                continue
+
+            for market in bookmaker.get("markets") or []:
+                if not isinstance(market, dict):
+                    continue
+                vendor_key = str(market.get("key", ""))
+                family = resolve_stat_family(vendor_key, verified_only=True)
+                if family is None:
+                    # Quarantined, never coerced into a nearby family.
+                    diagnostics.append(
+                        ProviderDiagnostic(
+                            category="UNSUPPORTED_MARKET",
+                            detail="vendor market key is not in the verified mapping",
+                            vendor_market_key=vendor_key,
+                            sportsbook=book,
+                        )
+                    )
+                    continue
+
+                market_updated = market.get("last_update")
+                parsed_updated = (
+                    _parse_iso(market_updated) if market_updated is not None else None
+                )
+
+                # Group by (player, line) so Over and Under can be paired.
+                grouped: dict[tuple[str, str], dict[str, dict]] = {}
+                for outcome in market.get("outcomes") or []:
+                    if not isinstance(outcome, dict):
+                        continue
+                    who = str(outcome.get("description", "") or "").strip()
+                    point = outcome.get("point")
+                    side = str(outcome.get("name", "") or "").strip().upper()
+                    if not who or point is None or side not in ("OVER", "UNDER"):
+                        continue
+                    grouped.setdefault((who, str(point)), {})[side] = outcome
+
+                # An ambiguous alternate set is refused WHOLE (seam §10.1):
+                # taking the first would let vendor row order decide the
+                # canonical baseline and every probability built on it.
+                per_player: dict[str, set[str]] = {}
+                for (who, point) in grouped:
+                    per_player.setdefault(who, set()).add(point)
+
+                for (who, point), sides in grouped.items():
+                    if len(per_player[who]) > 1:
+                        continue  # handled below, once per player
+                    over, under = sides.get("OVER"), sides.get("UNDER")
+                    if over is None or under is None:
+                        diagnostics.append(
+                            ProviderDiagnostic(
+                                category="INCOMPLETE_PRICE_PAIR",
+                                detail=f"only one side present at line {point}",
+                                vendor_market_key=vendor_key,
+                                sportsbook=book,
+                                player_display_name=who,
+                            )
+                        )
+                        continue
+                    try:
+                        quotes.append(
+                            ProviderQuote(
+                                event=event,
+                                player=ProviderPlayerRef(
+                                    provider=self.provider_name, display_name=who
+                                ),
+                                stat_family=family,
+                                vendor_market_key=vendor_key,
+                                sportsbook=book,
+                                line=Decimal(str(point)),
+                                over_price=int(over["price"]),
+                                under_price=int(under["price"]),
+                                as_of_at=observed,
+                                retrieved_at=observed,
+                                source=self.provider_name,
+                                provider_market_updated_at=parsed_updated,
+                            )
+                        )
+                    except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
+                        diagnostics.append(
+                            ProviderDiagnostic(
+                                category="INCOMPLETE_PRICE_PAIR",
+                                detail=f"could not normalize outcome: {type(exc).__name__}",
+                                vendor_market_key=vendor_key,
+                                sportsbook=book,
+                                player_display_name=who,
+                            )
+                        )
+
+                for who, lines in per_player.items():
+                    if len(lines) > 1:
+                        diagnostics.append(
+                            ProviderDiagnostic(
+                                category="AMBIGUOUS_ALTERNATE_LINE",
+                                detail=(
+                                    f"{len(lines)} candidate lines "
+                                    f"({', '.join(sorted(lines))}) with no vendor signal "
+                                    "identifying the standard market; quarantining the "
+                                    "whole set rather than picking one"
+                                ),
+                                vendor_market_key=vendor_key,
+                                sportsbook=book,
+                                player_display_name=who,
+                            )
+                        )
+
+        return quotes, diagnostics
 
     def fetch_quotes_as_of(self, *, event, stat_families, as_of, books=None):
         raise NotImplementedError(

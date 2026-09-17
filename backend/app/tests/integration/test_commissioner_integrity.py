@@ -49,6 +49,7 @@ def make_market(season_id, external_ref="g1", week_number=1) -> str:
             home_team="KC", away_team="BUF", kickoff_at=datetime.now(timezone.utc) + timedelta(days=3),
         )
         player = repo.create_player(external_ref=f"player-{external_ref}", name="Player X", team="KC", position="WR")
+        repo.create_game_player(game_id=game.id, player_id=player.id, team=game.home_team_canonical)
         market = repo.create_prop_market(game_id=game.id, player_id=player.id, stat_type="receiving_yards")
         return str(market.id)
 

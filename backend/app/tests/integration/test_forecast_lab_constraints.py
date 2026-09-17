@@ -44,6 +44,7 @@ def _setup_market():
             home_team="KC", away_team="BUF", kickoff_at=now + timedelta(hours=100),
         )
         player = repo.create_player(external_ref=f"p-{uuid.uuid4()}", name="Player X", team="KC", position="WR")
+        repo.create_game_player(game_id=game.id, player_id=player.id, team=game.home_team_canonical)
         market = repo.create_prop_market(game_id=game.id, player_id=player.id, stat_type="passing_yards")
         repo.add_quote(market_id=market.id, sportsbook="DRAFTKINGS", line=Decimal("225.5"), over_price=-115, under_price=-105, retrieved_at=now - timedelta(hours=1))
         season_id, game_id, market_id = season.id, game.id, market.id

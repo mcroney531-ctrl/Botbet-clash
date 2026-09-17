@@ -33,6 +33,7 @@ class SeasonRepository:
         rules: DomainSeasonRules,
         effective_from: datetime,
         market_data_provider: str = SYNTHETIC_SOURCE,
+        roster_data_provider: str = SYNTHETIC_SOURCE,
     ) -> SeasonRulesRow:
         row = SeasonRulesRow(
             season_id=season_id,
@@ -40,6 +41,7 @@ class SeasonRepository:
             starting_bankroll_cents=rules.starting_bankroll.cents,
             canonical_sportsbook="DRAFTKINGS",
             market_data_provider=market_data_provider,
+            roster_data_provider=roster_data_provider,
             research_settlement_provider="NFL_OFFICIAL_STATS",
             research_settlement_delay_hours=72,
             supported_prop_types=["passing_yards", "passing_touchdowns", "rushing_yards", "receptions", "receiving_yards"],

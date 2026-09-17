@@ -166,32 +166,70 @@ a use exists.
 
 ---
 
-## 4. `GamePlayer`
+## 4. `GamePlayer` and `GamePlayerObservation`
+
+Two tables, because they answer two different questions. An earlier draft
+used one, and it breaks at the second checkpoint.
+
+**The relationship** — what BotBet Clash accepted:
 
 ```
 GamePlayer
     id
-    game_id                  FK games            NOT NULL
-    player_id                FK players          NOT NULL
-    team                     CanonicalTeam       NOT NULL
-    position                 String              NULLABLE
+    game_id     FK games            NOT NULL
+    player_id   FK players          NOT NULL
+    team        CanonicalTeam       NOT NULL
+    position    String              NULLABLE
+    UNIQUE(game_id, player_id)
+```
+
+**The provenance** — why and when we accepted or revalidated it, append-only:
+
+```
+GamePlayerObservation
+    id
+    game_player_id           FK game_players     NOT NULL
     roster_provider_call_id  FK provider_calls   NOT NULL
     roster_season            Integer             NOT NULL
     roster_week              Integer             NULLABLE
     roster_basis             String              NOT NULL
+    resolved_team            CanonicalTeam       NOT NULL
+    resolved_position        String              NULLABLE
+    resolver_version         String              NOT NULL
     observed_at              timestamptz         NOT NULL
-    UNIQUE(game_id, player_id)
 ```
 
-`roster_season` / `roster_week` are stored explicitly and separately from the
-game's own week, because of §1.2: the snapshot that resolved a player may not
-correspond to the game's week, and that must be visible in a query rather than
-inferred.
+### 4.1 Why the split is necessary
 
-`roster_basis` records **which §5 path** produced this row:
-`CURRENT_CONTEMPORANEOUS` | `ARCHIVED_CONTEMPORANEOUS` | `HISTORICAL_RECONSTRUCTED`.
+`OPENING` resolves a player from roster snapshot A. `FINAL` revalidates the
+same player from snapshot B. With a single row carrying one
+`roster_provider_call_id`, that second resolution must either **overwrite** the
+provenance — destroying the record of what supported `OPENING` — or **leave it
+stale**, hiding the fact that `FINAL` revalidated at all. Neither is acceptable
+in a reproducibility-first system.
 
-### 4.1 Opponent is derived, never stored — and never guessed
+So `roster_basis` belongs to the **observation**, not the relationship: the same
+accepted relationship may be supported by a `CURRENT_CONTEMPORANEOUS` observation
+at `OPENING` and a `HISTORICAL_RECONSTRUCTED` one during a later backfill, and
+the relationship itself is neither.
+
+### 4.2 Semantics
+
+| situation | action |
+| --- | --- |
+| first successful resolution | get-or-create `Player`, create `GamePlayer`, append observation |
+| later resolution **agrees** | append another observation; **do not** rewrite the relationship |
+| later resolution **disagrees** | `ROSTER_IDENTITY_CONFLICT`; quarantine; require review |
+
+A player's team changing between checkpoints is either a real transaction we must
+review or a resolution error we must investigate. Silently rewriting the accepted
+relationship would erase the question.
+
+`resolver_version` is the roster equivalent of `PropQuote.parser_version`: if
+normalization or matching logic changes, we must be able to tell which logic
+produced an old observation. Provenance only — nothing filters on it.
+
+### 4.3 Opponent is derived, never stored — and never guessed
 
 ```python
 if game_player.team == game.home_team_canonical:
@@ -199,15 +237,13 @@ if game_player.team == game.home_team_canonical:
 elif game_player.team == game.away_team_canonical:
     opponent = game.home_team_canonical
 else:
-    raise TeamGameMismatch(...)      # TEAM_GAME_MISMATCH
+    raise TeamGameMismatch(...)
 ```
 
 There is **no** `else means away team` shortcut. If a resolved player's team is
 neither side of the game, that is corrupted context and it MUST stop request
-construction rather than silently produce a plausible-looking opponent. That
-shortcut is precisely the shape of the bug in §1.1.
-
----
+construction rather than produce a plausible-looking opponent. That shortcut is
+precisely the shape of the bug in §1.1.
 
 ## 5. Roster products and historical semantics
 
@@ -486,7 +522,7 @@ we break — mitigated by asserting the expected header on load and raising
 | --- | --- |
 | `Game.home_team_canonical`, `Game.away_team_canonical` NOT NULL | additive + backfill, fail loudly on unmapped |
 | `SeasonRules.roster_data_provider` | additive, backfill `SYNTHETIC` |
-| new table `game_players` | additive |
+| new tables `game_players`, `game_player_observations` | additive |
 | `Player.team` → NULLABLE | **constraint-loosening** |
 | `Player.position` → NULLABLE | **constraint-loosening** |
 | `orchestrator.py:350` opponent derivation | **required code fix** (§1.1, §4.1) |
@@ -497,19 +533,37 @@ both are in the code being rewritten anyway.
 
 ---
 
-## 13. Open decisions
+## 13. Decisions locked at review
 
-1. `STALE_ROSTER_SNAPSHOT` tolerance — how old may a current-roster snapshot be
-   before a checkpoint refuses it?
-2. Normalized `RosterEntry` mirror table, or rely on `roster_provider_call_id`
-   provenance? Leaning **rely** — a mirror is a cache, not a source of truth, and
-   it doubles the write path.
-3. Whether the live path should also archive the current-roster snapshot on a
-   schedule (independent of checkpoints), so that §5's
-   `ARCHIVED_CONTEMPORANEOUS` path accumulates coverage from day one rather than
-   only where a checkpoint happened to fire.
+**1. No normalized `RosterEntry` mirror table.** The raw provider-call bytes plus
+`GamePlayerObservation` are the reproducibility record. Duplicating the whole
+roster into a normalized cache would double the write path for something that is
+not a source of truth.
 
----
+**2. Independent daily current-roster archiving — YES.** During the active
+season, capture one current roster snapshot per day, independently of
+checkpoints. Checkpoints then reuse the newest eligible archived snapshot rather
+than each downloading the ~940 KB season file. 16 games × 3 checkpoints fetching
+independently would download the same bytes ~48 times a week for no gain.
+
+The archive operation is idempotent and **scheduler-ready**, but this phase does
+NOT build a scheduling framework — there isn't one yet, and inventing one here
+would be scope creep.
+
+**3. Live roster freshness — 36 hours.** For a live checkpoint, an eligible
+snapshot must satisfy:
+
+```
+snapshot.retrieved_at <= checkpoint taken_at
+age <= 36 hours
+```
+
+If no eligible archived snapshot exists, fetch the current roster **once** for the
+logical ingestion/checkpoint run. If that refresh fails and the newest available
+snapshot is older than 36 hours, raise `STALE_ROSTER_SNAPSHOT` and **block**
+roster-dependent market persistence for that run.
+
+There is never a silent fallback past the tolerance.
 
 ## 14. Phase 4A.2 gate
 

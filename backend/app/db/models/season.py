@@ -44,6 +44,10 @@ class SeasonRules(Base):
     # research baseline by blending two feeds into one consensus. Quote
     # selection pins on this value.
     market_data_provider: Mapped[str] = mapped_column(String, nullable=False)
+    # Which roster/identity provider resolves players for this season.
+    # Frozen for the same reason as the market provider: switching identity
+    # sources midseason would silently change WHO a player is.
+    roster_data_provider: Mapped[str] = mapped_column(String, nullable=False)
     research_settlement_provider: Mapped[str] = mapped_column(String, nullable=False)
     research_settlement_delay_hours: Mapped[int] = mapped_column(Integer, nullable=False)
     supported_prop_types: Mapped[list[str]] = mapped_column(ARRAY(String), nullable=False)

@@ -115,6 +115,7 @@ def build_smoke_fixture() -> SmokeFixture:
         player = market_repo.create_player(
             external_ref=f"live-smoke-player-{uuid.uuid4()}", name="Player X", team="KC", position="WR"
         )
+        market_repo.create_game_player(game_id=game.id, player_id=player.id, team=game.home_team_canonical)
         market = market_repo.create_prop_market(game_id=game.id, player_id=player.id, stat_type="receiving_yards")
         market_repo.add_quote(
             market_id=market.id, sportsbook=canonical_book, line=Decimal("74.5"),

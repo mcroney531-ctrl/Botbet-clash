@@ -210,13 +210,44 @@ def test_unknown_vendor_key_maps_to_nothing_rather_than_something_close():
     assert resolve_stat_family("player_pass_yds", verified_only=False) is StatFamily.PASSING_YARDS
 
 
-def test_production_refuses_to_run_on_unverified_market_keys():
-    with pytest.raises(UnverifiedMarketMappingError, match="validation probe"):
-        vendor_keys_for([StatFamily.RECEIVING_YARDS], verified_only=True)
-    # ...but the probe may request tentative spellings, which is its job.
-    assert vendor_keys_for([StatFamily.RECEIVING_YARDS], verified_only=False) == (
+def test_all_five_market_keys_are_verified_by_a_real_payload():
+    """Promoted 2026-09-17 after the live probe returned all five verbatim.
+
+    Documentation was never enough to populate VERIFIED_MARKET_KEYS --
+    observation was. The gate itself still works: a family with no
+    verified spelling raises rather than silently requesting fewer.
+    """
+
+    assert vendor_keys_for(list(StatFamily), verified_only=True) == (
+        "player_pass_yds",
+        "player_pass_tds",
+        "player_rush_yds",
+        "player_receptions",
         "player_reception_yds",
     )
+
+
+def test_the_verified_gate_still_refuses_a_family_with_no_verified_key(monkeypatch):
+    """Promotion filled the table; it did not remove the gate.
+
+    If a sixth family were added, or a verified spelling withdrawn,
+    production must refuse rather than silently request fewer families --
+    a short request would look like "DraftKings doesn't offer that" in the
+    resulting data.
+    """
+
+    from types import MappingProxyType
+
+    from app.marketdata import mapping
+
+    partial = {
+        k: v
+        for k, v in mapping.VERIFIED_MARKET_KEYS.items()
+        if v is not StatFamily.RECEIVING_YARDS
+    }
+    monkeypatch.setattr(mapping, "VERIFIED_MARKET_KEYS", MappingProxyType(partial))
+    with pytest.raises(UnverifiedMarketMappingError, match="validation probe"):
+        mapping.vendor_keys_for([StatFamily.RECEIVING_YARDS], verified_only=True)
 
 
 def test_ambiguous_alternate_lines_quarantine_the_whole_set():

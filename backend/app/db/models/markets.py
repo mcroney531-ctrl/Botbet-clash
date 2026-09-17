@@ -19,21 +19,41 @@ class Game(Base):
     external_ref: Mapped[str] = mapped_column(String, unique=True, nullable=False)
     season_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("seasons.id"), nullable=False)
     week_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Vendor display strings, retained for the Show layer and diagnosis.
     home_team: Mapped[str] = mapped_column(String, nullable=False)
     away_team: Mapped[str] = mapped_column(String, nullable=False)
+    # The canonical vocabulary. ALL logic uses these -- see CanonicalTeam.
+    home_team_canonical: Mapped[str] = mapped_column(String, nullable=False)
+    away_team_canonical: Mapped[str] = mapped_column(String, nullable=False)
     kickoff_at: Mapped[datetime] = mapped_column(nullable=False)
     status: Mapped[str] = mapped_column(String, nullable=False, default="SCHEDULED")
     created_at: Mapped[datetime] = created_at_column()
 
 
 class Player(Base):
+    """A PERSON, not a person-on-a-team.
+
+    `external_ref` is the durable identity: "GSIS:<gsis_id>" for real
+    players resolved from the roster provider. nflverse resolves it; GSIS
+    *is* it, so swapping roster providers later does not orphan these rows.
+
+    `team` and `position` are NULLABLE and explicitly NON-AUTHORITATIVE.
+    A player's team is time- and game-dependent, so it lives on
+    `GamePlayer`. These columns are retained only so pre-Phase-4 rows and
+    synthetic fixtures keep working; nothing in the research path may read
+    them. The `opponent` bug in orchestrator.py is exactly what happens
+    when a "conveniently populated" legacy field gets treated as
+    authoritative, which is why they were loosened rather than left
+    NOT NULL and quietly filled.
+    """
+
     __tablename__ = "players"
 
     id: Mapped[uuid.UUID] = uuid_pk()
     external_ref: Mapped[str] = mapped_column(String, unique=True, nullable=False)
     name: Mapped[str] = mapped_column(String, nullable=False)
-    team: Mapped[str] = mapped_column(String, nullable=False)
-    position: Mapped[str] = mapped_column(String, nullable=False)
+    team: Mapped[str | None] = mapped_column(String, nullable=True)
+    position: Mapped[str | None] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = created_at_column()
 
 
@@ -53,7 +73,7 @@ class PropMarket(Base):
     # The natural key. Real ingestion get-or-creates against this on every
     # poll, so without the constraint a concurrent or retried run would
     # fork a market in two and split its quote history.
-    __table_args__ = (UniqueConstraint("game_id", "player_id", "stat_type", name="natural_key"),)
+    __table_args__ = (UniqueConstraint("game_id", "player_id", "stat_type"),)
 
 
 class PropQuote(Base):

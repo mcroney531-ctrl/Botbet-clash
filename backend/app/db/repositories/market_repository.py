@@ -10,6 +10,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db.models.markets import Game, MarketSnapshot, Player, PropMarket, PropQuote
+from app.db.models.roster import GamePlayer
+from app.rosterdata.teams import CanonicalTeam, TeamMappingError
 from app.marketdata.provenance import (
     SYNTHETIC_PARSER_VERSION,
     SYNTHETIC_SOURCE,
@@ -32,13 +34,33 @@ class MarketRepository:
         away_team: str,
         kickoff_at: datetime,
         status: str = "SCHEDULED",
+        home_team_canonical: str | None = None,
+        away_team_canonical: str | None = None,
     ) -> Game:
+        """Create a game.
+
+        `home_team` / `away_team` are whatever the source called them --
+        for The Odds API that is a display name like "Buffalo Bills". The
+        canonical columns are what ALL logic reads; real ingestion passes
+        them explicitly after mapping through the provider table.
+
+        When they are omitted, the display value must already BE a
+        canonical code (which is true of every synthetic fixture). It is
+        validated rather than assumed: an unmappable value raises here
+        instead of silently writing a team that no opponent derivation can
+        match.
+        """
+
+        home_canonical = home_team_canonical or _canonical_or_raise(home_team, "home_team")
+        away_canonical = away_team_canonical or _canonical_or_raise(away_team, "away_team")
         row = Game(
             external_ref=external_ref,
             season_id=season_id,
             week_number=week_number,
             home_team=home_team,
             away_team=away_team,
+            home_team_canonical=home_canonical,
+            away_team_canonical=away_canonical,
             kickoff_at=kickoff_at,
             status=status,
         )
@@ -58,6 +80,33 @@ class MarketRepository:
 
     def create_player(self, *, external_ref: str, name: str, team: str, position: str) -> Player:
         row = Player(external_ref=external_ref, name=name, team=team, position=position)
+        self.session.add(row)
+        self.session.flush()
+        return row
+
+    def create_game_player(
+        self,
+        *,
+        game_id: uuid.UUID,
+        player_id: uuid.UUID,
+        team: str,
+        position: str | None = None,
+    ) -> GamePlayer:
+        """The game-scoped team relationship, which is what the orchestrator
+        reads to derive `opponent`.
+
+        Real ingestion creates this through the roster identity service,
+        which also appends a GamePlayerObservation carrying the roster
+        snapshot's provenance. This bare constructor exists for synthetic
+        fixtures, which have no roster provider behind them.
+        """
+
+        row = GamePlayer(
+            game_id=game_id,
+            player_id=player_id,
+            team=_canonical_or_raise(team, "team"),
+            position=position,
+        )
         self.session.add(row)
         self.session.flush()
         return row
@@ -184,3 +233,14 @@ class MarketRepository:
     def latest_snapshot(self, market_id: uuid.UUID) -> MarketSnapshot | None:
         stmt = select(MarketSnapshot).where(MarketSnapshot.market_id == market_id).order_by(MarketSnapshot.taken_at.desc())
         return self.session.execute(stmt).scalars().first()
+
+
+def _canonical_or_raise(value: str, field_name: str) -> str:
+    try:
+        return CanonicalTeam(value.strip().upper()).value
+    except ValueError:
+        raise TeamMappingError(
+            f"{field_name}={value!r} is not a CanonicalTeam code and no explicit "
+            f"{field_name}_canonical was supplied. Map it through the provider's "
+            "team table in app/rosterdata/teams.py -- never guess."
+        ) from None

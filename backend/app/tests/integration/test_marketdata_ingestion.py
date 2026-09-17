@@ -51,6 +51,8 @@ def _fixture(session, tag: str):
         week_number=1,
         home_team="KC",
         away_team="SF",
+        home_team_canonical="KC",
+        away_team_canonical="SF",
         kickoff_at=datetime.now(timezone.utc) + timedelta(days=3),
     )
     player = Player(external_ref=f"p-{tag}", name="Player", team="KC", position="WR")
