@@ -208,3 +208,66 @@ def test_create_forecast_observation_rejects_an_evidence_snapshot_for_a_differen
         from app.db.models.forecast_lab import ForecastObservation
 
         assert session.execute(select(ForecastObservation).where(ForecastObservation.market_id == market_id_b)).first() is None
+
+
+# --- Phase 4A.4 freshness guards, enforced by Postgres ------------------
+#
+# A CHECK nothing tests is decoration. These assert the database itself
+# refuses the two shapes the application also refuses, so a future writer
+# that bypasses MarketSnapshotService cannot land them.
+
+
+def _bare_snapshot(market_id, **overrides):
+    from app.db.models.markets import MarketSnapshot
+
+    fields = dict(
+        market_id=market_id,
+        taken_at=datetime(2026, 9, 17, 20, tzinfo=timezone.utc),
+        canonical_sportsbook="DRAFTKINGS",
+        devig_method="PROPORTIONAL_V1",
+        number_of_books=3,
+        books_observed=3,
+        stale_books_excluded=0,
+        canonical_quote_stale=False,
+        is_valid_canonical_baseline=False,
+    )
+    fields.update(overrides)
+    return MarketSnapshot(**fields)
+
+
+def test_a_negative_tolerance_is_refused_by_the_database():
+    """Not a strict rule -- a configuration error. It marks every
+    observation stale, so a run reads as a total market outage."""
+
+    _, market_id, _, _, _ = _setup_market()
+    with pytest.raises(IntegrityError):
+        with session_scope() as session:
+            session.add(_bare_snapshot(market_id, max_observation_age_seconds=-1))
+
+
+def test_a_book_cannot_fall_out_of_both_coverage_counts():
+    """books_observed must equal number_of_books + stale_books_excluded.
+    Otherwise a book silently dropped from the feed and a book refused as
+    stale both just shrink number_of_books, and degraded coverage becomes
+    indistinguishable from thin coverage."""
+
+    _, market_id, _, _, _ = _setup_market()
+    with pytest.raises(IntegrityError):
+        with session_scope() as session:
+            session.add(
+                _bare_snapshot(market_id, number_of_books=3, books_observed=5, stale_books_excluded=0)
+            )
+
+
+def test_consistent_coverage_counts_are_accepted():
+    _, market_id, _, _, _ = _setup_market()
+    with session_scope() as session:
+        session.add(
+            _bare_snapshot(
+                market_id,
+                number_of_books=3,
+                books_observed=5,
+                stale_books_excluded=2,
+                max_observation_age_seconds=900,
+            )
+        )
