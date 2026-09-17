@@ -283,3 +283,51 @@ def test_raw_bytes_and_hash_are_retained_for_provenance():
     assert result.call_metadata.raw_response_body == body
     assert result.call_metadata.raw_response_sha256 == sha256_hex(body)
     assert result.call_metadata.raw_response_bytes == len(body)
+
+
+# --- freshness must be measured at the point of use --------------------
+
+
+def test_a_roster_fetched_after_run_start_reports_a_non_negative_age():
+    """The acceptance-report clock bug.
+
+    live_ingest read `now` before the nflverse download, while
+    RosterSnapshot.retrieved_at is stamped post-response. Evaluating
+    age_hours(at=now) is therefore (earlier - later): negative, and MOST
+    negative for the freshest possible roster. The run meant to prove the
+    36-hour policy would have reported nonsense.
+    """
+
+    run_started = NOW
+    fetched_at = NOW + timedelta(seconds=90)      # download took 90s
+    snapshot = _snapshot(GOFF, retrieved_at=fetched_at)
+
+    # The bug, stated explicitly so it cannot quietly come back.
+    assert snapshot.age_hours(at=run_started) < 0
+
+    # Measured at the point of use, after the fetch.
+    checked_at = fetched_at + timedelta(seconds=2)
+    age = snapshot.age_hours(at=checked_at)
+    assert age >= 0
+    assert age < LIVE_ROSTER_MAX_AGE_HOURS
+
+
+def test_live_ingest_measures_roster_age_after_the_fetch_not_at_run_start():
+    import inspect
+
+    from app.marketdata import live_ingest
+
+    code = "\n".join(
+        line for line in inspect.getsource(live_ingest.run).splitlines()
+        if not line.strip().startswith("#")
+    )
+    assert "age_hours(at=now)" not in code
+    assert "roster_checked_at" in code
+
+
+def test_a_genuinely_stale_snapshot_still_exceeds_the_tolerance():
+    """The guard must not become permissive in fixing the sign."""
+
+    checked_at = NOW
+    stale = _snapshot(GOFF, retrieved_at=NOW - timedelta(hours=37))
+    assert stale.age_hours(at=checked_at) > LIVE_ROSTER_MAX_AGE_HOURS

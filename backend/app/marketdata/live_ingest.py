@@ -54,6 +54,11 @@ from app.rosterdata.teams import CanonicalTeam, TeamMappingError, canonical_from
 
 CANONICAL_BOOK = "DRAFTKINGS"
 
+# A freshly fetched snapshot can read a few milliseconds "old" or "new"
+# depending on where each clock was sampled. Anything beyond this is a real
+# anomaly, not precision.
+CLOCK_PRECISION_TOLERANCE_HOURS = 0.001  # 3.6 seconds
+
 
 @dataclass
 class Report:
@@ -184,7 +189,23 @@ def run(
         return report
     snapshot = roster_result.payload
     report.roster_entries = len(snapshot.entries)
-    report.roster_age_hours = round(snapshot.age_hours(at=now), 3)
+
+    # Freshness is evaluated at the point of USE, after the fetch. `now` was
+    # read before the download while snapshot.retrieved_at is post-response,
+    # so age_hours(at=now) is (earlier - later) -- negative, and most
+    # negative for the freshest possible roster. That would have made the
+    # acceptance report's freshness evidence meaningless on the very run
+    # meant to demonstrate the 36-hour policy.
+    roster_checked_at = datetime.now(timezone.utc)
+    roster_age = snapshot.age_hours(at=roster_checked_at)
+    if roster_age < -CLOCK_PRECISION_TOLERANCE_HOURS:
+        report.failures.append(
+            f"roster snapshot reports a negative age ({roster_age:.4f}h) when "
+            "checked after the fetch, which should be impossible; refusing to "
+            "treat an unexplained clock state as fresh"
+        )
+        return report
+    report.roster_age_hours = round(max(roster_age, 0.0), 4)
 
     if report.roster_age_hours > LIVE_ROSTER_MAX_AGE_HOURS:
         report.failures.append(
