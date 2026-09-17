@@ -33,7 +33,11 @@ def make_request(market_ids: list[str]) -> BenchmarkForecastRequest:
                 "canonical_under_price": -105,
                 "canonical_market_probability_over": "0.51",
                 "same_line_consensus_probability_over": None,
-                "market_context": {"median_line": "74.5", "min_line": "73.5", "max_line": "75.5", "books": 6},
+                "market_context": {
+                    "median_line": "74.5", "min_line": "73.5", "max_line": "75.5",
+                    "books": 6, "books_observed": 6, "stale_books_excluded": 0,
+                    "canonical_quote_stale": False,
+                },
                 "evidence": {},
             }
             for mid in market_ids

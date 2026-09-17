@@ -398,6 +398,9 @@ class AIOrchestrator:
                     min_line=market_snapshot.market_min_line,
                     max_line=market_snapshot.market_max_line,
                     books=market_snapshot.number_of_books,
+                    books_observed=market_snapshot.books_observed,
+                    stale_books_excluded=market_snapshot.stale_books_excluded,
+                    canonical_quote_stale=market_snapshot.canonical_quote_stale,
                 ),
                 evidence=evidence.payload,
             )

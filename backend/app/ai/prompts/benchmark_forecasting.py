@@ -1,9 +1,16 @@
-"""Prompt template for BENCHMARK_FORECASTING (prompt_version "benchmark-v2").
+"""Prompt template for BENCHMARK_FORECASTING (prompt_version "benchmark-v3").
 
 Neutral by design: every competitor gets the exact same system instructions.
 Do not add per-provider or per-competitor personality here -- that
 contaminates the research and belongs in the Show layer, later, on top of
 these same underlying forecasts.
+
+v3 adds a closing paragraph explaining market_context's coverage fields.
+They are three bare integers and a boolean; without the explanation a
+model has no way to know that `books` and `books_observed` differing means
+the evidence was degraded rather than that the market was thin. That is
+the same lesson as v2 below: semantics belong in the instruction, not in a
+field name.
 
 v2 (found live, against all three real providers at once): the first
 paragraph below is unchanged -- it is the frozen research instruction --
@@ -50,6 +57,18 @@ SYSTEM_INSTRUCTIONS = (
     "- public_reasoning: one to four sentences.\n"
     "- key_factors: at most five short items.\n"
     "- primary_concern: a single concise item."
+    "\n\n"
+    "Each market's market_context describes how complete the shared market "
+    "evidence is. `books` is how many sportsbooks were actually used. "
+    "`books_observed` is how many had a quote at all, and "
+    "`stale_books_excluded` is how many of those were dropped because our "
+    "last observation of them was too old to trust. When those differ, the "
+    "market picture you are given is narrower than the market itself was, "
+    "and the excluded books' prices are not available to you. "
+    "`canonical_quote_stale` is true when our last observation of the "
+    "canonical sportsbook was itself too old; no other book is substituted "
+    "in its place. Treat these as information about evidence quality, not "
+    "as information about the teams or the player."
 )
 
 

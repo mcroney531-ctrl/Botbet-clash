@@ -61,12 +61,42 @@ def mock_evidence_payload(*, generated_at: datetime, market_snapshot, extra: dic
             "over_price": market_snapshot.canonical_over_price,
             "under_price": market_snapshot.canonical_under_price,
         },
-        "market_context": {
-            "market_median_line": str(market_snapshot.market_median_line) if market_snapshot.market_median_line is not None else None,
-            "number_of_books": market_snapshot.number_of_books,
-        },
+        "market_context": market_context_payload(market_snapshot),
         "line_history": [],
     }
     if extra:
         payload.update(extra)
     return payload
+
+
+def market_context_payload(market_snapshot) -> dict:
+    """The shared market-coverage block every competitor sees.
+
+    `number_of_books` alone is ambiguous, and the ambiguity is material:
+    "3 books" reads identically whether three books existed or five existed
+    and two were refused as stale. Those are degraded coverage and
+    naturally thin coverage, and a forecaster should be able to tell them
+    apart. Presenting the first as the second is presenting a quality
+    problem as a market fact.
+
+    What is deliberately NOT here: the stale quotes' prices, their books'
+    names, and the vendor's `last_update`. The competitors get to know the
+    evidence was degraded and by how much; they do not get the rejected
+    prices back through a side door, and they never get a field the
+    freshness rule itself is forbidden to use.
+
+    Identical for all three competitors at a checkpoint, like everything
+    else in the shared evidence.
+    """
+
+    return {
+        "market_median_line": (
+            str(market_snapshot.market_median_line)
+            if market_snapshot.market_median_line is not None
+            else None
+        ),
+        "number_of_books": market_snapshot.number_of_books,
+        "books_observed": market_snapshot.books_observed,
+        "stale_books_excluded": market_snapshot.stale_books_excluded,
+        "canonical_quote_stale": market_snapshot.canonical_quote_stale,
+    }

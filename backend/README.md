@@ -929,3 +929,164 @@ still mocked Phase-2 payload content.
 ### Test count
 
 **226 passed, 4 skipped.**
+
+---
+
+## Phase 4A.4 readout — the contract for what happens when the refresh fails
+
+4A.3 built a freshness gate. 4A.4 answers the question the gate was
+missing: *fresh relative to what workflow?* The answer reframes the
+threshold itself.
+
+### The reframing
+
+A quote-age distribution sampled from arbitrary captures is not evidence
+about the tolerance. In the production choreography the refresh
+immediately precedes the capture, so a healthy cycle lands observation
+ages at ~0 and **every candidate threshold scores identically**. Scenario
+A shows exactly that: 900s, 3600s and 7200s are indistinguishable.
+
+The tolerance is an **operational fallback grace period** — when the
+refresh that should have preceded this capture failed, how old are we
+willing to let the last successful observation be? Only the failure cases
+speak to it, which is why the acceptance suite is built around failures
+rather than around a measured distribution.
+
+### The choreography
+
+```
+refresh market data          network, OUTSIDE any DB transaction
+    |
+    v
+persist immutable PropQuotes, COMMIT
+    |
+    v
+capture checkpoint           DB reads only, at the real captured_at
+```
+
+`run_checkpoint_cycle` is the one scheduler-ready entry point — a callable
+job, not a scheduler. Three properties it exists to guarantee:
+
+**No provider HTTP inside `capture_checkpoint`.** A network call inside a
+capture holds a transaction open across an unbounded wait, and a timeout
+aborts a capture that has already written half a slate. The guard walks
+the *transitive* import graph from the capture path, because the dangerous
+version of this regression is a helper three modules down growing an
+adapter import. It's proven non-vacuous by pointing the same walker at
+`live_ingest`, which legitimately does reach a provider.
+
+**The capture clock is read after the refresh settles.** Reading it first
+reproduces the 4A.2 bug exactly — snapshots that cannot see the quotes the
+run just wrote. There's a test asserting the call order, not just the
+outcome.
+
+**A failed refresh does not abort the capture.** A missing checkpoint is a
+hole in the record; a stale-but-labelled one is information.
+
+### Calibration never captures
+
+`capture_checkpoint` is idempotent once CAPTURED. Capturing the durable
+DET @ BUF FINAL to try a candidate threshold would permanently freeze
+experimental artifacts onto a real game with no second attempt. So the
+preview writes nothing — no `MarketSnapshot`, no `CheckpointRun`, no
+`EvidenceSnapshot` — and a structural test enforces it.
+
+It also doesn't re-implement the rule, which was the more interesting
+constraint. A preview built on its own copy is evidence about the copy.
+The rule is now one pure function (`quote_selection.plan_selection`) over
+plain value objects, called by both `build_snapshot` and the preview,
+with:
+
+- a test asserting preview and real capture reach identical verdicts on
+  identical data;
+- an AST guard asserting `quote_selection.py` is the only module in the
+  codebase that ordering-compares an observation age to a tolerance;
+- `provider_market_updated_at` simply absent from `QuoteObservation`, so
+  the rule cannot consult the forbidden field even by accident.
+
+The guard is narrowed to ordering operators — `is None` on a tolerance is
+a presence check, which renderers legitimately do. Both guards were
+verified by injecting a shadow implementation and watching them fail.
+
+### Scenarios A–G
+
+| | scenario | result |
+| --- | --- | --- |
+| A | refresh succeeds immediately before capture | ages 0.0; no candidate distinguishable |
+| B | refresh fails, observations 600s old | captured, baseline valid, labelled |
+| C | refresh fails, canonical 3600s old | baseline invalid, `canonical_quote_stale`, nothing promoted |
+| D | one comparison book stale, canonical fresh | 1 excluded, context narrowed |
+| E | no fresh comparison books | canonical-only: `books_observed` 4 vs `number_of_books` 1 |
+| F | scheduler 3000s late, quotes fresh | large offset, ages 0.0 |
+| G | scheduler on time, earlier refresh failed | offset 0.0, ages 5400 |
+
+F and G are the pair that matters: opposite readings from the same two
+fields. If anything ever derived one clock from the other, one of them
+would break.
+
+### Competitors are told coverage was degraded — not what was rejected
+
+`number_of_books: 3` is ambiguous: three books existed, or five existed
+and two were refused. That's degraded coverage versus naturally thin
+coverage, and presenting the first as the second presents a feed problem
+as a market fact. The shared evidence payload and the request
+`MarketContext` now carry `number_of_books`, `books_observed`,
+`stale_books_excluded`, `canonical_quote_stale`.
+
+Deliberately absent: the stale quotes' prices, which books they came from,
+and the vendor's `last_update`. Competitors learn the evidence was
+degraded and by how much; they don't get the rejected prices back through
+a side door, and never a field the rule itself is forbidden to use.
+
+`BENCHMARK_PROMPT_VERSION` moves **v2 → v3** with instruction text
+explaining the counts — the v1→v2 lesson applied directly, since three
+providers all independently misread `confidence` when its meaning lived
+only in a schema keyword. `FORECAST_SCHEMA_VERSION` stays at
+**forecast-v1**: the response schema is untouched, and bumping it would
+falsely invalidate every stored forecast's shape contract. The renderer
+refuses a v2 request, so a running season can't silently acquire v3's
+fields.
+
+A new `books_observed` column plus two CHECKs make the invariant the
+database's problem rather than a test's: `max_observation_age_seconds >= 0`
+when non-null, and `books_observed = number_of_books + stale_books_excluded`.
+A book must never fall out of both counts.
+
+### Config validation
+
+`None` disables the gate; any threshold must be a non-negative int. A
+negative value isn't a strict rule — it marks everything stale, so the run
+reports a total market outage that never happened. Rejected at CLI parse,
+at service construction (before a run starts, not partway through a
+slate), and by the DB CHECK. `bool` is rejected too: `True` is an `int`
+and would become a one-second tolerance. `run_checkpoint_cycle` validates
+before calling `refresh`, so a typo can't spend a provider call first.
+
+### Recommended threshold — proposed, not frozen
+
+**900 seconds, one value for all three checkpoint types.** Full argument
+in `docs/phase4a4-threshold-recommendation.md`.
+
+The honest part of that recommendation: **900s does not keep a checkpoint
+alive through a refresh failure, and no value can.** With one refresh per
+checkpoint, a failed refresh means the last observation is from the
+previous checkpoint — the real Week-3 runs were 15h51m apart. Any
+tolerance below the inter-checkpoint gap turns one failed refresh into a
+lost checkpoint, and any tolerance above it accepts yesterday's market as
+today's.
+
+So 900s isn't chosen to save the checkpoint. It's chosen to make the
+failure loud and correctly labelled rather than producing a
+confident-looking snapshot built on a stale baseline. If we want
+checkpoints to survive refresh failures, the fix is retries and a second
+attempt inside the window — a 4A.5 question, not a number.
+
+Nothing in the code carries 900. The gate is opt-in, defaults to `None`,
+and `SeasonRules` has no tolerance column; the proposed field shape and
+the migration plan are in the doc, gated on acceptance.
+
+### Test count
+
+**276 passed, 4 skipped.** Migrations `d2b9f45c1a7e` and `e5c1a93f2b64`
+applied through the full chain on a clean database and round-tripped
+twice; no drift against `Base.metadata`.

@@ -102,6 +102,7 @@ class Report:
     snapshots_valid_baseline: int = 0
     snapshots_canonical_stale: int = 0
     stale_books_excluded: int = 0
+    books_observed: int = 0
     quota_remaining: int | None = None
     quota_cost: int = 0
     failures: list[str] = field(default_factory=list)
@@ -461,6 +462,7 @@ def run(
             report.snapshots_valid_baseline += int(snap.is_valid_canonical_baseline)
             report.snapshots_canonical_stale += int(snap.canonical_quote_stale)
             report.stale_books_excluded += snap.stale_books_excluded
+            report.books_observed += snap.books_observed
             if snap.is_valid_canonical_baseline and report.snapshot is None:
                 player = session.get(Player, market.player_id)
                 report.snapshot = {
@@ -541,6 +543,7 @@ def render(report: Report) -> str:
     gate = report.max_observation_age_seconds
     add(f"  max_observation_age_seconds: {gate if gate is not None else 'None (no gate applied)'}")
     add(f"  snapshots built:             {report.snapshots_built}")
+    add(f"  books observed (total):      {report.books_observed}")
     add(f"  valid canonical baseline:    {report.snapshots_valid_baseline}")
     add(f"  canonical quote STALE:       {report.snapshots_canonical_stale}")
     add(f"  stale book-quotes excluded:  {report.stale_books_excluded}")
@@ -565,6 +568,29 @@ def render(report: Report) -> str:
     return "\n".join(out)
 
 
+def _non_negative_seconds(raw: str) -> int:
+    """argparse type for the freshness tolerance.
+
+    Rejected at PARSE time rather than deep inside snapshot construction:
+    a negative tolerance marks every observation stale, so the run would
+    complete "successfully" having reported a total market outage that
+    never happened. The service validates it again -- this is the layer
+    that keeps a typo from ever reaching it.
+    """
+
+    try:
+        value = int(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{raw!r} is not an integer number of seconds") from None
+    if value < 0:
+        raise argparse.ArgumentTypeError(
+            f"must be >= 0, got {value}. A negative tolerance marks every "
+            "observation stale, which reads as a total market outage rather "
+            "than as the misconfiguration it is."
+        )
+    return value
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Phase 4A.2 real current ingestion")
     parser.add_argument(
@@ -584,7 +610,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--sport", default=DEFAULT_SPORT)
     parser.add_argument(
-        "--max-observation-age-seconds", type=int, default=None,
+        "--max-observation-age-seconds", type=_non_negative_seconds, default=None,
         help="per-book observation freshness gate for the snapshots this run "
              "builds. Omitted means NO gate -- which is the honest default until "
              "real captures say what live staleness looks like. Never derived "

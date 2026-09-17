@@ -8,18 +8,43 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.ai.schemas.common import CallType, Uncertainty
 
 
 class MarketContext(BaseModel):
+    """Diagnostic market context, plus how complete it is.
+
+    `books` counts the books actually CONSUMED. `books_observed` counts the
+    books that had a quote at all, and the difference is what freshness
+    refused. Without that pair, degraded coverage and naturally thin
+    coverage are indistinguishable to a forecaster, so a feed problem
+    reads as a market fact.
+
+    Rejected prices are deliberately absent: a competitor learns the
+    evidence was degraded, not what the degraded evidence said.
+    """
+
     model_config = ConfigDict(extra="forbid")
 
     median_line: Decimal
     min_line: Decimal
     max_line: Decimal
     books: int = Field(ge=0)
+    books_observed: int = Field(ge=0)
+    stale_books_excluded: int = Field(ge=0)
+    canonical_quote_stale: bool = False
+
+    @model_validator(mode="after")
+    def _coverage_adds_up(self) -> "MarketContext":
+        if self.books_observed != self.books + self.stale_books_excluded:
+            raise ValueError(
+                "books_observed must equal books + stale_books_excluded; a book "
+                "that falls out of both counts turns a dropped feed into a "
+                "snapshot that merely looks thin"
+            )
+        return self
 
 
 class MarketInput(BaseModel):

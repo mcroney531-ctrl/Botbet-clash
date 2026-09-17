@@ -155,6 +155,13 @@ class MarketSnapshot(Base):
     # unreproducible, because you can no longer tell which rule produced it.
     # NULL means no freshness gate was applied (synthetic/Phase-2 path).
     max_observation_age_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # How many books had ANY quote at taken_at. Stored rather than left to
+    # be inferred, because `number_of_books` alone is ambiguous downstream:
+    # "3 books" reads identically whether three existed or five existed and
+    # two were refused as stale. That difference is degraded coverage
+    # versus naturally thin coverage, and it is what the competitors are
+    # shown (§4A.4). A CHECK keeps the three counts consistent.
+    books_observed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     stale_books_excluded: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     # True when the canonical book's newest observation was itself too old.
     # Distinct from "canonical absent": the book was quoting, we just had
@@ -185,6 +192,21 @@ class MarketSnapshot(Base):
         CheckConstraint(
             "same_line_consensus_over_probability IS NULL OR (same_line_consensus_over_probability >= 0 AND same_line_consensus_over_probability <= 1)",
             name="consensus_probability_range",
+        ),
+        # A negative tolerance is a configuration error, not a strict rule:
+        # it marks every observation stale, so the run reads downstream as a
+        # total market outage. Caught in the service too; enforced here so
+        # no other writer can land one.
+        CheckConstraint(
+            "max_observation_age_seconds IS NULL OR max_observation_age_seconds >= 0",
+            name="max_observation_age_non_negative",
+        ),
+        # Every observed book is either consumed or refused, never neither.
+        # Without this, a book silently dropped from the feed and a book
+        # refused as stale both just shrink number_of_books.
+        CheckConstraint(
+            "books_observed = number_of_books + stale_books_excluded",
+            name="books_observed_accounts_for_every_book",
         ),
     )
 

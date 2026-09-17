@@ -1,8 +1,10 @@
 """MarketSnapshotService — builds a frozen `MarketSnapshot` from whatever
 `PropQuote` rows already exist as of a point in time. No live provider
 calls happen here or after: this only ever reads quotes already persisted
-by an ingestion pipeline (not built in Phase 2 — see RULES.md §16's
-"if the canonical market is unavailable... do not silently substitute").
+by an ingestion pass that ran, committed, and finished BEFORE the capture
+began (seam doc §3.3). RULES.md §16's "if the canonical market is
+unavailable... do not silently substitute" is enforced by
+`quote_selection.plan_selection`, which decides what this consumes.
 """
 
 from __future__ import annotations
@@ -22,8 +24,32 @@ from app.forecast_lab.market_math import (
     market_line_context,
     same_line_consensus_probability,
 )
+from app.forecast_lab.quote_selection import (
+    QuoteObservation,
+    SelectionPlan,
+    plan_selection,
+    validate_max_observation_age,
+)
 
-SELECTION_SCHEMA = "market_snapshot_selection_v1"
+
+def as_observation(row: PropQuote) -> QuoteObservation:
+    """ORM row -> the value type the selection rule takes.
+
+    `provider_market_updated_at` is deliberately not carried across. The
+    rule is forbidden to consider it, and the cheapest way to keep a
+    forbidden field out of a decision is for the decision never to be
+    handed it.
+    """
+
+    return QuoteObservation(
+        quote_id=row.id,
+        sportsbook=row.sportsbook,
+        line=row.line,
+        over_price=row.over_price,
+        under_price=row.under_price,
+        as_of_at=row.as_of_at,
+        retrieved_at=row.retrieved_at,
+    )
 
 
 class MarketSnapshotService:
@@ -43,66 +69,56 @@ class MarketSnapshotService:
         # frozen string and pins quote selection to it.
         self.market_data_provider = market_data_provider
         # How old an OBSERVATION may be, at `taken_at`, and still count
-        # toward this snapshot. `None` disables the gate entirely, which
-        # is the Phase-2/synthetic behaviour and stays the default.
+        # toward this snapshot. `None` disables the gate, which is the
+        # Phase-2/synthetic behaviour and stays the default.
         #
-        # This is deliberately a caller-supplied parameter rather than a
-        # SeasonRules column: no defensible number exists yet. It lands in
-        # SeasonRules once real checkpoint captures say what live staleness
-        # actually looks like, and inventing a plausible-looking default
-        # here would freeze a guess into the research record.
-        self.max_observation_age_seconds = max_observation_age_seconds
+        # Still a caller-supplied parameter rather than a SeasonRules
+        # column: this is a post-refresh-failure grace period, and no
+        # defensible number exists until the refresh->capture workflow has
+        # been exercised against real failures.
+        #
+        # Validated at CONSTRUCTION, not at first use: a misconfigured
+        # tolerance must fail before a run starts, not partway through a
+        # slate with some snapshots already written.
+        self.max_observation_age_seconds = validate_max_observation_age(max_observation_age_seconds)
 
-    def build_snapshot(self, *, market_id: uuid.UUID, canonical_sportsbook: str, taken_at: datetime) -> MarketSnapshot:
+    def selection_plan(
+        self, *, market_id: uuid.UUID, canonical_sportsbook: str, taken_at: datetime
+    ) -> SelectionPlan:
+        """What a snapshot at `taken_at` WOULD consume. Reads only.
+
+        Shared with the calibration preview, which has to ask this question
+        without writing anything. `build_snapshot` is this plus the
+        arithmetic and the INSERT, so a preview and a real capture cannot
+        disagree about the selection — which is the only thing that makes
+        previewing a threshold evidence about that threshold.
+        """
+
         repo = MarketRepository(self.session)
-        quote_rows = repo.quotes_as_of(market_id, source=self.market_data_provider, as_of=taken_at)
-
-        # One quote per book: the most recent observation as of `taken_at`.
-        # `quotes_as_of` orders as_of_at desc, then retrieved_at desc, then
-        # id desc -- deterministic all the way down, which this loop relies
-        # on: it takes the first row it sees per sportsbook, so an unstable
-        # sort would make the canonical baseline non-reproducible. It
-        # orders on OBSERVATION time, not retrieval time; see the docstring
-        # on quotes_as_of for why that distinction is load-bearing.
-        latest_by_book: dict[str, PropQuote] = {}
-        for q in quote_rows:
-            if q.sportsbook not in latest_by_book:
-                latest_by_book[q.sportsbook] = q
-
-        # Freshness is decided PER BOOK, on OBSERVATION age -- how long
-        # before `taken_at` we actually saw that book's state. It is never
-        # decided on `provider_market_updated_at`: that is the vendor's
-        # claim about when the market last MOVED, so a book that has sat
-        # at the same number all week reads as "hours stale" while being
-        # perfectly current, and a feed that silently stopped reporting
-        # reads as fresh right up until it moves. Seam doc §3.1.
-        included: dict[str, PropQuote] = {}
-        excluded: dict[str, PropQuote] = {}
-        for sportsbook, q in latest_by_book.items():
-            if self._is_stale(q, taken_at):
-                excluded[sportsbook] = q
-            else:
-                included[sportsbook] = q
-
-        # The canonical book being stale is NOT a reason to promote the
-        # next-freshest book: RULES.md §16 forbids silently substituting a
-        # different sportsbook for the canonical baseline. The snapshot is
-        # written, the market context is written, and the baseline is
-        # simply marked invalid -- with `canonical_quote_stale` to
-        # distinguish "the book was quoting, we just had nothing recent
-        # enough" from "the book was not in the feed at all".
-        canonical_quote_stale = canonical_sportsbook in excluded
-
-        quotes = [
-            BookQuote(q.sportsbook, q.line, q.over_price, q.under_price)
-            for q in sorted(included.values(), key=lambda row: row.sportsbook)
-        ]
-        canonical_row = included.get(canonical_sportsbook)
-        canonical_quote = (
-            BookQuote(canonical_row.sportsbook, canonical_row.line, canonical_row.over_price, canonical_row.under_price)
-            if canonical_row is not None
-            else None
+        rows = repo.quotes_as_of(market_id, source=self.market_data_provider, as_of=taken_at)
+        return plan_selection(
+            [as_observation(r) for r in rows],
+            taken_at=taken_at,
+            canonical_sportsbook=canonical_sportsbook,
+            max_observation_age_seconds=self.max_observation_age_seconds,
         )
+
+    def build_snapshot(
+        self, *, market_id: uuid.UUID, canonical_sportsbook: str, taken_at: datetime
+    ) -> MarketSnapshot:
+        plan = self.selection_plan(
+            market_id=market_id, canonical_sportsbook=canonical_sportsbook, taken_at=taken_at
+        )
+
+        quotes = [_book_quote(s) for s in plan.included]
+        canonical_selected = plan.canonical
+        canonical_quote = _book_quote(canonical_selected) if canonical_selected is not None else None
+        # A stale canonical book promotes nobody: RULES.md §16 forbids
+        # silently substituting a different sportsbook for the canonical
+        # baseline, and "too old to trust" is a form of unavailable. The
+        # snapshot and its market context are still written; only the
+        # baseline goes invalid, with `canonical_quote_stale` recording
+        # which failure it was.
         is_valid = canonical_baseline_is_valid(canonical_quote)
 
         canonical_line = canonical_over_price = canonical_under_price = None
@@ -113,7 +129,9 @@ class MarketSnapshotService:
             canonical_line = canonical_quote.line
             canonical_over_price = canonical_quote.over_price
             canonical_under_price = canonical_quote.under_price
-            canonical_over_prob, canonical_under_prob = devig_two_sided(canonical_quote.over_price, canonical_quote.under_price)
+            canonical_over_prob, canonical_under_prob = devig_two_sided(
+                canonical_quote.over_price, canonical_quote.under_price
+            )
             consensus = same_line_consensus_probability(canonical_line, quotes)
 
         context = market_line_context(quotes)
@@ -134,59 +152,16 @@ class MarketSnapshotService:
             market_max_line=context["market_max_line"],
             number_of_books=context["number_of_books"],
             is_valid_canonical_baseline=is_valid,
-            max_observation_age_seconds=self.max_observation_age_seconds,
-            stale_books_excluded=len(excluded),
-            canonical_quote_stale=canonical_quote_stale,
-            selected_quotes=self._selection_record(
-                taken_at=taken_at,
-                canonical_sportsbook=canonical_sportsbook,
-                included=included,
-                excluded=excluded,
-            ),
+            max_observation_age_seconds=plan.max_observation_age_seconds,
+            books_observed=plan.books_observed,
+            stale_books_excluded=plan.stale_books_excluded,
+            canonical_quote_stale=plan.canonical_quote_stale,
+            selected_quotes=plan.as_record(),
         )
-        repo.add_market_snapshot(row)
+        MarketRepository(self.session).add_market_snapshot(row)
         return row
 
-    def _is_stale(self, quote: PropQuote, taken_at: datetime) -> bool:
-        if self.max_observation_age_seconds is None:
-            return False
-        return observation_age_seconds(quote, taken_at) > self.max_observation_age_seconds
 
-    def _selection_record(
-        self,
-        *,
-        taken_at: datetime,
-        canonical_sportsbook: str,
-        included: dict[str, PropQuote],
-        excluded: dict[str, PropQuote],
-    ) -> dict:
-        def entry(q: PropQuote) -> dict:
-            return {
-                "quote_id": str(q.id),
-                "sportsbook": q.sportsbook,
-                "as_of_at": q.as_of_at.isoformat(),
-                "observation_age_seconds": observation_age_seconds(q, taken_at),
-                "is_canonical": q.sportsbook == canonical_sportsbook,
-            }
-
-        def entries(rows: dict[str, PropQuote]) -> list[dict]:
-            return [entry(rows[book]) for book in sorted(rows)]
-
-        return {
-            "schema": SELECTION_SCHEMA,
-            "included": entries(included),
-            "excluded_stale": entries(excluded),
-        }
-
-
-def observation_age_seconds(quote: PropQuote, taken_at: datetime) -> float:
-    """How long before `taken_at` this observation was made.
-
-    Clamped at zero rather than allowed to go negative. `quotes_as_of`
-    already filters `as_of_at <= taken_at`, so a negative value would mean
-    a bug upstream rather than a fresh quote — but an age metric that can
-    read "-3.0 seconds" invites exactly the sign confusion that made the
-    first pass at this measure tautological, so the clamp is explicit.
-    """
-
-    return max(0.0, (taken_at - quote.as_of_at).total_seconds())
+def _book_quote(selected) -> BookQuote:
+    o = selected.observation
+    return BookQuote(o.sportsbook, o.line, o.over_price, o.under_price)
