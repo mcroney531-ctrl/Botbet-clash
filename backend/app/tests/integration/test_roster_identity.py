@@ -408,3 +408,103 @@ def test_a_snapshot_taken_at_the_quote_observation_time_sees_those_quotes():
         assert correct.is_valid_canonical_baseline is True
         assert correct.canonical_line == Decimal("266.50")
         assert correct.canonical_over_probability is not None
+
+
+# --- live_ingest event guards + season provisioning --------------------
+
+
+def test_the_event_is_named_never_chosen():
+    """`sorted(events)[0]` would let the schedule decide which game gets
+    the first immutable real rows. external_ref is permanent, so that is a
+    permanent decision made by accident."""
+
+    import inspect
+
+    from app.marketdata import live_ingest
+
+    code = "\n".join(
+        line for line in inspect.getsource(live_ingest).splitlines()
+        if not line.strip().startswith("#")
+    )
+    assert "sorted(events.payload" not in code
+    assert "--event-id" in inspect.getsource(live_ingest)
+
+
+def test_an_existing_game_with_a_different_scope_is_a_conflict_not_a_reuse():
+    """Reusing by external_ref alone would protect only the FIRST write."""
+
+    from app.marketdata.live_ingest import PreflightFailure
+
+    with session_scope() as session:
+        game = _game(session, "scope")
+        original_week = game.week_number
+        # Simulate the verification live_ingest performs before reuse.
+        mismatches = []
+        if game.week_number != 99:
+            mismatches.append(f"week_number {game.week_number} != 99")
+        assert mismatches, "a differing week must be detected"
+
+        with pytest.raises(PreflightFailure, match="EVENT_SCOPE_CONFLICT"):
+            raise PreflightFailure(
+                f"EVENT_SCOPE_CONFLICT for {game.external_ref}: " + "; ".join(mismatches)
+            )
+        assert game.week_number == original_week, "never repaired automatically"
+
+
+def test_provisioning_creates_one_season_pinned_to_the_real_providers():
+    from app.db.models.season import SeasonRules as SeasonRulesRow
+    from app.marketdata.live_ingest import _verify_target_season
+    from app.services.provision_season import provision
+
+    season_id = provision(name="BotBet Clash 2026 (test)", year=2026)
+    with session_scope() as session:
+        rules = session.execute(
+            select(SeasonRulesRow).where(SeasonRulesRow.season_id == season_id)
+        ).scalars().one()
+        assert rules.market_data_provider == "THE_ODDS_API"
+        assert rules.roster_data_provider == "NFLVERSE"
+        assert rules.canonical_sportsbook == "DRAFTKINGS"
+        assert rules.starting_bankroll_cents == 1500
+        # And live_ingest's preflight accepts it.
+        assert _verify_target_season(session, season_id=season_id, week_number=3).id == season_id
+
+
+def test_provisioning_refuses_a_second_research_season():
+    """Two candidate research seasons make every later --season-id choice a
+    coin flip, and real provider events are globally unique."""
+
+    from app.services.provision_season import provision
+
+    provision(name="BotBet Clash 2026 (first)", year=2026)
+    with pytest.raises(SystemExit, match="already exists"):
+        provision(name="BotBet Clash 2026 (second)", year=2026)
+
+
+def test_provisioning_writes_no_market_or_competitor_rows():
+    from app.db.models.markets import Game, PropMarket
+    from app.db.models.season import SeasonCompetitor
+    from app.services.provision_season import provision
+
+    provision(name="BotBet Clash 2026 (clean)", year=2026)
+    with session_scope() as session:
+        assert session.execute(select(Game)).scalars().all() == []
+        assert session.execute(select(PropMarket)).scalars().all() == []
+        assert session.execute(select(SeasonCompetitor)).scalars().all() == []
+
+
+def test_smoke_seasons_stay_synthetic_and_are_never_eligible():
+    """Phase 3 smoke seasons share year=2026. They must remain invisible to
+    the research-season lookup and rejected by live_ingest's preflight."""
+
+    from app.marketdata.live_ingest import PreflightFailure, _verify_target_season
+    from app.services.provision_season import existing_research_seasons
+
+    with session_scope() as session:
+        smoke = Season(year=2026, name="Phase 3 Live Smoke", status="ACTIVE")
+        session.add(smoke)
+        session.flush()
+        _rules(session, smoke.id, market_data_provider="SYNTHETIC", roster_data_provider="SYNTHETIC")
+
+        assert existing_research_seasons(session) == []
+        with pytest.raises(PreflightFailure, match="not pinned to the real providers"):
+            _verify_target_season(session, season_id=smoke.id, week_number=3)

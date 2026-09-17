@@ -81,6 +81,7 @@ from app.domain.errors import (
     TicketNotExecutable,
     WeekNotOpen,
 )
+from app.marketdata.provenance import SYNTHETIC_SOURCE
 from app.domain.lines import is_pushable_line
 from app.domain.models import SeasonRules as DomainSeasonRules
 from app.domain.risk import (
@@ -100,12 +101,33 @@ class SeasonCommissioner:
 
     @classmethod
     def create_season(
-        cls, *, name: str, year: int, rules: DomainSeasonRules, clock: Clock | None = None
+        cls,
+        *,
+        name: str,
+        year: int,
+        rules: DomainSeasonRules,
+        clock: Clock | None = None,
+        market_data_provider: str = SYNTHETIC_SOURCE,
+        roster_data_provider: str = SYNTHETIC_SOURCE,
     ) -> "SeasonCommissioner":
+        """Create a season and its first rules row.
+
+        The two provider pins default to SYNTHETIC so that a season created
+        without saying otherwise can never accidentally claim to be backed
+        by real market or roster data. A real research season passes them
+        explicitly.
+        """
+
         clock = clock or SystemClock()
         with session_scope() as session:
             season_row = SeasonRepository(session).create_season(name=name, year=year)
-            SeasonRepository(session).create_season_rules(season_id=season_row.id, rules=rules, effective_from=clock.now())
+            SeasonRepository(session).create_season_rules(
+                season_id=season_row.id,
+                rules=rules,
+                effective_from=clock.now(),
+                market_data_provider=market_data_provider,
+                roster_data_provider=roster_data_provider,
+            )
             season_id = season_row.id
         return cls(season_id=str(season_id), clock=clock)
 

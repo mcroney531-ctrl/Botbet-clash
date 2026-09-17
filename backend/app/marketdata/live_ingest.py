@@ -147,7 +147,9 @@ def _require_key() -> None:
         )
 
 
-def run(*, season_id: uuid.UUID, week_number: int, sport: str = DEFAULT_SPORT) -> Report:
+def run(
+    *, season_id: uuid.UUID, week_number: int, event_id: str, sport: str = DEFAULT_SPORT
+) -> Report:
     report = Report()
     _require_key()
     now = datetime.now(timezone.utc)
@@ -212,7 +214,21 @@ def run(*, season_id: uuid.UUID, week_number: int, sport: str = DEFAULT_SPORT) -
             finish_run(session, run=session.get(IngestionRun, odds_run_id), status="FAILED")
         return report
 
-    event = sorted(events.payload, key=lambda e: e.kickoff_at)[0]
+    # The event is NAMED, never chosen. Picking sorted(events)[0] would let
+    # the schedule decide which game receives the first immutable real rows,
+    # and Game.external_ref is globally unique -- so an implicitly chosen
+    # game is a permanent decision made by accident.
+    matches = [e for e in events.payload if e.ref.external_event_id == event_id]
+    if len(matches) != 1:
+        report.failures.append(
+            f"EVENT_NOT_FOUND: --event-id {event_id} matched {len(matches)} of "
+            f"{len(events.payload)} returned events. Refusing to substitute a "
+            "different game."
+        )
+        with session_scope() as session:
+            finish_run(session, run=session.get(IngestionRun, odds_run_id), status="FAILED")
+        return report
+    event = matches[0]
     report.event_label = f"{event.away_team} @ {event.home_team}"
 
     try:
@@ -266,6 +282,30 @@ def run(*, season_id: uuid.UUID, week_number: int, sport: str = DEFAULT_SPORT) -
         game = session.execute(
             select(Game).where(Game.external_ref == event.ref.as_external_ref())
         ).scalar_one_or_none()
+        if game is not None:
+            # Reusing by external_ref alone would make the poisoned-event
+            # protection cover only the FIRST write. Verify the whole scope.
+            mismatches = []
+            if game.season_id != season_id:
+                mismatches.append(f"season_id {game.season_id} != {season_id}")
+            if game.week_number != week_number:
+                mismatches.append(f"week_number {game.week_number} != {week_number}")
+            if game.home_team_canonical != home.value:
+                mismatches.append(f"home {game.home_team_canonical} != {home.value}")
+            if game.away_team_canonical != away.value:
+                mismatches.append(f"away {game.away_team_canonical} != {away.value}")
+            if game.kickoff_at != event.kickoff_at:
+                mismatches.append(
+                    f"kickoff {game.kickoff_at.isoformat()} != {event.kickoff_at.isoformat()}"
+                )
+            if mismatches:
+                raise PreflightFailure(
+                    f"EVENT_SCOPE_CONFLICT for {event.ref.as_external_ref()}: "
+                    + "; ".join(mismatches)
+                    + ".\nThe existing row is NOT being repaired or moved "
+                    "automatically -- an external_ref is a permanent identity and "
+                    "silently relocating it would hide whichever write was wrong."
+                )
         if game is None:
             game = repo.create_game(
                 external_ref=event.ref.as_external_ref(),
@@ -444,10 +484,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--week-number", required=True, type=int,
         help="the real NFL week. Week 0 is refused -- external_ref is global and permanent.",
     )
+    parser.add_argument(
+        "--event-id", required=True,
+        help="the exact provider event id. The event is named, never chosen: "
+             "external_ref is permanent, so an implicitly selected game is a "
+             "permanent decision made by accident.",
+    )
     parser.add_argument("--sport", default=DEFAULT_SPORT)
     args = parser.parse_args(argv)
 
-    report = run(season_id=args.season_id, week_number=args.week_number, sport=args.sport)
+    report = run(
+        season_id=args.season_id,
+        week_number=args.week_number,
+        event_id=args.event_id,
+        sport=args.sport,
+    )
     print(render(report))
     return 1 if report.failures or not report.quotes_written else 0
 
