@@ -1227,3 +1227,100 @@ across retries, and the capture clock read after the *final* attempt.
 
 **303 passed, 4 skipped.** Migration `f3a71d9b28c4` applied through the
 full chain on a clean database and round-tripped twice.
+
+---
+
+## Phase 4A.5 closeout — three things that would have cost money or lied
+
+### A NULL policy was masquerading as an official one
+
+`CapturePolicy.from_season_rules()` loaded a real-provider season whose
+`max_observation_age_seconds` and `refresh_retry_policy` were both NULL,
+turned that into "no freshness gate, one attempt", and reported
+`is_official = True` because `rules_version` was populated.
+
+That made *the absence of a decision* indistinguishable from *a decision
+to disable the gate* — and it did so on the run that looked most
+authoritative. The durable BotBet 2026 season is in exactly that state
+right now, so this was live.
+
+A real-provider season now raises `CapturePolicyNotFrozen` until both
+fields are set, and `is_official` requires every capture-policy value to
+have come from the frozen row (tracked by a `retry_frozen` flag, so "the
+rules say one attempt" and "no retry policy was ever frozen" stop being
+the same object). Synthetic seasons still resolve — they fabricate their
+own market data and have no provider to overspend against — but report
+`is_official = False`.
+
+Frozen JSON is now strictly validated rather than coerced. `int("3")`,
+`int(True)` and `int(3.7)` all succeed in Python; unknown keys are
+rejected too, since a misspelled field silently takes its default.
+
+### The concurrency hole, and two bugs the race test found in my fix
+
+Two workers could both see ELIGIBLE and both pay. `checkpoint_lease.py`
+makes the claim atomic — one `INSERT ... ON CONFLICT DO UPDATE ... WHERE`,
+committed before any network work, with no lock held across the provider
+call.
+
+Worth recording that my first implementation was wrong twice, and the
+test caught both:
+
+**I released the lease after the refresh, not after the capture.** That
+leaves a window where a worker has finished paying but has not yet
+captured — and a second worker claiming in that window re-verifies
+ELIGIBLE and pays again. It is the *capture* that makes a checkpoint stop
+being eligible, so the lease has to span it.
+
+**A takeover kept the abandoned row's primary key.** So the worker that
+overran its lease still held a matching `lease_id`, and its release
+deleted the *new* holder's lease on the way out. `SET id = EXCLUDED.id` is
+load-bearing.
+
+Also: the disposition is re-verified under the lease, since the preflight
+read is unsynchronized and can be stale by the time the claim succeeds.
+And a worker that loses the lease captures nothing either — it has no
+fresh data, and capturing would consume the checkpoint out from under the
+holder.
+
+The race test runs real threads against real Postgres, because the claim's
+atomicity is a property of one SQL statement rather than of application
+logic. Disabling the lease fails it deterministically, five runs out of
+five.
+
+### The window guard did not cover attempt 1
+
+A cycle starting seconds before `window_end` was ELIGIBLE, could buy a
+refresh, and then crossed the boundary — so the capture it paid for landed
+as MISSED. One rule (`_has_room`) now covers attempt 1 and every retry;
+two separate guards would inevitably disagree.
+
+Sized from the real call sequence rather than assumed: nflverse roster
+(60s timeout) + `list_events` (30s) + `fetch_quotes` (30s) = a 180s request
+budget, plus a 60s capture reserve — **240s of room needed before any paid
+attempt.** A 60s guard would have covered only the odds timeout. There's a
+test asserting the default still covers all three timeouts, so a future
+change to either adapter fails it.
+
+### Freeze machinery — built, not fired
+
+`amend_capture_policy` clones the active `SeasonRules` row, changes only
+the two capture-policy fields plus version/effective_from/reason, and sets
+the old row's `superseded_by` — one transaction, append-only. A guard
+verifies all 21 methodology fields are identical *after* building the
+clone, so a future edit that widened the command fails there rather than
+silently rewriting methodology. The CLI is a dry run unless `--apply` is
+passed.
+
+`official_capture` resolves game → season → active rules → policy and has
+no flags for the tolerance, retry budget, canonical book or provider — a
+structural test asserts that.
+
+**Nothing has been applied to production.** The exact command and the
+before/after diff are in the session notes awaiting approval.
+
+### Test count
+
+**338 passed, 4 skipped.** Migration `a71e5c3d94f8` (the lease table)
+applied through the full chain on a clean database and round-tripped
+twice.

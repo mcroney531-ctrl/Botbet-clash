@@ -35,6 +35,7 @@ from app.marketdata.checkpoint_cycle import (
     SINGLE_ATTEMPT,
     CapturePolicy,
     CapturePolicyError,
+    CapturePolicyNotFrozen,
     RefreshOutcome,
     RefreshRetryPolicy,
     render,
@@ -393,26 +394,108 @@ def test_a_non_retryable_failure_is_not_retried(category):
     assert report.checkpoint_status == "CAPTURED"
 
 
+def test_the_first_paid_attempt_is_guarded_by_the_remaining_window():
+    """ELIGIBLE at this instant is NOT "there is enough window left to
+    sensibly begin network work".
+
+    A cycle starting seconds before window_end would buy a refresh and
+    then cross the boundary, so the capture it paid for is marked MISSED.
+    The guard is sized from the real call sequence: an nflverse roster
+    download (60s timeout) plus list_events (30s) plus fetch_quotes (30s),
+    then a reserve for the capture itself.
+    """
+
+    game_id = _game("first-guard")
+    _market(game_id, "first-guard")
+
+    # Inside the window, but with less room than one refresh needs.
+    late = KICKOFF - timedelta(hours=2) - timedelta(seconds=100)
+
+    refresh = CountingRefresh()
+    report = _cycle(game_id, refresh=refresh, at=late, policy=_policy(retry=PROPOSED_RETRY))
+
+    assert report.disposition is CheckpointDisposition.ELIGIBLE, "still eligible..."
+    assert refresh.calls == 0, "...but not worth starting"
+    assert report.provider_calls_spent == 0
+    assert "window left" in report.refresh_skipped_reason
+
+
+def test_the_window_guard_boundary():
+    """Just enough room refreshes; one second less does not."""
+
+    room = PROPOSED_RETRY.room_needed_seconds
+    window_end = KICKOFF - timedelta(hours=2)
+
+    enough = _game("guard-enough")
+    _market(enough, "guard-enough")
+    refresh_a = CountingRefresh()
+    _cycle(enough, refresh=refresh_a, at=window_end - timedelta(seconds=room),
+           policy=_policy(retry=PROPOSED_RETRY))
+    assert refresh_a.calls == 1
+
+    short = _game("guard-short")
+    _market(short, "guard-short")
+    refresh_b = CountingRefresh()
+    _cycle(short, refresh=refresh_b, at=window_end - timedelta(seconds=room - 1),
+           policy=_policy(retry=PROPOSED_RETRY))
+    assert refresh_b.calls == 0
+
+
 def test_retries_never_consume_the_window_they_protect():
-    """A retry that would leave too little of the window is not attempted.
-    Spending the window on retries would turn a recoverable failure into a
-    MISSED checkpoint."""
+    """The same guard, offset by the backoff. Spending the window on
+    retries would turn a recoverable failure into a MISSED checkpoint.
+
+    A small request budget is used here so attempt 1 clears the guard and
+    the retry is the thing being refused -- otherwise this would just be
+    the attempt-1 test again.
+    """
 
     game_id = _game("window-guard")
     _market(game_id, "window-guard")
 
-    # 100 seconds before window_end: the 120s second backoff cannot fit.
+    tight = RefreshRetryPolicy(
+        max_attempts=3, backoff_seconds=(120.0,),
+        window_guard_seconds=10.0, request_budget_seconds=10.0,
+    )
+    # 100s left: attempt 1 needs 20s of room and fits; the 120s backoff
+    # would leave -20s and must not be attempted.
     late = KICKOFF - timedelta(hours=2) - timedelta(seconds=100)
 
     refresh = CountingRefresh(outcomes=[_fail("TIMEOUT")])
-    report = _cycle(
-        game_id, refresh=refresh, at=late,
-        policy=_policy(retry=RefreshRetryPolicy(max_attempts=3, backoff_seconds=(120.0,))),
-    )
+    report = _cycle(game_id, refresh=refresh, at=late, policy=_policy(retry=tight))
 
     assert refresh.calls == 1
     assert "guard" in report.refresh_skipped_reason
     assert report.checkpoint_status == "CAPTURED"
+
+
+def test_the_two_guards_are_one_rule():
+    """Two separate guards would inevitably disagree about how much room a
+    paid attempt needs."""
+
+    import ast
+    import inspect
+
+    from app.marketdata import checkpoint_cycle
+
+    code = ast.unparse(ast.parse(inspect.getsource(checkpoint_cycle)))
+    assert code.count("_has_room(") >= 2, "both call sites must use the shared helper"
+    assert "room_needed_seconds" in code
+
+
+def test_the_request_budget_covers_the_real_call_sequence():
+    """Sized, not guessed. The production refresh is a roster download plus
+    two odds calls, and the default must cover all three timeouts."""
+
+    from app.marketdata.checkpoint_cycle import DEFAULT_REQUEST_BUDGET_SECONDS
+    from app.marketdata.providers.the_odds_api import DEFAULT_TIMEOUT_SECONDS as ODDS_TIMEOUT
+    from app.rosterdata.providers.nflverse import DEFAULT_TIMEOUT_SECONDS as ROSTER_TIMEOUT
+
+    worst_case = ROSTER_TIMEOUT + 2 * ODDS_TIMEOUT
+    assert DEFAULT_REQUEST_BUDGET_SECONDS >= worst_case, (
+        f"a {DEFAULT_REQUEST_BUDGET_SECONDS}s budget cannot cover {worst_case}s "
+        "of provider timeouts"
+    )
 
 
 def test_model_a_is_the_single_attempt_policy():
@@ -567,24 +650,81 @@ def test_an_official_policy_comes_from_frozen_rules_and_says_so():
     assert policy.market_data_provider == PROVIDER
 
 
-def test_an_injected_policy_is_not_official():
+def test_is_official_means_more_than_a_rules_version_existing():
+    """The masquerade this closeout fixes. A real season row with NULL
+    policy fields carries a rules_version, so keying `is_official` on that
+    alone would report "no freshness gate, one attempt" as an official
+    policy -- which is precisely the state meaning nothing has been frozen.
+    """
+
     assert _policy().is_official is False
-    assert _policy(rules_version="2026-w0.1").is_official is True
+    # A version string alone is not enough any more.
+    assert _policy(rules_version="2026-w0.1").is_official is False
+    # Nor is a version plus a tolerance, while the retry policy is unfrozen.
+    assert CapturePolicy(
+        canonical_sportsbook=CANONICAL,
+        market_data_provider=PROVIDER,
+        checkpoint_windows=WINDOWS,
+        max_observation_age_seconds=900,
+        rules_version="2026-w0.1",
+    ).is_official is False
+    # All three, and only then.
+    assert CapturePolicy(
+        canonical_sportsbook=CANONICAL,
+        market_data_provider=PROVIDER,
+        checkpoint_windows=WINDOWS,
+        max_observation_age_seconds=900,
+        retry=PROPOSED_RETRY,
+        rules_version="2026-w0.1",
+        retry_frozen=True,
+    ).is_official is True
 
 
-def test_a_season_with_no_frozen_policy_gets_no_gate_and_one_attempt():
-    """NULL means no capture policy was frozen, which is exactly what every
-    pre-4A.5 season ran under. It is not a zero-second tolerance and not
-    zero attempts."""
+def test_a_real_provider_season_without_a_frozen_policy_fails_closed():
+    """The blocker this closeout exists for.
 
-    game_id = _game("legacy")
+    The durable BotBet 2026 season currently has both new fields NULL. The
+    old code turned that into "no freshness gate, one attempt" AND reported
+    it as official, because rules_version was populated. NULL means no
+    decision has been made; it is not a decision to disable the gate.
+    """
+
+    game_id = _game("notfrozen")
     with session_scope() as session:
         game = session.get(Game, game_id)
-        _rules(session, game.season_id)
+        _rules(session, game.season_id)  # both policy fields NULL
+        with pytest.raises(CapturePolicyNotFrozen, match="max_observation_age_seconds"):
+            CapturePolicy.from_season_rules(session, season_id=game.season_id)
+
+
+def test_a_half_frozen_policy_also_fails_closed():
+    """A tolerance without a retry budget is still an undecided policy, and
+    the error names the field that is missing."""
+
+    game_id = _game("halffrozen")
+    with session_scope() as session:
+        game = session.get(Game, game_id)
+        _rules(session, game.season_id, max_observation_age_seconds=900)
+        with pytest.raises(CapturePolicyNotFrozen, match="refresh_retry_policy"):
+            CapturePolicy.from_season_rules(session, season_id=game.season_id)
+
+
+def test_a_synthetic_season_still_resolves_but_is_not_official():
+    """Synthetic seasons fabricate their own market data and have no
+    provider to overspend against, so they keep working. What they must not
+    do is look frozen."""
+
+    from app.marketdata.provenance import SYNTHETIC_SOURCE
+
+    game_id = _game("synthetic")
+    with session_scope() as session:
+        game = session.get(Game, game_id)
+        _rules(session, game.season_id, market_data_provider=SYNTHETIC_SOURCE)
         policy = CapturePolicy.from_season_rules(session, season_id=game.season_id)
 
     assert policy.max_observation_age_seconds is None
     assert policy.retry == SINGLE_ATTEMPT
+    assert policy.is_official is False
 
 
 def test_a_superseded_rules_row_is_not_used():
@@ -596,10 +736,12 @@ def test_a_superseded_rules_row_is_not_used():
         game = session.get(Game, game_id)
         old = _rules(
             session, game.season_id, max_observation_age_seconds=60,
+            refresh_retry_policy={"max_attempts": 1},
             effective_from=datetime(2026, 9, 1, tzinfo=timezone.utc),
         )
         new = _rules(
             session, game.season_id, max_observation_age_seconds=900,
+            refresh_retry_policy={"max_attempts": 3, "backoff_seconds": [30, 120]},
             effective_from=datetime(2026, 9, 10, tzinfo=timezone.utc),
         )
         old.superseded_by = new.id
@@ -630,3 +772,505 @@ def test_no_existing_season_was_given_a_tolerance_by_the_migration():
             sqlalchemy.select(SeasonRules.max_observation_age_seconds)
         ).scalars().all()
     assert all(v is None for v in rows)
+
+
+# =====================================================================
+# 4. CONCURRENCY — the lease closes the double-spend race
+# =====================================================================
+
+
+def test_two_racing_workers_produce_exactly_one_paid_refresh():
+    """The hole the read-only preflight could not close.
+
+        worker A: preflight -> ELIGIBLE
+        worker B: preflight -> ELIGIBLE
+        worker A: pays
+        worker B: pays
+
+    Both paid, for a checkpoint only one could capture. Run here with real
+    threads against real Postgres, because the claim's atomicity is a
+    property of one SQL statement, not of application logic — a test that
+    simulated the race in one process would prove nothing about it.
+    """
+
+    import threading
+
+    game_id = _game("race")
+    market_id = _market(game_id, "race")
+
+    barrier = threading.Barrier(2)
+    lock = threading.Lock()
+    paid: list[str] = []
+
+    def worker(name: str, results: dict):
+        def refresh() -> RefreshOutcome:
+            with lock:
+                paid.append(name)
+            _write_quote(market_id, sportsbook=CANONICAL, as_of_at=CAPTURE_AT, tag=name)
+            return _ok()
+
+        barrier.wait()  # both workers enter the cycle at the same instant
+        results[name] = run_checkpoint_cycle(
+            game_id=game_id,
+            checkpoint_type="FINAL",
+            policy=_policy(retry=PROPOSED_RETRY),
+            refresh=refresh,
+            now_fn=lambda: CAPTURE_AT,
+            sleep_fn=lambda _s: None,
+            owner=name,
+        )
+
+    results: dict = {}
+    threads = [threading.Thread(target=worker, args=(n, results)) for n in ("A", "B")]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert len(paid) == 1, f"both workers paid: {paid}"
+
+    winner = paid[0]
+    loser = "B" if winner == "A" else "A"
+    assert results[winner].provider_calls_spent == 1
+    assert results[loser].provider_calls_spent == 0
+
+    # Two legitimate ways to lose, depending on how the threads interleave:
+    # blocked by the live lease, or arriving after the winner had already
+    # captured. Both are correct; asserting only one would make this test
+    # flaky rather than strict. What must hold either way is that the loser
+    # spent nothing.
+    reason = results[loser].refresh_skipped_reason
+    assert "lease" in reason or "CAPTURED" in reason, reason
+
+
+def test_the_loser_does_not_capture_either():
+    """A worker that lost the lease has no fresh data and the holder is
+    mid-refresh. Capturing would freeze a snapshot built on pre-refresh
+    state AND consume the checkpoint out from under the holder — and
+    capture is irreversible."""
+
+    game_id = _game("loser")
+    market_id = _market(game_id, "loser")
+    _write_quote(market_id, sportsbook=CANONICAL, as_of_at=CAPTURE_AT - timedelta(seconds=30))
+
+    from app.marketdata.checkpoint_lease import claim_cycle
+
+    held = claim_cycle(
+        game_id=game_id, checkpoint_type="FINAL", now=CAPTURE_AT,
+        duration_seconds=600, owner="holder",
+    )
+    assert held.acquired is True
+
+    refresh = CountingRefresh()
+    report = _cycle(game_id, refresh=refresh, policy=_policy(retry=PROPOSED_RETRY))
+
+    assert refresh.calls == 0
+    assert report.lease_acquired is False
+    assert report.checkpoint_status == "NOT_RUN", "no capture while another worker owns the cycle"
+
+
+def test_an_expired_lease_is_reclaimed():
+    """A worker that dies mid-cycle must not block the checkpoint forever.
+    The lease lapses and the next worker takes it."""
+
+    from app.marketdata.checkpoint_lease import claim_cycle
+
+    game_id = _game("expired-lease")
+    _market(game_id, "expired-lease")
+
+    dead = claim_cycle(
+        game_id=game_id, checkpoint_type="FINAL",
+        now=CAPTURE_AT - timedelta(hours=1), duration_seconds=60, owner="crashed",
+    )
+    assert dead.acquired is True
+
+    refresh = CountingRefresh()
+    report = _cycle(game_id, refresh=refresh, policy=_policy(retry=PROPOSED_RETRY))
+
+    assert refresh.calls == 1, "the abandoned lease was reclaimed"
+    assert report.lease_acquired is True
+
+
+def test_an_unexpired_lease_cannot_be_stolen():
+    """The counterpart. If expiry alone reclaimed a lease, a live holder
+    would be trampled."""
+
+    from app.marketdata.checkpoint_lease import claim_cycle
+
+    game_id = _game("live-lease")
+    _market(game_id, "live-lease")
+
+    first = claim_cycle(
+        game_id=game_id, checkpoint_type="FINAL", now=CAPTURE_AT,
+        duration_seconds=600, owner="holder",
+    )
+    second = claim_cycle(
+        game_id=game_id, checkpoint_type="FINAL", now=CAPTURE_AT + timedelta(seconds=5),
+        duration_seconds=600, owner="intruder",
+    )
+    assert first.acquired is True
+    assert second.acquired is False
+    assert second.held_by == "holder"
+
+
+def test_the_lease_is_released_so_a_retry_of_the_whole_cycle_is_possible():
+    """The claim is held for the cycle, not for the checkpoint's life. A
+    cycle that refreshed and captured must not leave a lease behind."""
+
+    import sqlalchemy
+
+    from app.db.models.markets import CheckpointCycleLease
+
+    game_id = _game("release")
+    market_id = _market(game_id, "release")
+    _write_quote(market_id, sportsbook=CANONICAL, as_of_at=CAPTURE_AT)
+
+    report = _cycle(game_id, refresh=CountingRefresh(), policy=_policy(retry=PROPOSED_RETRY))
+    assert report.checkpoint_status == "CAPTURED"
+
+    with session_scope() as session:
+        remaining = session.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(CheckpointCycleLease)
+        ).scalar()
+    assert remaining == 0
+
+
+def test_a_released_lease_is_scoped_to_its_own_id():
+    """A worker that overran its lease, and whose claim has since been
+    taken over, must not delete the new holder's lease on the way out."""
+
+    from app.marketdata.checkpoint_lease import claim_cycle, release_cycle
+
+    game_id = _game("scoped-release")
+    _market(game_id, "scoped-release")
+
+    overran = claim_cycle(
+        game_id=game_id, checkpoint_type="FINAL",
+        now=CAPTURE_AT - timedelta(hours=1), duration_seconds=60, owner="overran",
+    )
+    took_over = claim_cycle(
+        game_id=game_id, checkpoint_type="FINAL", now=CAPTURE_AT,
+        duration_seconds=600, owner="took-over",
+    )
+    assert took_over.acquired is True
+
+    removed = release_cycle(
+        game_id=game_id, checkpoint_type="FINAL", lease_id=overran.lease_id
+    )
+    assert removed is False, "the overrunning worker deleted someone else's lease"
+
+
+def test_no_database_transaction_spans_the_network_call():
+    """The claim and the release are each their own short transaction. A
+    lock held across an unbounded provider wait is the one thing this whole
+    choreography exists to prevent."""
+
+    import ast
+    import inspect
+
+    from app.marketdata import checkpoint_lease
+
+    # Matched against CODE, not the file text: the module docstring
+    # legitimately explains why SELECT FOR UPDATE is unusable here, and
+    # matching prose has burned this pattern three times already.
+    tree = ast.parse(inspect.getsource(checkpoint_lease))
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.FunctionDef, ast.ClassDef)):
+            body = node.body
+            if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+                node.body = body[1:] or [ast.Pass()]
+    code = ast.unparse(tree)
+    assert "FOR UPDATE" not in code.upper()
+    assert code.count("session_scope()") == 2, "one short transaction each for claim and release"
+
+
+# =====================================================================
+# 5. STRICT VALIDATION OF FROZEN POLICY JSON
+# =====================================================================
+
+
+@pytest.mark.parametrize(
+    "record, why",
+    [
+        ({"max_attempts": "3"}, "a string would int() cleanly to 3"),
+        ({"max_attempts": True}, "bool is an int in Python"),
+        ({"max_attempts": 3.7}, "int() truncates rather than rejecting"),
+        ({"max_attempts": 3, "backoff_seconds": [30, -1]}, "negative delay"),
+        ({"max_attempts": 3, "backoff_seconds": [30, "120"]}, "string delay"),
+        ({"max_attempts": 3, "backoff_seconds": [30, float("inf")]}, "non-finite delay"),
+        ({"max_attempts": 3, "backoff_seconds": "30,120"}, "not an array"),
+        ({"max_attempts": 3, "max_attempt": 4}, "misspelled key would take its default"),
+        ({"backoff_seconds": [30]}, "no max_attempts at all"),
+        ({"max_attempts": 3, "window_guard_seconds": True}, "bool guard"),
+        ("not-an-object", "not an object"),
+    ],
+)
+def test_malformed_frozen_policy_is_rejected_not_coerced(record, why):
+    """These rules are the research contract. `int("3")`, `int(True)` and
+    `int(3.7)` all succeed in Python and would quietly turn a typo into a
+    plausible-looking policy that changes how many times we are willing to
+    pay."""
+
+    with pytest.raises(CapturePolicyError):
+        RefreshRetryPolicy.from_record(record)
+
+
+def test_the_proposed_v1_record_round_trips():
+    record = {
+        "max_attempts": 3,
+        "backoff_seconds": [30, 120],
+        "window_guard_seconds": 60,
+        "request_budget_seconds": 180,
+    }
+    policy = RefreshRetryPolicy.from_record(record)
+    assert policy.max_attempts == 3
+    assert policy.backoff_seconds == (30.0, 120.0)
+    assert policy.as_record() == {
+        "max_attempts": 3,
+        "backoff_seconds": [30.0, 120.0],
+        "window_guard_seconds": 60.0,
+        "request_budget_seconds": 180.0,
+    }
+
+
+def test_none_stays_none_so_the_caller_decides():
+    """`from_record` must not invent SINGLE_ATTEMPT: that is how "no policy
+    frozen" became "one attempt, officially"."""
+
+    assert RefreshRetryPolicy.from_record(None) is None
+
+
+def test_a_malformed_policy_fails_before_any_provider_call():
+    game_id = _game("malformed")
+    _market(game_id, "malformed")
+
+    with session_scope() as session:
+        game = session.get(Game, game_id)
+        _rules(
+            session, game.season_id,
+            max_observation_age_seconds=900,
+            refresh_retry_policy={"max_attempts": "3"},
+        )
+        with pytest.raises(CapturePolicyError):
+            CapturePolicy.from_season_rules(session, season_id=game.season_id)
+
+
+# =====================================================================
+# 6. OFFICIAL RUNNER + APPEND-ONLY RULES AMENDMENT
+# =====================================================================
+
+V1_RETRY = {
+    "max_attempts": 3,
+    "backoff_seconds": [30, 120],
+    "window_guard_seconds": 60,
+    "request_budget_seconds": 180,
+}
+
+
+def test_the_official_runner_takes_no_policy_arguments():
+    """Structural. An operator must not be able to choose the tolerance,
+    the retry budget, the canonical book or the provider for a real
+    capture -- all four change which market state reaches an irreversible
+    capture."""
+
+    import inspect
+
+    from app.marketdata import official_capture
+
+    signature = inspect.signature(official_capture.run_official_checkpoint)
+    assert set(signature.parameters) == {"game_id", "checkpoint_type", "refresh", "owner"}
+
+    source = inspect.getsource(official_capture)
+    for flag in (
+        "--max-observation-age-seconds",
+        "--max-attempts",
+        "--canonical-sportsbook",
+        "--market-data-provider",
+    ):
+        assert flag not in source, f"{flag} must not be an official-capture option"
+
+
+def test_the_official_runner_refuses_an_unfrozen_policy():
+    game_id = _game("official-unfrozen")
+    with session_scope() as session:
+        game = session.get(Game, game_id)
+        _rules(session, game.season_id)
+
+    from app.marketdata.official_capture import run_official_checkpoint
+
+    refresh = CountingRefresh()
+    with pytest.raises(CapturePolicyNotFrozen):
+        run_official_checkpoint(game_id=game_id, checkpoint_type="FINAL", refresh=refresh)
+    assert refresh.calls == 0
+
+
+def test_the_official_runner_resolves_the_frozen_policy():
+    game_id = _game("official-frozen")
+    with session_scope() as session:
+        game = session.get(Game, game_id)
+        _rules(
+            session, game.season_id,
+            max_observation_age_seconds=900,
+            refresh_retry_policy=V1_RETRY,
+        )
+
+    from app.marketdata.official_capture import resolve_policy
+
+    policy = resolve_policy(game_id=game_id)
+    assert policy.is_official is True
+    assert policy.max_observation_age_seconds == 900
+    assert policy.retry.max_attempts == 3
+
+
+def test_the_amendment_is_append_only_and_changes_only_the_policy():
+    """SeasonRules is versioned. An UPDATE would rewrite the rules a
+    checkpoint was already captured under, and every stored snapshot is
+    only interpretable against the rules in force when it was written."""
+
+    import sqlalchemy
+
+    from app.services.amend_capture_policy import apply_amendment
+
+    game_id = _game("amend")
+    with session_scope() as session:
+        game = session.get(Game, game_id)
+        season_id = game.season_id
+        original = _rules(session, season_id, rules_version="2026-w0.1")
+        original_id = original.id
+        before = {f: getattr(original, f) for f in ("kelly_fraction", "pounce_limit", "checkpoint_windows")}
+
+    with session_scope() as session:
+        clone = apply_amendment(
+            session,
+            season_id=season_id,
+            max_observation_age_seconds=900,
+            refresh_retry_policy=V1_RETRY,
+            rules_version="2026-w0.2",
+            amendment_reason="Week 0 capture freshness and refresh-retry policy freeze",
+            effective_from=datetime(2026, 9, 18, tzinfo=timezone.utc),
+        )
+        clone_id = clone.id
+
+    with session_scope() as session:
+        rows = session.execute(
+            sqlalchemy.select(SeasonRules).where(SeasonRules.season_id == season_id)
+        ).scalars().all()
+        by_id = {r.id: r for r in rows}
+
+        assert len(rows) == 2, "the amendment appended rather than updating"
+        old, new = by_id[original_id], by_id[clone_id]
+
+        # The old row stays queryable and keeps its own values.
+        assert old.max_observation_age_seconds is None
+        assert old.refresh_retry_policy is None
+        assert old.superseded_by == clone_id
+
+        # Exactly one active row.
+        active = [r for r in rows if r.superseded_by is None]
+        assert [r.id for r in active] == [clone_id]
+
+        # The new values live only on the new row.
+        assert new.max_observation_age_seconds == 900
+        assert new.refresh_retry_policy["max_attempts"] == 3
+        assert new.amendment_reason == "Week 0 capture freshness and refresh-retry policy freeze"
+
+        # Nothing else moved.
+        for field, value in before.items():
+            assert getattr(new, field) == value, f"{field} changed"
+
+
+def test_the_amendment_refuses_a_duplicate_rules_version():
+    from app.services.amend_capture_policy import AmendmentRefused, apply_amendment
+
+    game_id = _game("amend-dup")
+    with session_scope() as session:
+        game = session.get(Game, game_id)
+        season_id = game.season_id
+        _rules(session, season_id, rules_version="2026-w0.1")
+
+    with pytest.raises(AmendmentRefused, match="already the active version"):
+        with session_scope() as session:
+            apply_amendment(
+                session, season_id=season_id,
+                max_observation_age_seconds=900, refresh_retry_policy=V1_RETRY,
+                rules_version="2026-w0.1", amendment_reason="x",
+                effective_from=datetime(2026, 9, 18, tzinfo=timezone.utc),
+            )
+
+
+def test_the_amendment_refuses_a_malformed_retry_policy_before_writing():
+    import sqlalchemy
+
+    from app.services.amend_capture_policy import apply_amendment
+
+    game_id = _game("amend-bad")
+    with session_scope() as session:
+        game = session.get(Game, game_id)
+        season_id = game.season_id
+        _rules(session, season_id, rules_version="2026-w0.1")
+
+    with pytest.raises(CapturePolicyError):
+        with session_scope() as session:
+            apply_amendment(
+                session, season_id=season_id,
+                max_observation_age_seconds=900,
+                refresh_retry_policy={"max_attempts": "3"},
+                rules_version="2026-w0.2", amendment_reason="x",
+                effective_from=datetime(2026, 9, 18, tzinfo=timezone.utc),
+            )
+
+    with session_scope() as session:
+        count = session.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(SeasonRules)
+            .where(SeasonRules.season_id == season_id)
+        ).scalar()
+    assert count == 1, "a refused amendment wrote nothing"
+
+
+def test_the_amendment_cannot_touch_methodology_fields():
+    """The guard runs AFTER the clone is built, so a future edit that
+    widened it would fail here rather than silently rewrite methodology."""
+
+    from app.services import amend_capture_policy
+
+    assert "starting_bankroll_cents" in amend_capture_policy.METHODOLOGY_FIELDS
+    assert "kelly_fraction" in amend_capture_policy.METHODOLOGY_FIELDS
+    assert "checkpoint_windows" in amend_capture_policy.METHODOLOGY_FIELDS
+    assert set(amend_capture_policy.POLICY_FIELDS) == {
+        "max_observation_age_seconds",
+        "refresh_retry_policy",
+    }
+    assert not set(amend_capture_policy.POLICY_FIELDS) & set(
+        amend_capture_policy.METHODOLOGY_FIELDS
+    )
+
+
+def test_the_dry_run_writes_nothing():
+    import sqlalchemy
+
+    from app.services.amend_capture_policy import plan_amendment
+
+    game_id = _game("amend-dry")
+    with session_scope() as session:
+        game = session.get(Game, game_id)
+        season_id = game.season_id
+        _rules(session, season_id, rules_version="2026-w0.1")
+
+    with session_scope() as session:
+        diff = plan_amendment(
+            session, season_id=season_id,
+            max_observation_age_seconds=900, refresh_retry_policy=V1_RETRY,
+            rules_version="2026-w0.2", amendment_reason="freeze",
+            effective_from=datetime(2026, 9, 18, tzinfo=timezone.utc),
+        )
+        text = diff.render()
+
+    assert "before" in text and "after" in text
+    assert "2026-w0.1" in text and "2026-w0.2" in text
+
+    with session_scope() as session:
+        count = session.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(SeasonRules)
+            .where(SeasonRules.season_id == season_id)
+        ).scalar()
+    assert count == 1

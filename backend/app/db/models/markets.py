@@ -229,3 +229,40 @@ class CheckpointRun(Base):
     __table_args__ = (
         UniqueConstraint("game_id", "checkpoint_type", name="one_run_per_game_checkpoint"),
     )
+
+
+class CheckpointCycleLease(Base):
+    """Exclusive right to run the refresh+capture for one (game, checkpoint).
+
+    The read-only preflight stops a scheduler from PAYING TWICE IN SEQUENCE,
+    but it cannot stop two workers racing: both can observe ELIGIBLE before
+    either spends, and both then buy a refresh for a checkpoint only one of
+    them can capture. The lease makes the eligible-cycle claim atomic.
+
+    A lease is claimed in its own short committed transaction and released
+    in another. No transaction and no row lock is held across the provider
+    HTTP call or the retry backoff -- holding one would put an unbounded
+    network wait inside a database transaction, which is exactly what the
+    rest of this design exists to prevent.
+
+    `expires_at` rather than a plain flag: a worker that dies mid-cycle must
+    not block the checkpoint forever. The lease simply lapses and the next
+    worker reclaims it. That is why the claim is an upsert guarded on
+    expiry rather than a bare INSERT.
+    """
+
+    __tablename__ = "checkpoint_cycle_leases"
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    game_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("games.id"), nullable=False)
+    checkpoint_type: Mapped[str] = mapped_column(String, nullable=False)
+    # Free-form worker identity. Diagnostic only: the lease's authority comes
+    # from the UNIQUE constraint and the expiry, never from trusting this.
+    owner: Mapped[str] = mapped_column(String, nullable=False)
+    acquired_at: Mapped[datetime] = mapped_column(nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("game_id", "checkpoint_type", name="one_lease_per_game_checkpoint"),
+        CheckConstraint("expires_at > acquired_at", name="lease_expires_after_acquisition"),
+    )

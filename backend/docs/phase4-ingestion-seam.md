@@ -501,6 +501,97 @@ NULL on either column means no capture policy was frozen — which is what
 every pre-4A.5 season genuinely ran under. It is not a zero-second
 tolerance and not zero attempts.
 
+**`from_season_rules` fails closed on NULL for a real-provider season.**
+The first version did not, and the result was a masquerade: a real season
+row with both fields NULL carries a `rules_version`, so the policy
+reported `is_official = True` while actually meaning *no freshness gate,
+one attempt*. That made the absence of a decision indistinguishable from a
+decision to disable the gate, and it did so on the run that looked most
+authoritative. A real-provider season now raises `CapturePolicyNotFrozen`
+until both fields are set.
+
+`is_official` likewise means more than "a rules_version exists": every
+capture-policy value must have come from the frozen row, tracked by a
+`retry_frozen` flag so "the rules say one attempt" and "no retry policy
+was ever frozen" are not the same object.
+
+Synthetic seasons still resolve to an ungated policy — they fabricate
+their own market data and have no provider to overspend against — but
+report `is_official = False`, so they can never be mistaken for a frozen
+research contract.
+
+**The frozen JSON is strictly validated, never coerced.** `int("3")`,
+`int(True)` and `int(3.7)` all succeed in Python. Unknown keys are
+rejected too, since a misspelled field would silently take its default.
+These rules are the research contract; a typo in them must fail at load
+time, not quietly change how many times we are willing to pay.
+
+---
+
+### 3.8 One worker per eligible cycle
+
+The read-only preflight stops a scheduler paying twice IN SEQUENCE. It
+cannot stop two workers racing:
+
+```
+worker A: preflight -> ELIGIBLE
+worker B: preflight -> ELIGIBLE
+worker A: pays for refresh
+worker B: pays for refresh
+worker A: captures
+worker B: finds CAPTURED
+```
+
+Both paid, for a checkpoint only one could capture. `checkpoint_lease.py`
+makes the claim atomic: one `INSERT ... ON CONFLICT DO UPDATE ... WHERE`,
+so two concurrent workers cannot both win.
+
+- **The claim commits before any network work.** No transaction and no row
+  lock is held across the provider call or the retry backoff.
+  `SELECT FOR UPDATE` is unusable here for that reason.
+- **The lease spans the refresh AND the capture.** Releasing after the
+  refresh leaves a window in which a worker has finished paying but has
+  not yet captured — and a second worker claiming in that window
+  re-verifies ELIGIBLE and pays again. (Found by the race test, not by
+  reading the code.)
+- **The disposition is re-verified under the lease.** The preflight read is
+  unsynchronized and can be stale by the time the claim succeeds.
+- **A crashed worker cannot block the checkpoint.** The lease expires and
+  the next worker reclaims it, which is why the claim is an upsert guarded
+  on expiry rather than a bare INSERT. A takeover takes a fresh row id, so
+  the overrunning worker's release cannot delete the new holder's lease.
+- **A worker that loses the lease captures nothing either.** It has no
+  fresh data and the holder is mid-refresh; capturing would freeze a
+  snapshot built on pre-refresh state and consume the checkpoint out from
+  under them.
+
+---
+
+### 3.9 The window guard covers the FIRST paid attempt
+
+"ELIGIBLE at this instant" is not "there is enough window left to sensibly
+begin network work". A cycle starting seconds before `window_end` can buy
+a refresh and then cross the boundary, so the capture it paid for is
+marked MISSED.
+
+One rule, `_has_room`, used before attempt 1 and before every retry — two
+separate guards would inevitably disagree about how much room a paid
+attempt needs.
+
+The size comes from the real call sequence, not a guess:
+
+| | timeout |
+| --- | --- |
+| nflverse roster download | 60s |
+| The Odds API `list_events` | 30s |
+| The Odds API `fetch_quotes` | 30s |
+| **request budget (default)** | **180s** |
+| capture reserve (`window_guard_seconds`) | 60s |
+| **room needed before any paid attempt** | **240s** |
+
+A 60s guard alone would have covered only the odds timeout and let a cycle
+start work it could not finish.
+
 ---
 
 ## 4. Observation retention
@@ -1150,6 +1241,10 @@ later        GamePlayer            (post-probe, §12.2)
              Additive, NO VALUE SET on any row. NULL means no capture policy
              frozen, which is what every pre-4A.5 season ran under.
 
+4A.5c        new table  checkpoint_cycle_leases
+             UNIQUE(game_id, checkpoint_type) -- what ON CONFLICT targets
+             CHECK expires_at > acquired_at
+
              (`provider_market_updated_at` was required by the time model in
              §3 and by the ProviderQuote DTO in §9 from the start; its absence
              from this summary was a documentation omission, corrected during
@@ -1218,6 +1313,12 @@ reasoning is not lost.
 | Retry every failure category | **Rejected.** A bad key stays bad and an exhausted quota stays exhausted. `MALFORMED_RESPONSE` is the sharpest: the provider answered and we were billed, so a retry pays again for the same unusable payload (§3.3). |
 | "900s covers a slow refresh plus a retry or two" | **Retracted.** `as_of_at` stamps at response receipt, so a slow success and a successful retry both age ~0. The tolerance only bites when the newest usable observation pre-dates the attempt entirely (§3.4). |
 | Let an operator pass the tolerance or retry budget per official run | **Rejected.** Both change which market state reaches an irreversible capture, so both are frozen rules and a change is an amendment (§3.7). |
+| Treat a NULL capture policy as "no gate, one attempt" | **Rejected, and fixed.** It reported `is_official = True` while meaning no decision had been made — the absence of a decision masquerading as an authoritative one (§3.7). |
+| Rely on the read-only preflight alone for cost integrity | **Rejected.** It only serializes a single scheduler. Two workers both observe ELIGIBLE and both pay; the claim has to be atomic (§3.8). |
+| Release the cycle lease after the refresh | **Rejected.** It leaves a window where a worker has paid but not captured, and a second worker claiming there re-verifies ELIGIBLE and pays again. The lease spans the capture (§3.8). |
+| `SELECT FOR UPDATE` for the claim | **Rejected.** It would hold a lock across an unbounded provider wait (§3.8). |
+| Coerce frozen retry-policy JSON with `int()`/`float()` | **Rejected.** `int("3")`, `int(True)` and `int(3.7)` all succeed, turning a typo in the research contract into a plausible-looking policy (§3.7). |
+| Guard only retries against the window end | **Rejected.** Attempt 1 can be bought seconds before `window_end` and land as MISSED. One rule covers both, sized to the real call sequence (§3.9). |
 | `as_of_at` derived from vendor `last_update` | **Rejected.** Wrong granularity (market-level, not bookmaker-level) and, more importantly, the wrong meaning: a quote row records an observation, not the vendor's belief about market change (§3). |
 | Timestamp-based retry idempotency | **Replaced** by `provider_call_id` + fingerprint (§5). Provenance beats inference. |
 | Hash-only raw retention for successful runs | **Rejected.** A hash cannot reconstruct a bad normalization (§11.1). |
