@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 
 import pytest
 from sqlalchemy import func, select
@@ -1601,8 +1602,476 @@ def test_a_snapshot_referenced_by_evidence_does_block_the_repair():
     assert plan.census.standalone_snapshots == 0
     assert plan.census.snapshots_in_evidence == 1
     assert plan.safe is False
-    assert any("EvidenceSnapshot" in b for b in plan.blockers)
-    assert any("referenced by" in b for b in plan.blockers)
+    assert any("evidence snapshots" in b for b in plan.blockers)
+    assert any("referenced (DISTINCT union)" in b for b in plan.blockers)
+
+
+def _evidence(session, market_id, snapshot_id):
+    from app.db.models.forecast_lab import EvidenceSnapshot
+
+    row = EvidenceSnapshot(
+        market_id=market_id, generated_at=NOW, payload={},
+        market_snapshot_id=snapshot_id,
+    )
+    session.add(row)
+    session.flush()
+    return row
+
+
+def _forecast(session, market_id, evidence_id, season_competitor_id):
+    from app.db.models.forecast_lab import ForecastObservation
+
+    row = ForecastObservation(
+        season_competitor_id=season_competitor_id, market_id=market_id,
+        source_type="BENCHMARK", timestamp=NOW,
+        model_probability_over=Decimal("0.60000"), confidence=Decimal("7.00"),
+        uncertainty="LOW", evidence_snapshot_id=evidence_id,
+        research_eligible=True,
+    )
+    session.add(row)
+    session.flush()
+    return row
+
+
+def _week(game_id, number):
+    """A real Week row in the game's own season, so a committed artifact can
+    name a week that contradicts the correction."""
+
+    from app.db.models.season import Week
+
+    with session_scope() as session:
+        season_id = session.get(Game, game_id).season_id
+        existing = session.execute(
+            select(Week).where(Week.season_id == season_id, Week.week_number == number)
+        ).scalar_one_or_none()
+        if existing is not None:
+            return existing.id
+        week = Week(season_id=season_id, week_number=number, is_real_money=False)
+        session.add(week)
+        session.flush()
+        return week.id
+
+
+def _competitor(game_id, tag):
+    from app.db.models.season import Competitor, SeasonCompetitor
+
+    with session_scope() as session:
+        season_id = session.get(Game, game_id).season_id
+        cid = f"openai-{tag}"
+        session.add(Competitor(id=cid, provider="openai", display_name="GPT"))
+        session.flush()
+        sc = SeasonCompetitor(
+            season_id=season_id, competitor_id=cid,
+            model_identifier="gpt-test", model_version="v1",
+        )
+        session.add(sc)
+        session.flush()
+        return sc.id
+
+
+# --- every competitive artifact that can contradict the correction ----
+#
+# The census used to cover five models and call itself complete. Each test
+# below attaches exactly ONE durable artifact to an otherwise-repairable
+# game and proves the repair refuses. Without the traversal the census
+# reports zero and the repair proceeds, leaving
+# `Game.week_number = 2` while the artifact still says Week 3.
+
+
+def test_a_benchmark_slot_blocks_the_repair():
+    from app.db.models.forecast_lab import BenchmarkSlatePlan, BenchmarkSlot
+    from app.services.repair_game_week import plan_repair
+
+    game_id = _mis_scoped_game("slot")
+    week_id = _week(game_id, 3)
+    with session_scope() as session:
+        plan_row = BenchmarkSlatePlan(
+            week_id=week_id, target_slot_count=5,
+            allocation_method="EVEN", committed_at=NOW,
+        )
+        session.add(plan_row)
+        session.flush()
+        session.add(BenchmarkSlot(
+            plan_id=plan_row.id, slot_index=0, game_id=game_id,
+            target_stat_type="receiving_yards",
+        ))
+
+    verdict = _verdict(game_id)
+    with session_scope() as session:
+        plan = plan_repair(session, verdict=verdict, expected_current_week=3)
+
+    assert plan.census.benchmark_slots == 1
+    assert plan.census.committed_weeks["benchmark_slots"] == [3]
+    assert plan.safe is False
+    assert any("benchmark slots" in b for b in plan.blockers)
+
+
+def test_a_ticket_blocks_the_repair_and_names_its_week():
+    """The exact contradiction: correcting the game to week 2 while a
+    Ticket on one of its markets still points at Week 3."""
+
+    from app.db.models.competition import Ticket
+    from app.services.repair_game_week import plan_repair
+
+    game_id = _mis_scoped_game("ticket")
+    week_id = _week(game_id, 3)
+    sc_id = _competitor(game_id, "ticket")
+    with session_scope() as session:
+        market = _market(session, game_id)
+        session.add(Ticket(
+            season_competitor_id=sc_id, week_id=week_id, market_id=market.id,
+            urgency="STANDARD", side="OVER", risk_posture="STANDARD",
+            kelly_reference_stake_cents=100, model_requested_stake_cents=50,
+            final_allowed_stake_cents=50, observed_line=Decimal("55.5"),
+            why_now="test",
+        ))
+
+    verdict = _verdict(game_id)
+    with session_scope() as session:
+        plan = plan_repair(session, verdict=verdict, expected_current_week=3)
+
+    assert plan.census.tickets == 1
+    assert plan.census.committed_weeks["tickets"] == [3], "the census hid the contradiction"
+    assert plan.safe is False
+    assert any("tickets" in b and "week(s) [3]" in b for b in plan.blockers)
+
+
+def test_a_wager_and_its_money_block_the_repair():
+    from app.db.models.competition import Ticket, Wager
+    from app.db.models.settlement import BankrollTransaction
+    from app.services.repair_game_week import plan_repair
+
+    game_id = _mis_scoped_game("wager")
+    week_id = _week(game_id, 3)
+    sc_id = _competitor(game_id, "wager")
+    with session_scope() as session:
+        market = _market(session, game_id)
+        ticket = Ticket(
+            season_competitor_id=sc_id, week_id=week_id, market_id=market.id,
+            urgency="STANDARD", side="OVER", risk_posture="STANDARD",
+            kelly_reference_stake_cents=100, model_requested_stake_cents=50,
+            final_allowed_stake_cents=50, observed_line=Decimal("55.5"),
+            why_now="test",
+        )
+        session.add(ticket)
+        session.flush()
+        wager = Wager(
+            ticket_id=ticket.id, season_competitor_id=sc_id, week_id=week_id,
+            market_id=market.id, requested_stake_cents=50, execution_status="PLACED",
+        )
+        session.add(wager)
+        session.flush()
+        session.add(BankrollTransaction(
+            season_competitor_id=sc_id, week_id=week_id, wager_id=wager.id,
+            type="STAKE", amount_cents=-50,
+        ))
+
+    verdict = _verdict(game_id)
+    with session_scope() as session:
+        plan = plan_repair(session, verdict=verdict, expected_current_week=3)
+
+    assert plan.census.wagers == 1
+    assert plan.census.bankroll_transactions == 1, "real money moved and the census missed it"
+    assert plan.census.committed_weeks["wagers"] == [3]
+    assert plan.safe is False
+
+
+def test_a_pass_decision_on_this_market_blocks_the_repair():
+    from app.db.models.competition import PassDecision
+    from app.services.repair_game_week import plan_repair
+
+    game_id = _mis_scoped_game("pass")
+    week_id = _week(game_id, 3)
+    sc_id = _competitor(game_id, "pass")
+    with session_scope() as session:
+        market = _market(session, game_id)
+        session.add(PassDecision(
+            season_competitor_id=sc_id, week_id=week_id,
+            best_available_candidate_market_id=market.id,
+            reason_for_pass="no edge",
+        ))
+
+    verdict = _verdict(game_id)
+    with session_scope() as session:
+        plan = plan_repair(session, verdict=verdict, expected_current_week=3)
+
+    assert plan.census.pass_decisions == 1
+    assert plan.census.committed_weeks["pass_decisions"] == [3]
+    assert plan.safe is False
+
+
+def test_a_research_settlement_blocks_the_repair():
+    from app.db.models.settlement import ResearchSettlement
+    from app.services.repair_game_week import plan_repair
+
+    game_id = _mis_scoped_game("settled")
+    with session_scope() as session:
+        market = _market(session, game_id)
+        session.add(ResearchSettlement(
+            market_id=market.id, research_stat_value_at_lock=Decimal("61.00"),
+            research_locked_at=NOW,
+        ))
+
+    verdict = _verdict(game_id)
+    with session_scope() as session:
+        plan = plan_repair(session, verdict=verdict, expected_current_week=3)
+
+    assert plan.census.research_settlements == 1
+    assert plan.safe is False
+
+
+def test_a_stake_recommendation_blocks_the_repair():
+    from app.db.models.competition import StakeRecommendation
+    from app.services.repair_game_week import plan_repair
+
+    game_id = _mis_scoped_game("stake")
+    sc_id = _competitor(game_id, "stake")
+    with session_scope() as session:
+        market = _market(session, game_id)
+        snapshot = _snapshot(session, market.id)
+        evidence = _evidence(session, market.id, snapshot.id)
+        observation = _forecast(session, market.id, evidence.id, sc_id)
+        session.add(StakeRecommendation(
+            season_competitor_id=sc_id, market_id=market.id,
+            forecast_observation_id=observation.id,
+            bankroll_at_decision_cents=1500,
+            model_probability_over=Decimal("0.60000"),
+            kelly_fraction_used=Decimal("0.2000"),
+            kelly_reference_stake_cents=100,
+            model_requested_stake_cents=50,
+            risk_posture="STANDARD", final_allowed_stake_cents=50,
+        ))
+
+    verdict = _verdict(game_id)
+    with session_scope() as session:
+        plan = plan_repair(session, verdict=verdict, expected_current_week=3)
+
+    assert plan.census.stake_recommendations == 1
+    assert plan.safe is False
+
+
+# --- batched agent sessions -------------------------------------------
+
+
+def test_a_batched_agent_session_is_detected_through_the_join_table():
+    """`create_pending` populates ONLY `agent_session_evidence_snapshots`
+    and leaves both singular columns NULL, so counting those two columns
+    reported zero agent sessions for every batched call. This test attaches
+    a session exactly the way the real batch path does."""
+
+    from app.db.models.forecast_lab import AgentSession, AgentSessionEvidenceSnapshot
+    from app.services.repair_game_week import plan_repair
+
+    game_id = _mis_scoped_game("batched")
+    sc_id = _competitor(game_id, "batched")
+    with session_scope() as session:
+        market = _market(session, game_id)
+        snapshot = _snapshot(session, market.id)
+        evidence = _evidence(session, market.id, snapshot.id)
+        agent = AgentSession(
+            season_competitor_id=sc_id, provider="openai",
+            model_identifier="gpt-test", call_type="BENCHMARK_FORECAST",
+            prompt_version="v1", schema_version="v1", status="PENDING",
+            orchestration_key=f"k-{uuid.uuid4()}",
+            bankroll_at_decision_cents=1500, timestamp=NOW,
+        )
+        session.add(agent)
+        session.flush()
+        assert agent.evidence_snapshot_id is None
+        assert agent.market_snapshot_id is None
+        session.add(AgentSessionEvidenceSnapshot(
+            agent_session_id=agent.id, evidence_snapshot_id=evidence.id,
+            market_id=market.id,
+        ))
+
+    verdict = _verdict(game_id)
+    with session_scope() as session:
+        plan = plan_repair(session, verdict=verdict, expected_current_week=3)
+
+    assert plan.census.agent_sessions == 1, "a batched model call was invisible to the census"
+    assert plan.census.batched_agent_sessions == 1
+    assert plan.safe is False
+    assert any("agent sessions" in b for b in plan.blockers)
+
+
+def test_one_session_reachable_two_ways_is_counted_once():
+    from app.db.models.forecast_lab import AgentSession, AgentSessionEvidenceSnapshot
+    from app.services.repair_game_week import plan_repair
+
+    game_id = _mis_scoped_game("double-route")
+    sc_id = _competitor(game_id, "double-route")
+    with session_scope() as session:
+        market = _market(session, game_id)
+        snapshot = _snapshot(session, market.id)
+        evidence = _evidence(session, market.id, snapshot.id)
+        agent = AgentSession(
+            season_competitor_id=sc_id, provider="openai",
+            model_identifier="gpt-test", call_type="BENCHMARK_FORECAST",
+            prompt_version="v1", schema_version="v1", status="PENDING",
+            orchestration_key=f"k-{uuid.uuid4()}",
+            bankroll_at_decision_cents=1500, timestamp=NOW,
+            evidence_snapshot_id=evidence.id, market_snapshot_id=snapshot.id,
+        )
+        session.add(agent)
+        session.flush()
+        session.add(AgentSessionEvidenceSnapshot(
+            agent_session_id=agent.id, evidence_snapshot_id=evidence.id,
+            market_id=market.id,
+        ))
+
+    verdict = _verdict(game_id)
+    with session_scope() as session:
+        plan = plan_repair(session, verdict=verdict, expected_current_week=3)
+
+    assert plan.census.agent_sessions == 1, "the same session counted more than once"
+
+
+# --- the snapshot union -----------------------------------------------
+
+
+def test_disjoint_reference_sets_are_unioned_not_maxed():
+    """max(2, 3) = 3, but five distinct snapshots are referenced. The old
+    property understated referenced_snapshots and therefore OVERSTATED
+    standalone_snapshots -- the number the safe/unsafe call reads."""
+
+    from app.db.models.forecast_lab import AgentSession
+    from app.services.repair_game_week import plan_repair
+
+    game_id = _mis_scoped_game("union")
+    sc_id = _competitor(game_id, "union")
+    with session_scope() as session:
+        market = _market(session, game_id)
+        # Two snapshots referenced only by evidence.
+        for _ in range(2):
+            snap = _snapshot(session, market.id)
+            _evidence(session, market.id, snap.id)
+        # Three DIFFERENT snapshots referenced only by agent sessions.
+        for _ in range(3):
+            snap = _snapshot(session, market.id)
+            session.add(AgentSession(
+                season_competitor_id=sc_id, provider="openai",
+                model_identifier="gpt-test", call_type="BENCHMARK_FORECAST",
+                prompt_version="v1", schema_version="v1", status="PENDING",
+                orchestration_key=f"k-{uuid.uuid4()}",
+                bankroll_at_decision_cents=1500, timestamp=NOW,
+                market_snapshot_id=snap.id,
+            ))
+        # One referenced by nothing.
+        _snapshot(session, market.id)
+
+    verdict = _verdict(game_id)
+    with session_scope() as session:
+        plan = plan_repair(session, verdict=verdict, expected_current_week=3)
+
+    c = plan.census
+    assert c.market_snapshots == 6
+    assert (c.snapshots_in_evidence, c.snapshots_in_agent_sessions) == (2, 3)
+    assert c.referenced_snapshots == 5, "max(2,3)=3 is a LOWER bound on the union"
+    assert c.standalone_snapshots == 1
+
+
+# --- completeness -----------------------------------------------------
+
+
+def test_every_table_that_can_reach_a_game_is_classified():
+    """The census's own completeness check, computed from the live
+    metadata rather than a hand-kept list. A model added later that can
+    reach a game turns this red until someone classifies it -- which is
+    the only durable defence against the gap that made this pass
+    necessary. It already caught ingestion_runs and provider_calls."""
+
+    import app.db.models  # noqa: F401  -- register every mapper
+    from app.services.repair_game_week import (
+        CENSUS_CLASSIFICATION,
+        tables_reaching_a_game,
+    )
+
+    reachable = tables_reaching_a_game()
+    assert len(reachable) > 20, "the FK closure collapsed; it is not proving anything"
+    unclassified = reachable - set(CENSUS_CLASSIFICATION)
+    assert not unclassified, (
+        f"these tables can reach a game but the census does not classify them: "
+        f"{sorted(unclassified)}"
+    )
+    stale = set(CENSUS_CLASSIFICATION) - reachable
+    assert not stale, f"classified but unreachable: {sorted(stale)}"
+
+
+def test_every_blocking_table_is_actually_queried():
+    """A classification that nothing queries is a comment, not a guard."""
+
+    import ast
+    import inspect
+
+    from app.services import repair_game_week
+    from app.services.repair_game_week import CENSUS_CLASSIFICATION, Reach
+
+    source = inspect.getsource(repair_game_week.take_census)
+    names = {
+        n.id for n in ast.walk(ast.parse(source.lstrip())) if isinstance(n, ast.Name)
+    } | {
+        n.attr for n in ast.walk(ast.parse(source.lstrip())) if isinstance(n, ast.Attribute)
+    }
+    # table name -> the model class the census must reference
+    models = {
+        "evidence_snapshots": "EvidenceSnapshot",
+        "forecast_observations": "ForecastObservation",
+        "agent_sessions": "AgentSession",
+        "agent_session_evidence_snapshots": "AgentSessionEvidenceSnapshot",
+        "research_settlements": "ResearchSettlement",
+        "benchmark_slots": "BenchmarkSlot",
+        "stake_recommendations": "StakeRecommendation",
+        "tickets": "Ticket",
+        "wagers": "Wager",
+        "pass_decisions": "PassDecision",
+        "settlements": "Settlement",
+        "bankroll_transactions": "BankrollTransaction",
+    }
+    blocking = {t for t, r in CENSUS_CLASSIFICATION.items() if r is Reach.BLOCKING}
+    assert blocking == set(models), (
+        "the blocking set changed; update this test's model map deliberately"
+    )
+    for table, model in models.items():
+        assert model in names, f"{table} is classified BLOCKING but take_census never queries it"
+
+
+def test_a_repairable_game_has_only_observation():
+    """The expected DET shape: raw quotes plus standalone acceptance
+    snapshots, and nothing committed."""
+
+    from app.services.repair_game_week import plan_repair
+
+    game_id = _mis_scoped_game("clean")
+    with session_scope() as session:
+        market = _market(session, game_id)
+        _snapshot(session, market.id)
+        _snapshot(session, market.id)
+
+    verdict = _verdict(game_id)
+    with session_scope() as session:
+        plan = plan_repair(session, verdict=verdict, expected_current_week=3)
+
+    assert plan.safe is True, plan.blockers
+    assert plan.census.standalone_snapshots == 2
+    assert plan.census.referenced_snapshots == 0
+    assert [r.label for r in plan.census.rows() if r.blocking] == []
+
+
+def test_the_render_shows_every_blocking_table_even_at_zero():
+    """"We looked and found none" and "we never looked" must not render
+    identically. Every counted artifact appears whatever its count."""
+
+    from app.services.repair_game_week import plan_repair
+
+    game_id = _mis_scoped_game("render")
+    verdict = _verdict(game_id)
+    with session_scope() as session:
+        text = plan_repair(session, verdict=verdict, expected_current_week=3).render()
+
+    for label in ("tickets", "wagers", "pass decisions", "benchmark slots",
+                  "research settlements", "stake recommendations", "settlements",
+                  "bankroll transactions", "agent sessions (any route)"):
+        assert label in text, f"the census report never mentions {label}"
 
 
 def test_the_census_reports_checkpoints_by_status():

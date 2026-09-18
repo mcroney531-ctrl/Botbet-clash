@@ -1676,23 +1676,71 @@ correction: the loser sees the corrected row and refuses.
 Blocking on any `MarketSnapshot` at all was too blunt. A snapshot is a
 derived read of quotes that hang off `game_id`, and `game_id` does not
 change. What makes an artifact unsafe to relabel is something having
-*committed* to it. The census now reports separately:
-
-    prop markets / prop quotes
-    market snapshots: total / referenced by evidence / referenced by
-                      agent sessions / standalone
-    evidence snapshots, forecast observations, agent sessions
-    checkpoint runs, grouped by status
-
-and blocks only on a CAPTURED checkpoint, an EvidenceSnapshot, a
-ForecastObservation, an AgentSession, or a referenced snapshot. A
+*committed* to it — so the census classifies rather than counts, and a
 standalone snapshot and a PENDING checkpoint do not block.
+
+### The census called itself complete and covered five models
+
+It scanned checkpoints, snapshots, evidence, forecasts and `AgentSession`'s
+two singular FK columns. That is not the set of things that can commit
+this game to a week. `BenchmarkSlot` carries a `game_id` and a plan tied
+to a `week_id`; `Ticket`, `Wager` and `PassDecision` carry both a
+`market_id` and a `week_id`; `StakeRecommendation` and
+`ResearchSettlement` carry the market; `Settlement` and
+`BankrollTransaction` sit one hop past a wager and represent real money.
+Correcting `Game.week_number` under any of them produces exactly the
+contradiction the repair exists to eliminate:
+
+    Game.week_number = 2   while   Ticket.week_id -> Week 3
+
+All twelve are traversed now, and the report prints the week numbers the
+committed artifacts actually name, so a contradiction is visible rather
+than inferable.
+
+**Batched model calls were invisible.** `agent_session_evidence_snapshots`
+is the source of truth for multi-market inputs — `create_pending` says so
+in as many words, and it never populates either singular column. Counting
+only `evidence_snapshot_id` / `market_snapshot_id` therefore reported
+`agent_sessions = 0` for *every* batched call that consumed this game.
+The census now takes a DISTINCT union across all three routes.
+
+**`max(a, b)` was a lower bound, not an upper one.** Two disjoint
+reference sets of 2 and 3 reference five snapshots, not three — so
+`referenced_snapshots` was understated and `standalone_snapshots`, the
+number the safe/unsafe call reads, was *overstated*. Replaced with a real
+`DISTINCT` union over evidence, agent sessions and tickets.
+
+### The census now audits itself
+
+`tables_reaching_a_game()` computes the transitive FK closure from live
+metadata, and a test asserts every table in it appears in
+`CENSUS_CLASSIFICATION` as BLOCKING, OBSERVATIONAL or AUDIT. A model added
+later that can reach a game turns that test red until someone classifies
+it deliberately. It immediately caught two tables the hand-written list
+missed — `ingestion_runs` reaches games through
+`IngestionRun.checkpoint_run_id`, and `provider_calls` through it. A second
+test asserts every BLOCKING table is actually queried by `take_census`, so
+a classification cannot decay into a comment.
+
+Every counted artifact is printed whatever its count: *we looked and found
+none* and *we never looked* must not render identically.
+
+### A correction to the apply ordering comment
+
+The audit row is inserted before the `Game` update, and the comment
+claimed that ordering meant the audit row would survive a failed update.
+It would not — both statements are in one transaction, so the INSERT rolls
+back with the UPDATE. The order is kept for a smaller, real reason: the FK
+and CHECK on `game_scope_corrections` are evaluated at that flush, so a
+correction that cannot name its schedule call fails *before* `Game` is
+touched.
 
 ### Acceptance
 
-442 passed, 4 skipped. Mutation-tested ten ways — turning the guard into
-an override, letting an unresolved verdict yield a week, accepting an
-unresolved schedule, dropping the provenance link, removing the row lock,
-removing the under-lock recheck, blanket-blocking snapshots, widening the
-kickoff tolerance, resolving through a second matcher, and removing the
-database CHECK — each turned the intended tests red.
+455 passed, 4 skipped. Mutation-tested twenty-two ways across both passes.
+The census half: deleting each of the benchmark-slot, ticket, wager,
+bankroll, pass-decision, research-settlement and stake-recommendation
+traversals; ignoring `BenchmarkSlot.resolved_market_id`; deleting the
+batch join-table route; reverting the union to `max()`; decoupling
+`blockers_for` from the census rows; and dropping a table from the
+registry — each turned the intended tests red.

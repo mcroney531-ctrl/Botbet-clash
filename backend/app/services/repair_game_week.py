@@ -40,12 +40,26 @@ import argparse
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import StrEnum
 from typing import Sequence
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.db.models.forecast_lab import AgentSession, EvidenceSnapshot, ForecastObservation
+from app.db.models.competition import (
+    PassDecision,
+    StakeRecommendation,
+    Ticket,
+    Wager,
+)
+from app.db.models.forecast_lab import (
+    AgentSession,
+    AgentSessionEvidenceSnapshot,
+    BenchmarkSlatePlan,
+    BenchmarkSlot,
+    EvidenceSnapshot,
+    ForecastObservation,
+)
 from app.db.models.markets import (
     CheckpointRun,
     Game,
@@ -53,6 +67,13 @@ from app.db.models.markets import (
     MarketSnapshot,
     PropMarket,
     PropQuote,
+)
+from app.db.models.roster import GamePlayer
+from app.db.models.season import Week
+from app.db.models.settlement import (
+    BankrollTransaction,
+    ResearchSettlement,
+    Settlement,
 )
 from app.db.session import session_scope
 from app.marketdata.game_registration import _schedule_provider_for, _season_pins
@@ -198,35 +219,158 @@ def derive_authoritative_week(
 # --------------------------------------------------------------------------
 # 2. What already depends on the week label
 # --------------------------------------------------------------------------
+#
+# The first version counted five models and called the result "the whole
+# dependency census". It was not. Every competitive artifact below can
+# reach this game and carry its own week interpretation, and correcting
+# `Game.week_number` underneath one of them produces exactly the
+# cross-week contradiction this repair exists to eliminate:
+#
+#     Game.week_number = 2   while   Ticket.week_id -> Week 3
+#
+# Two specific holes are worth naming, because both were silent:
+#
+#   * `agent_session_evidence_snapshots` is the source of truth for
+#     multi-market and batched model inputs -- `create_pending` says so in
+#     as many words, and it never populates `AgentSession`'s singular
+#     `evidence_snapshot_id` / `market_snapshot_id` at all. Counting only
+#     those two columns therefore reported `agent_sessions = 0` for EVERY
+#     batched call that consumed this game.
+#
+#   * `max(count_a, count_b)` was labelled an upper bound on the union of
+#     two snapshot-reference sets. It is a LOWER bound: two disjoint sets
+#     of 2 and 3 reference five snapshots, not three. That understated
+#     `referenced_snapshots` and therefore OVERSTATED
+#     `standalone_snapshots` -- the number the safe/unsafe call reads.
+
+
+class Reach(StrEnum):
+    """How a table relates to a game's week label."""
+
+    BLOCKING = "BLOCKING"
+    """Durable competition or research state whose interpretation changes."""
+
+    OBSERVATIONAL = "OBSERVATIONAL"
+    """Hangs off game_id or market_id, which do not change. Raw or derived
+    observation that commits nothing."""
+
+    AUDIT = "AUDIT"
+    """Our own provenance and lease rows. Describe the repair; never gate it."""
+
+
+# EVERY table that can reach `games` by foreign key, classified. This is a
+# declaration, not documentation: `test_every_table_that_can_reach_a_game_is_classified`
+# recomputes the FK closure from the live metadata and fails if a table is
+# missing, so a model added later cannot quietly re-open the hole that made
+# this pass necessary. Adding a row here is a deliberate act.
+CENSUS_CLASSIFICATION: dict[str, Reach] = {
+    # -- raw and derived observation ----------------------------------
+    "prop_markets": Reach.OBSERVATIONAL,
+    "prop_quotes": Reach.OBSERVATIONAL,
+    "market_snapshots": Reach.OBSERVATIONAL,  # unless referenced; see below
+    "game_players": Reach.OBSERVATIONAL,
+    "game_player_observations": Reach.OBSERVATIONAL,
+    "checkpoint_runs": Reach.OBSERVATIONAL,  # unless CAPTURED; see below
+    # -- our own provenance -------------------------------------------
+    "game_scope_observations": Reach.AUDIT,
+    "game_scope_corrections": Reach.AUDIT,
+    "checkpoint_cycle_leases": Reach.AUDIT,
+    # Reached because `IngestionRun.checkpoint_run_id` points at a
+    # checkpoint. Provider-call telemetry describes what we FETCHED, never
+    # what we concluded, so it carries no week interpretation to
+    # contradict. Found by the closure check, not by hand -- which is the
+    # point of computing it.
+    "ingestion_runs": Reach.AUDIT,
+    "provider_calls": Reach.AUDIT,
+    # -- committed research state -------------------------------------
+    "evidence_snapshots": Reach.BLOCKING,
+    "forecast_observations": Reach.BLOCKING,
+    "agent_sessions": Reach.BLOCKING,
+    "agent_session_evidence_snapshots": Reach.BLOCKING,
+    "research_settlements": Reach.BLOCKING,
+    "benchmark_slots": Reach.BLOCKING,
+    # -- committed competition state ----------------------------------
+    "stake_recommendations": Reach.BLOCKING,
+    "tickets": Reach.BLOCKING,
+    "wagers": Reach.BLOCKING,
+    "pass_decisions": Reach.BLOCKING,
+    "settlements": Reach.BLOCKING,
+    "bankroll_transactions": Reach.BLOCKING,
+}
+
+
+def tables_reaching_a_game(metadata=None) -> set[str]:
+    """Transitive FK closure: every table that can reach `games`.
+
+    Computed from the live metadata rather than listed by hand, so the
+    completeness check cannot drift from the schema. Direction is
+    child-ward -- a table is in the closure if it REFERENCES something
+    already in it -- which is what "this row is about that game" means.
+    """
+
+    from app.db.base import Base
+
+    md = metadata if metadata is not None else Base.metadata
+    reached = {"games"}
+    changed = True
+    while changed:
+        changed = False
+        for table in md.tables.values():
+            if table.name in reached:
+                continue
+            targets = {fk.column.table.name for fk in table.foreign_keys}
+            if targets & reached:
+                reached.add(table.name)
+                changed = True
+    return reached - {"games"}
+
+
+@dataclass(frozen=True)
+class ArtifactCount:
+    """One classified row in the census."""
+
+    label: str
+    count: int
+    blocking: bool
+    detail: str = ""
+
+    def render(self) -> str:
+        line = f"    {self.label:<34}{self.count:>6}"
+        if self.detail:
+            line += f"   {self.detail}"
+        return line
 
 
 @dataclass
 class DependencyCensus:
-    """Counted, then CLASSIFIED. The first version blocked on any
-    `MarketSnapshot` at all, which is too blunt: a snapshot is a derived
-    read of quotes that hang off `game_id`, and `game_id` does not change.
-    What makes an artifact unsafe to relabel is something having COMMITTED
-    to it — an EvidenceSnapshot built from it, a forecast citing it, a
-    model call that consumed it, a CAPTURED checkpoint declaring it
-    official. A standalone snapshot nothing references is none of those.
-    """
+    """Counted, then CLASSIFIED. Blocking is not "an artifact exists"; it
+    is "something COMMITTED to this game under its current week label".
+    A standalone snapshot nothing references, a PENDING checkpoint, a
+    roster observation and a quote are all observation -- they hang off
+    `game_id` / `market_id`, neither of which the repair touches."""
 
     prop_markets: int = 0
     prop_quotes: int = 0
+    game_players: int = 0
     market_snapshots: int = 0
     snapshots_in_evidence: int = 0
     snapshots_in_agent_sessions: int = 0
+    snapshots_in_tickets: int = 0
+    referenced_snapshots: int = 0
     evidence_snapshots: int = 0
     forecast_observations: int = 0
     agent_sessions: int = 0
+    batched_agent_sessions: int = 0
+    benchmark_slots: int = 0
+    stake_recommendations: int = 0
+    tickets: int = 0
+    wagers: int = 0
+    pass_decisions: int = 0
+    research_settlements: int = 0
+    settlements: int = 0
+    bankroll_transactions: int = 0
     checkpoints: dict[str, list[str]] = field(default_factory=dict)
-
-    @property
-    def referenced_snapshots(self) -> int:
-        """Upper bound: the two reference sets may overlap, and for a
-        blocking decision an over-count is the safe direction."""
-
-        return max(self.snapshots_in_evidence, self.snapshots_in_agent_sessions)
+    committed_weeks: dict[str, list[int]] = field(default_factory=dict)
 
     @property
     def standalone_snapshots(self) -> int:
@@ -236,94 +380,218 @@ class DependencyCensus:
     def captured_checkpoints(self) -> list[str]:
         return sorted(self.checkpoints.get("CAPTURED", []))
 
+    def _weeks(self, label: str) -> str:
+        weeks = self.committed_weeks.get(label)
+        return f"naming week(s) {weeks}" if weeks else ""
+
+    def rows(self) -> list[ArtifactCount]:
+        """Every counted artifact, blocking flag included. Reported in
+        full even at zero: "we looked and found none" and "we never
+        looked" must not render identically."""
+
+        captured = self.captured_checkpoints
+        return [
+            ArtifactCount("prop markets", self.prop_markets, False),
+            ArtifactCount("prop quotes", self.prop_quotes, False),
+            ArtifactCount("game players", self.game_players, False),
+            ArtifactCount("market snapshots (total)", self.market_snapshots, False),
+            ArtifactCount("  referenced by evidence", self.snapshots_in_evidence, False),
+            ArtifactCount("  referenced by agent sessions", self.snapshots_in_agent_sessions, False),
+            ArtifactCount("  referenced by tickets", self.snapshots_in_tickets, False),
+            ArtifactCount("  referenced (DISTINCT union)", self.referenced_snapshots,
+                          self.referenced_snapshots > 0),
+            ArtifactCount("  standalone", self.standalone_snapshots, False),
+            ArtifactCount("CAPTURED checkpoint runs", len(captured), bool(captured),
+                          ", ".join(captured)),
+            ArtifactCount("evidence snapshots", self.evidence_snapshots,
+                          self.evidence_snapshots > 0),
+            ArtifactCount("forecast observations", self.forecast_observations,
+                          self.forecast_observations > 0),
+            ArtifactCount("agent sessions (any route)", self.agent_sessions,
+                          self.agent_sessions > 0,
+                          f"{self.batched_agent_sessions} via the batch join table"),
+            ArtifactCount("benchmark slots", self.benchmark_slots,
+                          self.benchmark_slots > 0, self._weeks("benchmark_slots")),
+            ArtifactCount("stake recommendations", self.stake_recommendations,
+                          self.stake_recommendations > 0),
+            ArtifactCount("tickets", self.tickets, self.tickets > 0, self._weeks("tickets")),
+            ArtifactCount("wagers", self.wagers, self.wagers > 0, self._weeks("wagers")),
+            ArtifactCount("pass decisions", self.pass_decisions,
+                          self.pass_decisions > 0, self._weeks("pass_decisions")),
+            ArtifactCount("research settlements", self.research_settlements,
+                          self.research_settlements > 0),
+            ArtifactCount("settlements", self.settlements, self.settlements > 0),
+            ArtifactCount("bankroll transactions", self.bankroll_transactions,
+                          self.bankroll_transactions > 0),
+        ]
+
 
 def take_census(session: Session, game_id: uuid.UUID) -> DependencyCensus:
-    """Read-only. Every count is scoped through `PropMarket.game_id`."""
+    """Read-only. Every count is scoped through `PropMarket.game_id` or
+    `game_id` directly, and every BLOCKING table in
+    `CENSUS_CLASSIFICATION` is queried."""
 
-    census = DependencyCensus()
+    c = DependencyCensus()
     markets = select(PropMarket.id).where(PropMarket.game_id == game_id).scalar_subquery()
+    snapshots = (
+        select(MarketSnapshot.id).where(MarketSnapshot.market_id.in_(markets)).scalar_subquery()
+    )
+    evidence = (
+        select(EvidenceSnapshot.id).where(EvidenceSnapshot.market_id.in_(markets)).scalar_subquery()
+    )
 
-    def count(model, column) -> int:
+    def count(model, *where) -> int:
         return session.execute(
-            select(func.count()).select_from(model).where(column.in_(markets))
+            select(func.count()).select_from(model).where(*where)
         ).scalar() or 0
 
-    census.prop_markets = session.execute(
-        select(func.count()).select_from(PropMarket).where(PropMarket.game_id == game_id)
-    ).scalar() or 0
-    census.prop_quotes = count(PropQuote, PropQuote.market_id)
-    census.market_snapshots = count(MarketSnapshot, MarketSnapshot.market_id)
-    census.evidence_snapshots = count(EvidenceSnapshot, EvidenceSnapshot.market_id)
-    census.forecast_observations = count(ForecastObservation, ForecastObservation.market_id)
+    def weeks_named(model, *where) -> list[int]:
+        """Which weeks the committed artifacts actually name. A contradiction
+        an operator can SEE beats a bare count they have to go look up."""
 
-    snapshots = (
-        select(MarketSnapshot.id)
-        .where(MarketSnapshot.market_id.in_(markets))
-        .scalar_subquery()
-    )
-    census.snapshots_in_evidence = session.execute(
-        select(func.count(func.distinct(EvidenceSnapshot.market_snapshot_id)))
-        .where(EvidenceSnapshot.market_snapshot_id.in_(snapshots))
-    ).scalar() or 0
-    census.snapshots_in_agent_sessions = session.execute(
-        select(func.count(func.distinct(AgentSession.market_snapshot_id)))
-        .where(AgentSession.market_snapshot_id.in_(snapshots))
-    ).scalar() or 0
+        return sorted({
+            w for (w,) in session.execute(
+                select(Week.week_number).distinct()
+                .select_from(model).join(Week, Week.id == model.week_id).where(*where)
+            )
+        })
 
-    # An AgentSession has no game_id; it reaches this game through the
-    # evidence or the snapshot it consumed. Either link means a model was
-    # shown this game under its current week label.
-    evidence = (
-        select(EvidenceSnapshot.id)
-        .where(EvidenceSnapshot.market_id.in_(markets))
-        .scalar_subquery()
-    )
-    census.agent_sessions = session.execute(
-        select(func.count()).select_from(AgentSession).where(
-            AgentSession.evidence_snapshot_id.in_(evidence)
-            | AgentSession.market_snapshot_id.in_(snapshots)
-        )
-    ).scalar() or 0
+    # -- observation --------------------------------------------------
+    c.prop_markets = count(PropMarket, PropMarket.game_id == game_id)
+    c.prop_quotes = count(PropQuote, PropQuote.market_id.in_(markets))
+    c.game_players = count(GamePlayer, GamePlayer.game_id == game_id)
+    c.market_snapshots = count(MarketSnapshot, MarketSnapshot.market_id.in_(markets))
 
     for run in session.execute(
         select(CheckpointRun).where(CheckpointRun.game_id == game_id)
     ).scalars():
-        census.checkpoints.setdefault(run.status, []).append(run.checkpoint_type)
-    return census
+        c.checkpoints.setdefault(run.status, []).append(run.checkpoint_type)
+
+    # -- committed research -------------------------------------------
+    c.evidence_snapshots = count(EvidenceSnapshot, EvidenceSnapshot.market_id.in_(markets))
+    c.forecast_observations = count(
+        ForecastObservation, ForecastObservation.market_id.in_(markets)
+    )
+
+    # An AgentSession has no game_id. It reaches this game three ways, and
+    # the BATCH ROUTE IS THE NORMAL ONE: `create_pending` populates only
+    # the join table, leaving both singular columns NULL. DISTINCT over the
+    # union, because one session can arrive by more than one route.
+    batched = (
+        select(AgentSessionEvidenceSnapshot.agent_session_id)
+        .where(
+            AgentSessionEvidenceSnapshot.market_id.in_(markets)
+            | AgentSessionEvidenceSnapshot.evidence_snapshot_id.in_(evidence)
+        )
+        .scalar_subquery()
+    )
+    c.agent_sessions = count(
+        AgentSession,
+        AgentSession.evidence_snapshot_id.in_(evidence)
+        | AgentSession.market_snapshot_id.in_(snapshots)
+        | AgentSession.id.in_(batched),
+    )
+    c.batched_agent_sessions = count(AgentSession, AgentSession.id.in_(batched))
+
+    c.research_settlements = count(
+        ResearchSettlement, ResearchSettlement.market_id.in_(markets)
+    )
+    # Either link counts: a slot names the game directly, and a resolved
+    # slot also names the market it picked inside it.
+    slot_where = (
+        (BenchmarkSlot.game_id == game_id) | (BenchmarkSlot.resolved_market_id.in_(markets))
+    )
+    c.benchmark_slots = count(BenchmarkSlot, slot_where)
+    c.committed_weeks["benchmark_slots"] = sorted({
+        w for (w,) in session.execute(
+            select(Week.week_number).distinct().select_from(BenchmarkSlot)
+            .join(BenchmarkSlatePlan, BenchmarkSlatePlan.id == BenchmarkSlot.plan_id)
+            .join(Week, Week.id == BenchmarkSlatePlan.week_id)
+            .where(slot_where)
+        )
+    })
+
+    # -- committed competition ----------------------------------------
+    c.stake_recommendations = count(
+        StakeRecommendation, StakeRecommendation.market_id.in_(markets)
+    )
+    ticket_where = (
+        Ticket.market_id.in_(markets) | Ticket.market_snapshot_id.in_(snapshots)
+    )
+    c.tickets = count(Ticket, ticket_where)
+    c.committed_weeks["tickets"] = weeks_named(Ticket, ticket_where)
+
+    c.wagers = count(Wager, Wager.market_id.in_(markets))
+    c.committed_weeks["wagers"] = weeks_named(Wager, Wager.market_id.in_(markets))
+
+    c.pass_decisions = count(
+        PassDecision, PassDecision.best_available_candidate_market_id.in_(markets)
+    )
+    c.committed_weeks["pass_decisions"] = weeks_named(
+        PassDecision, PassDecision.best_available_candidate_market_id.in_(markets)
+    )
+
+    # Two hops out, and the most committed artifacts in the system: real
+    # money moved against a wager on a market in this game.
+    wagers = select(Wager.id).where(Wager.market_id.in_(markets)).scalar_subquery()
+    c.settlements = count(Settlement, Settlement.wager_id.in_(wagers))
+    c.bankroll_transactions = count(
+        BankrollTransaction, BankrollTransaction.wager_id.in_(wagers)
+    )
+
+    # -- snapshot classification --------------------------------------
+    #
+    # A TRUE DISTINCT UNION, not max() of the parts. `MarketSnapshot.id` is
+    # the primary key, so counting matching ROWS is exactly the cardinality
+    # of the union of the reference sets.
+    c.snapshots_in_evidence = session.execute(
+        select(func.count(func.distinct(EvidenceSnapshot.market_snapshot_id)))
+        .where(EvidenceSnapshot.market_snapshot_id.in_(snapshots))
+    ).scalar() or 0
+    c.snapshots_in_agent_sessions = session.execute(
+        select(func.count(func.distinct(AgentSession.market_snapshot_id)))
+        .where(AgentSession.market_snapshot_id.in_(snapshots))
+    ).scalar() or 0
+    c.snapshots_in_tickets = session.execute(
+        select(func.count(func.distinct(Ticket.market_snapshot_id)))
+        .where(Ticket.market_snapshot_id.in_(snapshots))
+    ).scalar() or 0
+
+    referencing_evidence = select(EvidenceSnapshot.market_snapshot_id).scalar_subquery()
+    referencing_sessions = (
+        select(AgentSession.market_snapshot_id)
+        .where(AgentSession.market_snapshot_id.is_not(None))
+        .scalar_subquery()
+    )
+    referencing_tickets = (
+        select(Ticket.market_snapshot_id)
+        .where(Ticket.market_snapshot_id.is_not(None))
+        .scalar_subquery()
+    )
+    c.referenced_snapshots = count(
+        MarketSnapshot,
+        MarketSnapshot.market_id.in_(markets),
+        MarketSnapshot.id.in_(referencing_evidence)
+        | MarketSnapshot.id.in_(referencing_sessions)
+        | MarketSnapshot.id.in_(referencing_tickets),
+    )
+    return c
 
 
 def blockers_for(census: DependencyCensus) -> list[str]:
-    """Which counted artifacts make the relabel unsafe, and why."""
+    """Which counted artifacts make the relabel unsafe.
 
-    out: list[str] = []
-    if census.captured_checkpoints:
-        out.append(
-            f"{len(census.captured_checkpoints)} CAPTURED checkpoint run(s): "
-            + ", ".join(census.captured_checkpoints)
-            + " — a capture is an official, irreversible declaration made "
-            "under the current week label"
-        )
-    if census.evidence_snapshots:
-        out.append(
-            f"{census.evidence_snapshots} EvidenceSnapshot row(s) — immutable "
-            "evidence assembled under the current week label"
-        )
-    if census.forecast_observations:
-        out.append(
-            f"{census.forecast_observations} ForecastObservation row(s) — "
-            "competitive forecasts scored against this week"
-        )
-    if census.agent_sessions:
-        out.append(
-            f"{census.agent_sessions} AgentSession row(s) — a model was shown "
-            "this game under the current week label"
-        )
-    if census.referenced_snapshots:
-        out.append(
-            f"{census.referenced_snapshots} MarketSnapshot row(s) referenced by "
-            "evidence or an agent session"
-        )
-    return out
+    Derived from `census.rows()`, so a table added to the census is
+    blocking-checked by construction rather than by remembering to add a
+    second `if` down here. That omission is what made the first version
+    incomplete.
+    """
+
+    return [
+        f"{row.count} {row.label.strip()}" + (f" ({row.detail})" if row.detail else "")
+        for row in census.rows()
+        if row.blocking
+    ]
 
 
 # --------------------------------------------------------------------------
@@ -372,23 +640,19 @@ class RepairPlan:
             f"  reason        {self.reason}",
             "",
             "  --- dependency census ------------------------------------------",
-            f"    prop markets                        {c.prop_markets}",
-            f"    prop quotes                         {c.prop_quotes}",
-            f"    market snapshots (total)            {c.market_snapshots}",
-            f"      referenced by evidence            {c.snapshots_in_evidence}",
-            f"      referenced by agent sessions      {c.snapshots_in_agent_sessions}",
-            f"      standalone                        {c.standalone_snapshots}",
-            f"    evidence snapshots                  {c.evidence_snapshots}",
-            f"    forecast observations               {c.forecast_observations}",
-            f"    agent sessions                      {c.agent_sessions}",
+            f"    (every table that can reach a game by FK: "
+            f"{len(CENSUS_CLASSIFICATION)} classified)",
         ]
+        for row in c.rows():
+            out.append(row.render() + ("   <-- BLOCKS" if row.blocking else ""))
+        out.append("")
         for status in sorted(c.checkpoints):
             out.append(
-                f"    checkpoints {status:<10}              "
+                f"    checkpoint runs {status:<10}          "
                 f"{', '.join(sorted(c.checkpoints[status]))}"
             )
         if not c.checkpoints:
-            out.append("    checkpoints                         none")
+            out.append("    checkpoint runs                   none")
         if self.blockers:
             out += ["", "  REFUSED — correcting the week would reinterpret:"]
             out += [f"    - {b}" for b in self.blockers]
@@ -401,11 +665,16 @@ class RepairPlan:
         else:
             out += [
                 "",
-                "  Nothing has COMMITTED to the current week label: no CAPTURED",
-                "  checkpoint, no evidence, no forecast, no agent session, and no",
-                "  referenced snapshot. PropMarket / PropQuote / standalone",
-                f"  MarketSnapshot rows ({c.standalone_snapshots}) hang off game_id,",
-                "  which does not change, so no observation is reinterpreted.",
+                "  Nothing has COMMITTED to the current week label. Every blocking",
+                "  table above is zero -- no CAPTURED checkpoint, no evidence, no",
+                "  forecast, no agent session by ANY route, no benchmark slot,",
+                "  ticket, wager, pass decision, stake recommendation, settlement",
+                "  or bankroll transaction.",
+                "",
+                f"  What remains is observation: prop markets, quotes, roster rows",
+                f"  and {c.standalone_snapshots} standalone MarketSnapshot row(s). All of it hangs off",
+                "  game_id / market_id -- neither of which this correction touches",
+                "  -- so nothing is reinterpreted.",
             ]
         out.append("=" * 74)
         return "\n".join(out)
@@ -512,10 +781,17 @@ def apply_repair(
             f"{FIELD_CORRECTED} correction may not be written without one"
         )
 
-    # The audit row is written FIRST and is append-only. If the update
-    # failed after it, the record would still say a correction was
-    # attempted; if the order were reversed and the audit insert failed,
-    # the field would have moved with nothing explaining why.
+    # The audit row is written first, but that ordering buys NOTHING
+    # against failure and the earlier comment here claimed otherwise: both
+    # statements are in one transaction, so if the UPDATE fails the INSERT
+    # rolls back with it and no "a correction was attempted" record
+    # survives. Durability of the pair is what the transaction guarantees,
+    # not the order inside it.
+    #
+    # The order is kept for a smaller, real reason: the FK and the CHECK on
+    # `game_scope_corrections` are evaluated at this flush, so a correction
+    # that could not name its schedule call fails BEFORE `Game` is touched
+    # at all, rather than after.
     correction = GameScopeCorrection(
         game_id=game_id,
         field_corrected=FIELD_CORRECTED,
