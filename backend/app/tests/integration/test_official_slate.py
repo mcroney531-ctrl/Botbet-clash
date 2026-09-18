@@ -555,20 +555,38 @@ def test_the_commit_transaction_locks_the_week_and_the_rules():
     tree = ast.parse(
         textwrap.dedent(inspect.getsource(official_slate.commit_official_slate))
     )
+    # The Week row is locked inline, to serialize committers.
     locked = [
         node for node in ast.walk(tree)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
         and node.func.attr == "with_for_update"
     ]
-    assert len(locked) >= 2, (
-        "the commit transaction must lock BOTH the Week row (to serialize "
-        "committers) and the active SeasonRules row (to catch an amendment "
-        f"landing mid-commit); found {len(locked)} lock(s)"
+    assert any("Week" in ast.dump(node) for node in locked), "the Week row is not locked"
+
+    # The RULES are RESOLVED under the lock, in one statement. An earlier
+    # version resolved the active row unlocked and then locked that id,
+    # which proved nothing: if an amendment landed in between, it locked the
+    # superseded parent whose rules_version still matched the proposal.
+    calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    ]
+    resolved_under_lock = [
+        node for node in calls
+        if node.func.id == "active_rules"
+        and any(kw.arg == "lock" and getattr(kw.value, "value", None) is True
+                for kw in node.keywords)
+    ]
+    assert resolved_under_lock, (
+        "the commit transaction must resolve the ACTIVE rules row under the "
+        "lock via active_rules(..., lock=True), not resolve it unlocked and "
+        "then lock the id it already chose"
     )
-    sources = [ast.dump(node) for node in locked]
-    assert any("Week" in s for s in sources), "the Week row is not locked"
-    assert any("SeasonRules" in s for s in sources), "the rules row is not locked"
+    assert not any(node.func.id == "_season_pins" for node in calls), (
+        "_season_pins does an UNLOCKED active read; using it at the write "
+        "boundary reintroduces the stale-parent race"
+    )
 
 
 def test_the_planning_input_fingerprint_is_persisted_and_distinct():
@@ -1027,3 +1045,176 @@ def test_the_readiness_cli_exits_cleanly_on_failure(capsys):
     assert code == 1
     assert "CANNOT ASSESS" in out
     assert "Traceback" not in out
+
+
+# --- the stale-parent race the lock must actually close ----------------
+
+
+def test_an_amendment_between_proposal_and_lock_cannot_pass_as_current():
+    """The precise failure the earlier lock did not close.
+
+    It resolved the active row UNLOCKED, then locked that id. If an
+    amendment landed in between, the locked row was the superseded PARENT —
+    whose rules_version still equalled the proposal's, so the comparison
+    passed and the slate committed under methodology that was no longer
+    active. Resolving the active row UNDER the lock makes that impossible.
+    """
+
+    import app.forecast_lab.official_slate as module
+
+    season_id = _season("stale-parent")
+    original = module.propose_slate
+
+    def supersede_after_proposal(**kwargs):
+        proposal = original(**kwargs)
+        # A real amendment: the parent is superseded and a NEW active row
+        # appears. The parent's own rules_version is untouched, which is
+        # exactly why locking it by id proved nothing.
+        with session_scope() as session:
+            parent = session.execute(
+                select(SeasonRules).where(
+                    SeasonRules.season_id == season_id,
+                    SeasonRules.superseded_by.is_(None),
+                )
+            ).scalar_one()
+            clone = SeasonRules(
+                **{
+                    c.name: getattr(parent, c.name)
+                    for c in SeasonRules.__table__.columns
+                    if c.name not in {"id", "created_at"}
+                }
+            )
+            clone.rules_version = f"{parent.rules_version}-v3"
+            session.add(clone)
+            session.flush()
+            parent.superseded_by = clone.id
+        return proposal
+
+    module.propose_slate = supersede_after_proposal
+    try:
+        with pytest.raises(SlateCommitRefused, match="methodology changed"):
+            commit_official_slate(
+                season_id=season_id, week_number=3,
+                schedule_provider=StubSchedule(), now=IN_TIME,
+            )
+    finally:
+        module.propose_slate = original
+
+    assert _count(BenchmarkSlatePlan) == 0
+    with session_scope() as session:
+        active = session.execute(
+            select(SeasonRules).where(
+                SeasonRules.season_id == season_id,
+                SeasonRules.superseded_by.is_(None),
+            )
+        ).scalar_one()
+        assert active.rules_version.endswith("-v3"), "the fixture did not amend"
+
+
+# --- committed_at is the write-boundary clock --------------------------
+
+
+def test_committed_at_is_the_write_boundary_time_not_the_proposal_time():
+    """The deadline is enforced against the write clock, so calling the
+    earlier proposal moment "committed" would put a timestamp in the
+    durable record that no write ever happened at."""
+
+    import app.forecast_lab.official_slate as module
+
+    season_id = _season("committed-at")
+    proposed_at = DEADLINE - timedelta(hours=6)
+    written_at = DEADLINE - timedelta(minutes=30)
+    original = module.propose_slate
+
+    def propose_early(**kwargs):
+        kwargs["now"] = proposed_at
+        return original(**kwargs)
+
+    module.propose_slate = propose_early
+    try:
+        proposal = commit_official_slate(
+            season_id=season_id, week_number=3,
+            schedule_provider=StubSchedule(), now=written_at,
+        )
+    finally:
+        module.propose_slate = original
+
+    assert proposal.decided_at == proposed_at
+    assert proposal.committed_at == written_at
+    with session_scope() as session:
+        plan = session.get(BenchmarkSlatePlan, proposal.plan_id)
+        assert plan.committed_at == written_at, (
+            "the plan records a time no write happened at"
+        )
+        assert plan.committed_at != proposed_at
+
+
+def test_the_planning_input_version_is_persisted():
+    from app.forecast_lab.fixture_identity import PLANNING_INPUT_VERSION
+
+    season_id = _season("planning-version")
+    proposal = _commit(season_id)
+    with session_scope() as session:
+        plan = session.get(BenchmarkSlatePlan, proposal.plan_id)
+        assert plan.planning_input_version == PLANNING_INPUT_VERSION, (
+            "an auditor holding the digest cannot tell which format produced it"
+        )
+
+
+def test_an_official_plan_without_the_planning_version_is_refused_by_the_database():
+    from sqlalchemy.exc import IntegrityError
+
+    from app.forecast_lab.fixture_identity import FIXTURE_KEY_VERSION
+
+    season_id = _season("no-planning-version")
+    with session_scope() as session:
+        week_id = session.execute(
+            select(Week.id).where(Week.season_id == season_id)
+        ).scalar_one()
+    with pytest.raises(IntegrityError):
+        with session_scope() as session:
+            session.add(BenchmarkSlatePlan(
+                week_id=week_id, target_slot_count=5,
+                allocation_method="STABLE_HASH_V1", committed_at=IN_TIME,
+                is_official=True, rules_version="x",
+                schedule_provider_call_id=None,
+                fixture_pool_fingerprint="a" * 64,
+                planning_input_fingerprint="b" * 64,
+                fixture_pool_count=10, earliest_opening_at=DEADLINE,
+                fixture_key_version=FIXTURE_KEY_VERSION, resolver_version="r",
+            ))
+
+
+# --- readiness reports the week lifecycle ------------------------------
+
+
+def test_readiness_reports_an_absent_week_row():
+    season_id = _season("no-week-row", week_number=None)
+    report = _readiness(season_id)
+    assert report.week_present is False
+    text = report.render()
+    assert "week row                ABSENT" in text
+    assert "NO WEEK ROW" in text
+    assert "cannot occur until the week is PREPARED" in text
+
+
+def test_readiness_reports_a_pending_week_as_committable():
+    season_id = _season("pending-week")
+    report = _readiness(season_id)
+    assert report.week_present is True
+    assert report.week_status == "PENDING"
+    text = report.render()
+    assert "week row                PRESENT" in text
+    assert "is PENDING" in text
+    assert "A slate may be committed against it" in text
+
+
+def test_readiness_reports_an_opened_week_distinctly():
+    from app.services.season_commissioner import SeasonCommissioner
+
+    season_id = _season("opened-week", week_number=None)
+    SeasonCommissioner(season_id=season_id).open_week(week_number=3, is_real_money=False)
+    report = _readiness(season_id)
+    assert report.week_status == "OPENED"
+    assert report.week_opened_at is not None
+    assert "the competition week has begun" in report.render()

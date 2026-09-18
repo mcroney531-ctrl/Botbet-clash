@@ -16,6 +16,10 @@ from app.domain.models import SeasonRules as DomainSeasonRules
 from app.marketdata.provenance import SYNTHETIC_SOURCE
 
 
+class WeekConfigurationConflict(RuntimeError):
+    """An existing week row contradicts what was asked for."""
+
+
 class SeasonRepository:
     def __init__(self, session: Session) -> None:
         self.session = session
@@ -85,15 +89,69 @@ class SeasonRepository:
             raise LookupError(f"no active season_rules for season {season_id}")
         return row
 
-    def open_week(self, *, season_id: uuid.UUID, week_number: int, is_real_money: bool, opened_at: datetime) -> WeekRow:
+    def prepare_week(
+        self, *, season_id: uuid.UUID, week_number: int, is_real_money: bool
+    ) -> WeekRow:
+        """Create the week PENDING. Creation is not opening.
+
+        These were one operation, which forced an ordering the
+        precommitment design cannot accept: `BenchmarkSlatePlan.week_id`
+        is required BEFORE the first OPENING checkpoint, so committing a
+        research slate meant declaring the competition week open first.
+        Preparing a week creates the FK target and emits no event, moves no
+        bankroll and touches no competitor.
+
+        Idempotent for an identical PENDING week; a contradictory existing
+        row is refused rather than adjusted, because `is_real_money` decides
+        whether a week's results count and silently changing it under a
+        committed slate would rewrite what the season agreed to.
+        """
+
+        existing = self.session.execute(
+            select(WeekRow).where(
+                WeekRow.season_id == season_id, WeekRow.week_number == week_number
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            if existing.is_real_money != is_real_money:
+                raise WeekConfigurationConflict(
+                    f"week {week_number} already exists with "
+                    f"is_real_money={existing.is_real_money}, not {is_real_money}. "
+                    "That flag decides whether the week counts; it is not "
+                    "adjusted in place."
+                )
+            return existing
+
         row = WeekRow(
             season_id=season_id,
             week_number=week_number,
             is_real_money=is_real_money,
-            status="OPENED",
-            opened_at=opened_at,
+            status="PENDING",
+            opened_at=None,
         )
         self.session.add(row)
+        self.session.flush()
+        return row
+
+    def open_week(self, *, season_id: uuid.UUID, week_number: int, is_real_money: bool, opened_at: datetime) -> WeekRow:
+        """Prepare if needed, then TRANSITION to OPENED.
+
+        Creation and opening are two steps now; this keeps the old
+        single-call ergonomics by doing both, so existing callers are
+        unchanged while production can prepare a week without opening it.
+        """
+
+        row = self.prepare_week(
+            season_id=season_id, week_number=week_number, is_real_money=is_real_money
+        )
+        if row.status == "OPENED":
+            return row
+        if row.status != "PENDING":
+            raise WeekConfigurationConflict(
+                f"week {week_number} is {row.status}; only a PENDING week opens"
+            )
+        row.status = "OPENED"
+        row.opened_at = opened_at
         self.session.flush()
         return row
 

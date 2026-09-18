@@ -113,6 +113,10 @@ class BenchmarkSlatePlan(Base):
     # allocator and the deadline actually see". Kickoff is not decorative at
     # commit time -- it is what earliest_opening_at is computed from.
     planning_input_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # WHICH serialization produced that digest. Persisted because an auditor
+    # holding only the hash otherwise cannot tell which format it came from,
+    # and two formats can produce different digests for identical input.
+    planning_input_version: Mapped[str | None] = mapped_column(String, nullable=True)
     # The deadline this commitment was checked against, kept so the check
     # can be audited later rather than merely trusted.
     earliest_opening_at: Mapped[datetime | None] = mapped_column(nullable=True)
@@ -126,6 +130,7 @@ class BenchmarkSlatePlan(Base):
             " AND fixture_key_version IS NOT NULL"
             " AND fixture_pool_fingerprint IS NOT NULL"
             " AND planning_input_fingerprint IS NOT NULL"
+            " AND planning_input_version IS NOT NULL"
             " AND fixture_pool_count IS NOT NULL"
             " AND earliest_opening_at IS NOT NULL)",
             name="official_plan_requires_provenance",

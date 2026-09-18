@@ -49,6 +49,7 @@ from app.db.repositories.market_repository import MarketRepository
 from app.domain.lines import is_pushable_line
 from app.forecast_lab.fixture_identity import (
     FIXTURE_KEY_VERSION,
+    PLANNING_INPUT_VERSION,
     REGULAR_SEASON,
     FixtureKey,
     PlannedFixture,
@@ -120,6 +121,7 @@ def commit_from_planned_fixtures(
         fixture_pool_count=len(ordered),
         fixture_pool_fingerprint=pool_fingerprint(ordered),
         planning_input_fingerprint=planning_input_fingerprint(ordered),
+        planning_input_version=PLANNING_INPUT_VERSION,
         earliest_opening_at=provenance.earliest_opening_at if provenance else None,
     ))
 

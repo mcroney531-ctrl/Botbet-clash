@@ -40,7 +40,7 @@ from typing import Sequence
 from sqlalchemy import select
 
 from app.db.models.forecast_lab import BenchmarkSlatePlan
-from app.db.models.season import SeasonRules, Week
+from app.db.models.season import Week
 from app.db.session import session_scope
 from app.forecast_lab.benchmark_slate_service import (
     PlanProvenance,
@@ -49,6 +49,7 @@ from app.forecast_lab.benchmark_slate_service import (
 from app.forecast_lab.checkpoint_window import compute_window
 from app.forecast_lab.fixture_identity import (
     FIXTURE_KEY_VERSION,
+    PLANNING_INPUT_VERSION,
     IncompletePool,
     PlannedFixture,
     planned_pool,
@@ -66,6 +67,7 @@ from app.marketdata.game_registration import (
     _season_pins,
 )
 from app.marketdata.telemetry import finish_run, record_call, start_run
+from app.services.amend_capture_policy import AmendmentRefused, active_rules
 from app.marketdata.week_resolution import RESOLVER_VERSION
 
 OPENING = "OPENING"
@@ -95,6 +97,10 @@ class SlatePlanProposal:
     earliest_opening_at: datetime | None = None
     decided_at: datetime | None = None
     committed: bool = False
+    # When the proposal was DECIDED (after the fetch) versus when the write
+    # actually happened. Both are kept because the deadline is checked twice
+    # and an auditor should be able to see both moments.
+    committed_at: datetime | None = None
     plan_id: uuid.UUID | None = None
 
     @property
@@ -126,6 +132,7 @@ class SlatePlanProposal:
             f"  slate size        {self.slate_size}",
             f"  prop types        {', '.join(self.prop_types)}",
             f"  fixture key       {FIXTURE_KEY_VERSION}",
+            f"  planning input    {PLANNING_INPUT_VERSION}",
             "",
             "  --- the complete fixture pool the allocator saw ----------------",
             f"    {len(self.pool)} fixture(s), fingerprint {self.fingerprint[:16]}…",
@@ -330,14 +337,27 @@ def commit_official_slate(
                 "is keyed by week and cannot be committed without one"
             )
 
-        # The RULES, re-read under lock. rules_version is the complete
-        # methodology version, so a change to it is disqualifying whatever
-        # field moved -- but the allocation method is named explicitly
-        # because it is the one this commitment most obviously depends on.
-        _, live = _season_pins(session, season_id)
-        session.execute(
-            select(SeasonRules.id).where(SeasonRules.id == live.id).with_for_update()
-        ).scalar_one()
+        # The RULES. The ACTIVE row is resolved UNDER THE LOCK, in one
+        # statement -- not resolved unlocked and then locked by id.
+        #
+        # The earlier version did exactly that, and it proved nothing: if an
+        # amendment landed between the unlocked read and the lock, the row
+        # it locked was the superseded PARENT, whose rules_version still
+        # matched the proposal. It would have locked a dead row, compared
+        # a stale version to itself, and committed. The structural test
+        # showed a FOR UPDATE existed; it could not show WHICH row.
+        #
+        # `active_rules(..., lock=True)` selects on `superseded_by IS NULL`
+        # with the lock attached, so whatever it returns is active at the
+        # write boundary by construction.
+        try:
+            live = active_rules(session, season_id, lock=True)
+        except AmendmentRefused as exc:
+            raise SlateCommitRefused(
+                f"the season's active rules could not be resolved at the write "
+                f"boundary ({exc}). A concurrent amendment may be in flight; "
+                "nothing committed. Re-run the preview."
+            ) from exc
         if live.rules_version != proposal.rules_version:
             raise SlateCommitRefused(
                 f"the season's methodology changed while this slate was being "
@@ -379,7 +399,11 @@ def commit_official_slate(
             target_slot_count=proposal.slate_size,
             prop_types=proposal.prop_types,
             allocation_method=proposal.allocation_method,
-            committed_at=proposal.decided_at,
+            # The WRITE-BOUNDARY clock, not `proposal.decided_at`. The
+            # deadline is enforced against `write_now`, so calling the
+            # earlier proposal time "committed" would put a timestamp in the
+            # durable record that no write ever happened at.
+            committed_at=write_now,
             provenance=PlanProvenance(
                 rules_version=proposal.rules_version,
                 schedule_provider_call_id=proposal.schedule_provider_call_id,
@@ -388,6 +412,7 @@ def commit_official_slate(
             ),
         )
         proposal.plan_id = plan.id
+        proposal.committed_at = write_now
         proposal.committed = True
     return proposal
 

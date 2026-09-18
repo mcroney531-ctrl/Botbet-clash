@@ -179,6 +179,28 @@ class SeasonCommissioner:
 
     # -- weeks -------------------------------------------------------------
 
+    def prepare_week(self, *, week_number: int, is_real_money: bool) -> str:
+        """Create the week PENDING without opening the competition.
+
+        A benchmark slate must be committed before the first OPENING
+        window, and `BenchmarkSlatePlan.week_id` needs a Week row to point
+        at. Before this existed, the only way to get that row was
+        `open_week`, which declares the competition week open and emits
+        WEEK_OPENED -- so precommitting the research sample required
+        starting the competition first. Those are two different events and
+        this makes them two different calls.
+
+        Emits NO event, moves no bankroll, touches no competitor and calls
+        no provider. Idempotent for an identical PENDING week.
+        """
+
+        with session_scope() as session:
+            week = SeasonRepository(session).prepare_week(
+                season_id=self.season_id, week_number=week_number,
+                is_real_money=is_real_money,
+            )
+            return str(week.id)
+
     def open_week(self, *, week_number: int, is_real_money: bool) -> str:
         with session_scope() as session:
             week = SeasonRepository(session).open_week(

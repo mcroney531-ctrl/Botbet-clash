@@ -1926,7 +1926,71 @@ here without anyone remembering to copy it. Teaching `amend_capture_policy`
 a second mutable field would have weakened its own guard, and "which fields
 may this command change" is the entire safety property.
 
+### The rules lock was locking the wrong row
+
+The write-boundary lock looked right and proved nothing:
+
+```python
+_, live = _season_pins(session, season_id)      # UNLOCKED active read
+select(SeasonRules.id).where(id == live.id).with_for_update()
+```
+
+It resolved the active row unlocked, then locked *that id*. If an amendment
+landed between those two statements, `live` was the superseded **parent** —
+whose `rules_version` still equalled the proposal's. So it locked a dead
+row, compared a stale version to itself, and committed. The structural test
+showed a `FOR UPDATE` existed; it could not show which row.
+
+`active_rules(session, season_id, lock=True)` selects on
+`superseded_by IS NULL` with the lock attached, so whatever comes back is
+active at the write boundary by construction. The structural test now
+asserts that call *and* that `_season_pins` — the unlocked read — is absent
+from the transaction. A test supersedes the parent between proposal and
+write and proves the commit refuses.
+
+### Preparing a week is not opening it
+
+`BenchmarkSlatePlan.week_id` must exist before the first OPENING window,
+because the slate is precommitted. The only persistence path that created a
+`Week` was `open_week`, which creates it already `OPENED` and emits
+`WEEK_OPENED` — so precommitting the research sample required declaring the
+competition week open first, purely as a schema side effect.
+
+`prepare_week` creates the row `PENDING` with `opened_at` NULL and does
+nothing else: no event, no bankroll transaction, no competitor state, no
+provider call. Opening is now a transition on that row. `open_week` still
+works unchanged for existing callers — it prepares, then transitions.
+
+`is_real_money` conflicts are refused rather than adjusted, at both the
+service and repository layers: that flag decides whether a week counts, and
+changing it under a committed slate would rewrite what the season agreed
+to.
+
+### Readiness reports the week lifecycle
+
+It queried the `Week` row and never surfaced it, so "no week row" looked
+identical to "week awaiting its plan" — while official commitment refuses
+without one. The report now states PRESENT/ABSENT, the id, status,
+`is_real_money` and `opened_at`, and the verdict distinguishes an absent
+row, PENDING, OPENED and CLOSED.
+
+### Audit provenance finished
+
+`planning_input_version` is persisted (migration `f5a92e7c31d8`) and
+required by the official-plan CHECK — the digest folds the version in, but
+an auditor holding only the hash could not tell which serialization
+produced it. `amend_allocation_method` now requires `--reason` and persists
+it. And `committed_at` is the **write-boundary** clock, not
+`proposal.decided_at`: the deadline is enforced against the write clock, so
+calling the earlier moment "committed" put a timestamp in the durable
+record that no write ever happened at.
+
 ### Acceptance
+
+593 passed, 4 skipped. Twelve mutations on this pass, including the
+stale-parent lock — reverting it to `_season_pins` turns the race test red.
+
+### Earlier acceptance
 
 570 passed, 4 skipped. Fifteen closeout mutations; the three that survived
 the first pass — an unlocked `Week` row, a timezone-blind planning

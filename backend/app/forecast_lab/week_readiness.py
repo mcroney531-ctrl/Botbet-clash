@@ -91,6 +91,10 @@ class WeekReadiness:
     plan_fingerprint: str | None = None
     plan_pool_count: int | None = None
     slot_count: int = 0
+    week_id: uuid.UUID | None = None
+    week_status: str | None = None
+    week_is_real_money: bool | None = None
+    week_opened_at: datetime | None = None
     fixtures: list[FixtureReadiness] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
@@ -116,6 +120,10 @@ class WeekReadiness:
         return self.plan_id is not None
 
     @property
+    def week_present(self) -> bool:
+        return self.week_id is not None
+
+    @property
     def past_commit_deadline(self) -> bool:
         earliest = self.earliest_opening_at
         return earliest is not None and self.now >= earliest
@@ -129,6 +137,18 @@ class WeekReadiness:
             f"  rules version           {self.rules_version}",
             f"  allocation method       {self.allocation_method or 'NOT FROZEN'}",
             f"  now                     {self.now.isoformat()}",
+            "",
+            f"  week row                {'PRESENT' if self.week_present else 'ABSENT'}",
+        ]
+        if self.week_present:
+            out += [
+                f"  week id                 {self.week_id}",
+                f"  week status             {self.week_status}",
+                f"  is_real_money           {self.week_is_real_money}",
+                f"  opened_at               "
+                f"{self.week_opened_at.isoformat() if self.week_opened_at else '—'}",
+            ]
+        out += [
             "",
             f"  schedule fixtures       {self.schedule_fixture_count}/"
             f"{self.schedule_fixture_count}   ({self.schedule_provider})",
@@ -186,6 +206,33 @@ class WeekReadiness:
 
     def _verdict(self) -> list[str]:
         lines: list[str] = []
+        # The week row is reported FIRST and explicitly. It was queried
+        # before and never surfaced, so a week with no row looked
+        # indistinguishable from one merely awaiting its plan -- and
+        # official commitment refuses without it.
+        if not self.week_present:
+            lines.append(
+                f"NO WEEK ROW for week {self.week_number}. Official benchmark "
+                "commitment cannot occur until the week is PREPARED."
+            )
+            lines.append(
+                "Preparing a week creates it PENDING; it does not open the "
+                "competition. See app.services.prepare_week."
+            )
+        elif self.week_status == "PENDING":
+            lines.append(
+                f"Week row {self.week_id} is PENDING — prepared, not opened. "
+                "A slate may be committed against it."
+            )
+        elif self.week_status == "OPENED":
+            lines.append(
+                f"Week row {self.week_id} is OPENED"
+                + (f" at {self.week_opened_at.isoformat()}" if self.week_opened_at else "")
+                + " — the competition week has begun."
+            )
+        else:
+            lines.append(f"Week row {self.week_id} is {self.week_status}.")
+
         if not self.plan_committed:
             if self.past_commit_deadline:
                 lines.append(
@@ -249,6 +296,10 @@ def assess_week(
         ).scalar_one_or_none()
         plan = None
         if week is not None:
+            report.week_id = week.id
+            report.week_status = week.status
+            report.week_is_real_money = week.is_real_money
+            report.week_opened_at = week.opened_at
             plan = session.execute(
                 select(BenchmarkSlatePlan).where(BenchmarkSlatePlan.week_id == week.id)
             ).scalar_one_or_none()

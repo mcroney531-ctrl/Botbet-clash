@@ -70,13 +70,16 @@ def _active(season_id) -> SeasonRules:
         ).scalar_one()
 
 
+REASON = "Week 0 benchmark fixture allocation methodology freeze"
+
+
 def _amend(season_id, *, method="STABLE_HASH_V1", version="2026-research-v3",
-           expected="2026-research-v2"):
+           expected="2026-research-v2", reason=REASON):
     with session_scope() as session:
         return apply_allocation_amendment(
             session, season_id=season_id, allocation_method=method,
-            new_rules_version=version, effective_from=NOW,
-            expected_current_version=expected,
+            new_rules_version=version, amendment_reason=reason,
+            effective_from=NOW, expected_current_version=expected,
         )
 
 
@@ -177,8 +180,8 @@ def test_the_apply_revalidates_the_parent_under_a_lock():
     with session_scope() as session:
         plan_allocation_amendment(
             session, season_id=season_id, allocation_method="STABLE_HASH_V1",
-            new_rules_version="2026-research-v3", effective_from=NOW,
-            expected_current_version="2026-research-v2",
+            new_rules_version="2026-research-v3", amendment_reason=REASON,
+            effective_from=NOW, expected_current_version="2026-research-v2",
         )
     # Somebody else amends first.
     with session_scope() as session:
@@ -220,6 +223,7 @@ def test_the_under_lock_recheck_catches_a_race_with_no_expected_version():
                     session, season_id=season_id,
                     allocation_method="STABLE_HASH_V1",
                     new_rules_version="2026-research-v3",
+                    amendment_reason=REASON,
                     effective_from=NOW,
                     expected_current_version=None,
                 )
@@ -266,6 +270,7 @@ def test_the_dry_run_writes_nothing(capsys):
         "--season-id", str(season_id),
         "--allocation-method", "STABLE_HASH_V1",
         "--new-rules-version", "2026-research-v3",
+        "--reason", REASON,
         "--expect-current-version", "2026-research-v2",
     ])
     out = capsys.readouterr().out
@@ -282,6 +287,7 @@ def test_the_dry_run_names_the_rejected_methods_and_why(capsys):
         "--season-id", str(season_id),
         "--allocation-method", "STABLE_HASH_V1",
         "--new-rules-version", "2026-research-v3",
+        "--reason", REASON,
         "--expect-current-version", "2026-research-v2",
     ])
     out = capsys.readouterr().out
@@ -296,6 +302,7 @@ def test_the_cli_refuses_cleanly(capsys):
         "--season-id", str(season_id),
         "--allocation-method", "KICKOFF_BLOCK_STRATIFIED_V1",
         "--new-rules-version", "2026-research-v3",
+        "--reason", REASON,
         "--expect-current-version", "2026-research-v2",
     ])
     out = capsys.readouterr().out
@@ -324,3 +331,27 @@ def test_the_amended_season_can_then_commit_an_official_slate():
     )
     assert proposal.allocation_method == "STABLE_HASH_V1"
     assert len(proposal.chosen) == 5
+
+
+def test_the_amendment_requires_a_reason_and_persists_it():
+    """A rules row that cannot explain itself is the audit gap the
+    append-only lineage exists to close."""
+
+    season_id = _season("reasoned")
+    with pytest.raises(AmendmentRefused, match="must say why"):
+        _amend(season_id, reason="   ")
+
+    _amend(season_id)
+    assert _active(season_id).amendment_reason == REASON
+
+
+def test_the_reason_appears_in_the_diff(capsys):
+    season_id = _season("reason-shown")
+    main([
+        "--season-id", str(season_id),
+        "--allocation-method", "STABLE_HASH_V1",
+        "--new-rules-version", "2026-research-v3",
+        "--reason", REASON,
+        "--expect-current-version", "2026-research-v2",
+    ])
+    assert REASON in capsys.readouterr().out

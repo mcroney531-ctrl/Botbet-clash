@@ -57,6 +57,7 @@ class AllocationDiff:
     new_rules_version: str
     before: str | None
     after: str
+    amendment_reason: str
     effective_from: datetime
     applied: bool = False
     new_rules_id: uuid.UUID | None = None
@@ -71,6 +72,7 @@ class AllocationDiff:
             f"  season          {self.season_name}  ({self.season_id})",
             f"  lineage         {self.old_rules_version}  ->  {self.new_rules_version}",
             f"  effective from  {self.effective_from.isoformat()}",
+            f"  reason          {self.amendment_reason}",
             "",
             "  --- the one field this command may change ------------------------",
             f"    {FIELD}",
@@ -124,10 +126,19 @@ def plan_allocation_amendment(
     season_id: uuid.UUID,
     allocation_method: str,
     new_rules_version: str,
+    amendment_reason: str,
     effective_from: datetime | None = None,
     expected_current_version: str | None = None,
 ) -> AllocationDiff:
     """Build the diff. Writes nothing."""
+
+    if not (amendment_reason or "").strip():
+        raise AmendmentRefused(
+            "an amendment must say why. This one freezes the methodology a "
+            "whole season's benchmark sample is drawn by, and a rules row "
+            "that cannot explain itself is the audit gap the append-only "
+            "lineage exists to close."
+        )
 
     if allocation_method not in ALLOCATION_METHODS:
         raise AmendmentRefused(
@@ -165,6 +176,7 @@ def plan_allocation_amendment(
         new_rules_version=new_rules_version,
         before=getattr(current, FIELD),
         after=allocation_method,
+        amendment_reason=amendment_reason,
         effective_from=effective_from or datetime.now(timezone.utc),
     )
 
@@ -175,6 +187,7 @@ def apply_allocation_amendment(
     season_id: uuid.UUID,
     allocation_method: str,
     new_rules_version: str,
+    amendment_reason: str,
     effective_from: datetime | None = None,
     expected_current_version: str | None = None,
 ) -> AllocationDiff:
@@ -187,7 +200,8 @@ def apply_allocation_amendment(
 
     diff = plan_allocation_amendment(
         session, season_id=season_id, allocation_method=allocation_method,
-        new_rules_version=new_rules_version, effective_from=effective_from,
+        new_rules_version=new_rules_version, amendment_reason=amendment_reason,
+        effective_from=effective_from,
         expected_current_version=expected_current_version,
     )
 
@@ -209,6 +223,7 @@ def apply_allocation_amendment(
     setattr(clone, FIELD, allocation_method)
     clone.rules_version = new_rules_version
     clone.effective_from = diff.effective_from
+    clone.amendment_reason = amendment_reason
     session.add(clone)
     session.flush()
 
@@ -231,6 +246,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--allocation-method", required=True)
     parser.add_argument("--new-rules-version", required=True)
     parser.add_argument(
+        "--reason", required=True,
+        help="why the methodology is being frozen. Persisted on the new "
+             "rules row; a rules version that cannot explain itself is the "
+             "audit gap the append-only lineage exists to close.",
+    )
+    parser.add_argument(
         "--expect-current-version", required=True,
         help="the rules version the dry run showed. The amendment refuses if "
              "the active row says anything else.",
@@ -248,6 +269,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 session, season_id=args.season_id,
                 allocation_method=args.allocation_method,
                 new_rules_version=args.new_rules_version,
+                amendment_reason=args.reason,
                 expected_current_version=args.expect_current_version,
             )
             print(diff.render())
@@ -268,6 +290,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 session, season_id=args.season_id,
                 allocation_method=args.allocation_method,
                 new_rules_version=args.new_rules_version,
+                amendment_reason=args.reason,
                 expected_current_version=args.expect_current_version,
             )
             print(diff.render())
