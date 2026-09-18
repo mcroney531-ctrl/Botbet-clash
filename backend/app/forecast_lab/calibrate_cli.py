@@ -17,6 +17,7 @@ import uuid
 from datetime import datetime
 from typing import Sequence
 
+from app.cli_args import int_list
 from app.db.session import session_scope
 from app.forecast_lab.calibration import preview_thresholds, render
 
@@ -24,16 +25,13 @@ DEFAULT_CANDIDATES = "60,180,300,600,900,1800,3600,7200"
 
 
 def _candidates(raw: str) -> list[int | None]:
-    values: list[int | None] = [None]  # always score the ungated baseline
-    for part in raw.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        value = int(part)
-        if value < 0:
-            raise argparse.ArgumentTypeError(f"candidate {value} must be >= 0")
-        values.append(value)
-    return values
+    """Always scores the ungated baseline alongside the named candidates.
+
+    Accepts commas, whitespace, or both -- see app/cli_args.py for why an
+    unquoted comma list is not something a CLI can rely on receiving.
+    """
+
+    return [None, *int_list(raw, field="--candidates")]
 
 
 def _instant(raw: str) -> datetime:

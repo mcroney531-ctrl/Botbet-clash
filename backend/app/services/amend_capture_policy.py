@@ -28,6 +28,7 @@ from typing import Sequence
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.cli_args import number_list
 from app.db.models.season import Season, SeasonRules
 from app.db.session import session_scope
 from app.forecast_lab.quote_selection import FreshnessConfigError, validate_max_observation_age
@@ -271,6 +272,10 @@ def apply_amendment(
     return clone
 
 
+def _backoff(raw: str) -> list[float]:
+    return number_list(raw, field="--backoff-seconds")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Freeze a season's capture policy via an append-only rules amendment"
@@ -279,8 +284,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--max-observation-age-seconds", required=True, type=int)
     parser.add_argument("--max-attempts", required=True, type=int)
     parser.add_argument(
-        "--backoff-seconds", required=True,
-        help="comma-separated, e.g. 30,120",
+        "--backoff-seconds", required=True, type=_backoff,
+        help='comma- or space-separated, e.g. 30,120. In PowerShell, quote it: '
+             '"30,120" -- an unquoted comma there is array syntax.',
     )
     parser.add_argument("--window-guard-seconds", type=float, default=60.0)
     parser.add_argument("--request-budget-seconds", type=float, default=180.0)
@@ -300,7 +306,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     retry = {
         "max_attempts": args.max_attempts,
-        "backoff_seconds": [float(x) for x in args.backoff_seconds.split(",") if x.strip()],
+        "backoff_seconds": args.backoff_seconds,
         "window_guard_seconds": args.window_guard_seconds,
         "request_budget_seconds": args.request_budget_seconds,
     }
