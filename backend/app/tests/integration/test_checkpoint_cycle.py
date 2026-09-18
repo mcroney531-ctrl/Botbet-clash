@@ -29,7 +29,14 @@ from app.db.session import session_scope
 from app.domain.enums import StatFamily
 from app.forecast_lab.calibration import preview_thresholds, render as render_calibration
 from app.marketdata.base import ProviderCallMetadata
-from app.marketdata.checkpoint_cycle import RefreshOutcome, render, run_checkpoint_cycle
+from app.marketdata.checkpoint_cycle import (
+    SINGLE_ATTEMPT,
+    CapturePolicy,
+    RefreshOutcome,
+    RefreshRetryPolicy,
+    render,
+    run_checkpoint_cycle,
+)
 from app.marketdata.dto import ProviderEventRef, ProviderPlayerRef, ProviderQuote
 from app.marketdata.ingestion import IngestionService
 from app.marketdata.telemetry import record_call, start_run
@@ -133,16 +140,26 @@ def _write_quote(market_id: uuid.UUID, *, sportsbook: str, as_of_at: datetime, l
         assert row is not None, "fixture wrote a duplicate fingerprint"
 
 
-def _cycle(game_id, *, refresh=None, tolerance=CANDIDATE, captured_at=CAPTURE_AT):
+def _policy(tolerance=CANDIDATE, retry=SINGLE_ATTEMPT, rules_version=None) -> CapturePolicy:
+    return CapturePolicy(
+        canonical_sportsbook=CANONICAL,
+        market_data_provider=PROVIDER,
+        checkpoint_windows=WINDOWS,
+        max_observation_age_seconds=tolerance,
+        retry=retry,
+        rules_version=rules_version,
+    )
+
+
+def _cycle(game_id, *, refresh=None, tolerance=CANDIDATE, captured_at=CAPTURE_AT,
+           retry=SINGLE_ATTEMPT, policy=None, sleep_fn=lambda _s: None):
     return run_checkpoint_cycle(
         game_id=game_id,
         checkpoint_type="FINAL",
-        windows_config=WINDOWS,
-        canonical_sportsbook=CANONICAL,
-        market_data_provider=PROVIDER,
+        policy=policy or _policy(tolerance, retry),
         refresh=refresh,
-        max_observation_age_seconds=tolerance,
         now_fn=lambda: captured_at,
+        sleep_fn=sleep_fn,
     )
 
 
@@ -212,15 +229,16 @@ def test_the_capture_clock_is_read_after_the_refresh():
     report = run_checkpoint_cycle(
         game_id=game_id,
         checkpoint_type="FINAL",
-        windows_config=WINDOWS,
-        canonical_sportsbook=CANONICAL,
-        market_data_provider=PROVIDER,
+        policy=_policy(),
         refresh=refresh,
-        max_observation_age_seconds=CANDIDATE,
         now_fn=now_fn,
     )
 
-    assert seen == ["refresh", "clock"]
+    # The preflight reads the clock first (it must, to decide eligibility),
+    # then the refresh runs, and only THEN is the capture clock read. What
+    # matters is that no clock read separates the refresh from the capture.
+    assert seen[-2:] == ["refresh", "clock"]
+    assert seen.index("refresh") > 0, "the preflight ran before the paid refresh"
     assert report.valid_baselines == 1, "the capture saw the quotes its own refresh wrote"
 
 
@@ -397,6 +415,10 @@ def test_a_bad_tolerance_stops_the_cycle_before_the_refresh_runs():
     with pytest.raises(FreshnessConfigError):
         _cycle(game_id, refresh=refresh, tolerance=-1)
     assert called == []
+    # It now fails even earlier: constructing the policy at all is refused,
+    # so a misconfiguration cannot reach a scheduler.
+    with pytest.raises(FreshnessConfigError):
+        _policy(tolerance=-1)
 
 
 def test_a_second_cycle_is_a_no_op_and_does_not_re_capture():

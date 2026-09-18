@@ -267,14 +267,36 @@ that merely looks thin.
 The production contract for a checkpoint:
 
 ```
-refresh market data          network, OUTSIDE any DB transaction
-    |
+preflight                    DB reads only. May this checkpoint work?
+    |  ELIGIBLE only
+    v
+refresh market data          network, OUTSIDE any DB transaction,
+    |                        bounded explicit retries
     v
 persist immutable PropQuotes, COMMIT
     |
     v
 capture checkpoint           DB reads only, at the real captured_at
 ```
+
+**A paid refresh happens only when the checkpoint could use it
+(Phase 4A.5).** The preflight is read-only and runs first. An
+already-CAPTURED checkpoint is immutable, so new quotes could never reach
+it; a too-early or expired one will not capture at all. Refreshing in any
+of those cases buys nothing and costs credits — and a scheduler that
+re-ticks pays again on every tick. This is a cost-integrity invariant.
+
+4A.4 shipped this the wrong way round: it refreshed first and discovered
+the disposition afterwards. The eligibility rule now lives in ONE pure
+module (`checkpoint_window.py`) used by both the preflight and
+`capture_checkpoint`, because two copies would let them disagree — and the
+disagreement would be paid for in Odds API credits.
+
+The preflight deliberately writes nothing, not even the PENDING
+`CheckpointRun` row. Creating state as a side effect of asking a question
+would mean a too-early poll silently changed the record it was only meant
+to read; `capture_checkpoint` still does that bookkeeping afterwards,
+unchanged.
 
 `app/marketdata/checkpoint_cycle.py::run_checkpoint_cycle` is the one
 scheduler-ready entry point. It is a callable job, not a scheduler:
@@ -300,6 +322,33 @@ having a tolerance at all. A capture that runs on last-known observations
 and labels them stale is information; a capture that does not happen is a
 hole in the research record. The gate decides whether those observations
 are usable and the report says the refresh failed.
+
+**Retries happen BEFORE the capture, never after it (MODEL B).** Because
+`capture_checkpoint` is idempotent once CAPTURED, "retry by calling the
+cycle again later" cannot work: the first call has already consumed the
+checkpoint. A single transient timeout would otherwise permanently cost
+FINAL, the highest-value checkpoint. Attempts are therefore bounded,
+explicit and individually audited inside one call — each is its own
+provider call with its own `ProviderCall` row, because "how many times did
+we ask, and what did each attempt say" is research provenance rather than
+an implementation detail. An adapter-level retry would make three billed
+calls look like one.
+
+Two constraints on the loop:
+
+- **Not every failure is retryable.** `AUTHENTICATION_ERROR`,
+  `QUOTA_EXHAUSTED` and `QUOTA_RESERVE_EXHAUSTED` cannot succeed on a
+  retry. `MALFORMED_RESPONSE` is the sharpest case: the provider
+  *answered* and we were **billed**, so the same request yields the same
+  unusable payload and a retry pays again for it.
+- **Retries must never consume the window they protect.** A guard stops
+  the loop when the next backoff would leave too little of the window to
+  capture in; turning a recoverable failure into a MISSED checkpoint is
+  worse than the failure.
+
+Both the tolerance and the retry budget are frozen in `SeasonRules`
+(§3.7), because both materially change which market state may reach an
+irreversible capture.
 
 The cycle reports, separately and never merged:
 
@@ -354,8 +403,19 @@ observation age is ~0 and every candidate threshold scores identically.
 
 The threshold is an **operational fallback grace period**: how old we are
 willing to let the last successful observation be when the refresh that
-should have preceded this capture *failed*. Only the failure cases speak
-to it. The seven scenarios in `test_checkpoint_cycle.py` (A–G) are the
+should have preceded this capture did not produce one. Only the failure
+cases speak to it.
+
+It is specifically NOT a network-timeout allowance and NOT a retry
+allowance. A current quote stamps `as_of_at` at **response receipt**, so a
+slow-but-successful request still yields age ~0 at capture, and so does a
+retry that eventually succeeds. The tolerance bites only when the newest
+usable observation pre-dates the current attempt entirely — a refresh that
+failed outright, or a book that vanished from an otherwise successful
+response. Under today's one-refresh-per-checkpoint choreography that
+fallback is usually hours old, so the tolerance is close to inert; it
+becomes load-bearing when a pre-capture refresh cadence exists. See
+`docs/phase4a4-threshold-recommendation.md` §2. The seven scenarios in `test_checkpoint_cycle.py` (A–G) are the
 evidence a recommendation has to be argued from, and F/G exist to prove
 the two clocks stay independent — F is a late scheduler with fresh quotes,
 G is an on-time scheduler with stale ones.
@@ -422,6 +482,24 @@ tolerance.
 
 `run_checkpoint_cycle` validates it before calling `refresh`, so a
 misconfiguration cannot spend a provider call before failing.
+
+### 3.7 The capture policy is frozen, not chosen per run
+
+`SeasonRules` carries both `max_observation_age_seconds` and
+`refresh_retry_policy`. Both materially change **which market state may
+reach a checkpoint**, and a capture is irreversible — letting an operator
+pick either per run would mean two checkpoints in the same season were
+built under different rules with nothing in the record saying so.
+
+`CapturePolicy.from_season_rules()` is the only official constructor. It
+carries the row's `rules_version`, so a cycle report distinguishes "the
+season's rules said so" from "someone injected a value for this run"; a
+directly-constructed policy (calibration, tests) reports
+`rules_version = None` and `is_official = False`.
+
+NULL on either column means no capture policy was frozen — which is what
+every pre-4A.5 season genuinely ran under. It is not a zero-second
+tolerance and not zero attempts.
 
 ---
 
@@ -1066,6 +1144,12 @@ later        GamePlayer            (post-probe, §12.2)
              BENCHMARK_PROMPT_VERSION benchmark-v2 -> benchmark-v3
              FORECAST_SCHEMA_VERSION unchanged (forecast-v1)
 
+4A.5         SeasonRules  + max_observation_age_seconds  nullable
+                          + refresh_retry_policy         JSONB nullable
+             CHECK max_observation_age_seconds IS NULL OR >= 0
+             Additive, NO VALUE SET on any row. NULL means no capture policy
+             frozen, which is what every pre-4A.5 season ran under.
+
              (`provider_market_updated_at` was required by the time model in
              §3 and by the ProviderQuote DTO in §9 from the start; its absence
              from this summary was a documentation omission, corrected during
@@ -1128,6 +1212,12 @@ reasoning is not lost.
 | Abort the capture when the refresh fails | **Rejected.** A missing checkpoint is a hole in the research record; a stale-but-labelled one is information. The gate decides usability and the report says the refresh failed (§3.3). |
 | Show competitors the rejected stale quotes | **Rejected.** They are told coverage was degraded and by how much, never what the degraded evidence said, and never `provider_market_updated_at` (§3.5). |
 | Hide the exclusion from competitors entirely | **Rejected.** `number_of_books: 3` would then mean either three books existed or five did and two were refused — presenting a feed problem as a market fact (§3.5). |
+| Refresh before establishing the checkpoint's disposition (as 4A.4 shipped) | **Rejected, and fixed.** A scheduler re-tick on a CAPTURED checkpoint paid for quotes that could never reach it, once per tick. The preflight now gates the provider call (§3.3). |
+| Retry a failed refresh by calling the cycle again later | **Rejected.** `capture_checkpoint` is idempotent once CAPTURED, so the first call has already consumed the checkpoint. Retries happen before the capture or not at all (§3.3). |
+| Put retries inside the provider adapter | **Rejected.** Three billed calls would look like one. Each attempt is its own `ProviderCall` row (§3.3). |
+| Retry every failure category | **Rejected.** A bad key stays bad and an exhausted quota stays exhausted. `MALFORMED_RESPONSE` is the sharpest: the provider answered and we were billed, so a retry pays again for the same unusable payload (§3.3). |
+| "900s covers a slow refresh plus a retry or two" | **Retracted.** `as_of_at` stamps at response receipt, so a slow success and a successful retry both age ~0. The tolerance only bites when the newest usable observation pre-dates the attempt entirely (§3.4). |
+| Let an operator pass the tolerance or retry budget per official run | **Rejected.** Both change which market state reaches an irreversible capture, so both are frozen rules and a change is an amendment (§3.7). |
 | `as_of_at` derived from vendor `last_update` | **Rejected.** Wrong granularity (market-level, not bookmaker-level) and, more importantly, the wrong meaning: a quote row records an observation, not the vendor's belief about market change (§3). |
 | Timestamp-based retry idempotency | **Replaced** by `provider_call_id` + fingerprint (§5). Provenance beats inference. |
 | Hash-only raw retention for successful runs | **Rejected.** A hash cannot reconstruct a bad normalization (§11.1). |

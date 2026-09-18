@@ -1090,3 +1090,140 @@ the migration plan are in the doc, gated on acceptance.
 **276 passed, 4 skipped.** Migrations `d2b9f45c1a7e` and `e5c1a93f2b64`
 applied through the full chain on a clean database and round-tripped
 twice; no drift against `Base.metadata`.
+
+---
+
+## Phase 4A.5 readout — cost integrity, and retries before an irreversible capture
+
+Two problems with 4A.4, one of them a real bug in shipped code.
+
+### The bug: the cycle paid before it knew whether it could use the data
+
+`run_checkpoint_cycle` called `refresh()` first and only then entered
+`capture_checkpoint`, where CAPTURED / too-early / expired were handled.
+So a scheduler that re-ticked on an already-CAPTURED checkpoint bought
+quotes that could never reach an immutable row — and paid again on every
+tick. Same for a poll before the window opens or after it closes.
+
+The preflight now runs first, is read-only, and gates the provider call.
+Four dispositions, one of which may spend money:
+
+```
+ALREADY_CAPTURED  immutable; new quotes could never reach it   -> 0 calls
+TOO_EARLY         will not capture yet                          -> 0 calls
+EXPIRED           will not capture at all (MISSED path runs)    -> 0 calls
+ELIGIBLE                                                        -> refresh
+```
+
+The eligibility rule now lives in one pure module used by *both* the
+preflight and `capture_checkpoint`. Two copies would let them disagree,
+and the disagreement would be paid for in credits on every tick — there's
+an AST guard asserting neither module re-derives the window arithmetic.
+
+The preflight deliberately writes nothing, not even the PENDING row.
+Creating state as a side effect of asking a question would mean a
+too-early poll silently changed the record it was only meant to read.
+`capture_checkpoint` still does that bookkeeping afterwards, unchanged.
+
+### Retries: Model B, because capture is irreversible
+
+`capture_checkpoint` is idempotent once CAPTURED, so "retry by calling the
+cycle again later" can't work — the first call has already consumed the
+checkpoint. One transient timeout would permanently cost FINAL, the
+highest-value checkpoint of the three. So attempts are bounded, explicit,
+and happen *inside* the same call, before the capture.
+
+Proposed budget: **3 attempts, backoff 30s then 120s.** FINAL's window is
+4 hours wide, so 150s is negligible against it; worst case is 3× the
+event-odds call and only on failure. Three attempts can't fix a sustained
+outage — and a sustained outage is exactly when we shouldn't be
+forecasting on last-known prices.
+
+Two constraints beyond the brief:
+
+**Not every failure is retryable.** `AUTHENTICATION_ERROR`,
+`QUOTA_EXHAUSTED` and `QUOTA_RESERVE_EXHAUSTED` can't succeed on a retry.
+`MALFORMED_RESPONSE` is the sharpest case: the provider *answered* and we
+were **billed**, so the same request returns the same unusable payload and
+a retry pays again for it.
+
+**Retries never consume the window they protect.** A guard stops the loop
+when the next backoff would leave too little room to capture. Turning a
+recoverable failure into a MISSED checkpoint is worse than the failure.
+
+Each attempt is its own provider call with its own `ProviderCall` row and
+appears separately in the report. No adapter-level retry — that would make
+three billed calls look like one, and "how many times did we ask, and what
+did each attempt say" is research provenance.
+
+### Retraction: the 900s rationale was partly wrong
+
+The previous recommendation said 900s "comfortably covers a refresh that
+succeeded but ran slowly, plus a retry or two." That is false.
+
+A current quote stamps `as_of_at` at **response receipt**
+(`the_odds_api.py:316`). So a slow-but-successful request still yields age
+~0 at capture, and so does a retry that eventually succeeds. The tolerance
+is not a timeout allowance and not a retry allowance.
+
+It bites only when the newest usable observation pre-dates the current
+attempt entirely: a refresh that failed outright, or a book that vanished
+from an otherwise successful response. Under one-refresh-per-checkpoint,
+that fallback is the *previous checkpoint* — 15h51m in the real Week-3
+data.
+
+Following that through further than the correction required: **900s is
+currently close to inert.** It discriminates only inside a band today's
+workflow never lands in, so its practical effect right now is identical to
+a 0-second tolerance — make a refresh failure loud.
+
+Still recommending 900 rather than 0, for a narrower reason than before:
+it's the right order of magnitude for the cases that *do* become real once
+any pre-capture cadence exists, and it's a value we can grow into without
+a rules amendment. The choice simply doesn't require precision yet.
+
+Scenario B (600s fallback after a failure) is relabelled in the docs as a
+**policy scenario**, not an observed operational path.
+
+### The policy is frozen, not chosen per run
+
+`SeasonRules` gains `max_observation_age_seconds` and
+`refresh_retry_policy` (migration `f3a71d9b28c4`, both nullable, CHECK on
+the tolerance). Both change which market state may reach an irreversible
+capture, so neither is an operator flag — two checkpoints in one season
+built under different rules with nothing in the record saying so is
+exactly what frozen rules exist to prevent.
+
+`CapturePolicy.from_season_rules()` is the only official constructor and
+carries `rules_version` as provenance. A directly-constructed policy
+(calibration, tests) reports `is_official = False`, so "the season's rules
+said so" can't be confused with "someone injected a value for this run".
+
+**No value is set on any season.** NULL means no capture policy frozen —
+what every pre-4A.5 season genuinely ran under, and not the same as a
+zero-second tolerance or zero attempts. Setting them is one provisioning
+call on acceptance; a later change is a rules amendment, never an UPDATE.
+
+### Acceptance
+
+24 new tests, zero credits — the refresh is a counter, so a *failing*
+refresh is just a callable returning `ok=False`.
+
+Verified by mutation, five ways:
+
+| mutation | what went red |
+| --- | --- |
+| restore the 4A.4 ordering (refresh regardless of disposition) | all three zero-call tests |
+| CAPTURED no longer blocks a refresh | the already-captured test |
+| make every category retryable | all four non-retryable cases |
+| remove the window guard | the window-guard test |
+| let the preflight create the PENDING row | the writes-nothing test |
+
+Plus: eligible calls *do* refresh (a preflight that refused everything
+would pass the three zero-call tests and be useless), at-most-once capture
+across retries, and the capture clock read after the *final* attempt.
+
+### Test count
+
+**303 passed, 4 skipped.** Migration `f3a71d9b28c4` applied through the
+full chain on a clean database and round-tripped twice.

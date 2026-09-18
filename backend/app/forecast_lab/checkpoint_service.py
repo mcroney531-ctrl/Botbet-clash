@@ -19,18 +19,28 @@ from sqlalchemy.orm import Session
 from app.db.models.markets import CheckpointRun, Game
 from app.db.repositories.checkpoint_repository import CheckpointRepository
 from app.db.repositories.market_repository import MarketRepository
+from app.forecast_lab.checkpoint_window import (
+    CheckpointDisposition,
+    CheckpointWindow,
+    compute_window as _compute_window,
+    disposition,
+)
 from app.forecast_lab.evidence_service import create_evidence_snapshot, mock_evidence_payload
 from app.forecast_lab.market_snapshot_service import MarketSnapshotService
 from app.marketdata.provenance import SYNTHETIC_SOURCE
 
 
-def compute_window(kickoff_at: datetime, checkpoint_type: str, windows_config: dict) -> tuple[datetime, datetime, datetime]:
-    cfg = windows_config[checkpoint_type]
-    window_start = kickoff_at - timedelta(hours=cfg["start_hours_before_kickoff"])
-    window_end = kickoff_at - timedelta(hours=cfg["end_hours_before_kickoff"])
-    target_offsets = {"OPENING": cfg["start_hours_before_kickoff"], "MID": 48, "FINAL": 3}
-    target_time = kickoff_at - timedelta(hours=target_offsets[checkpoint_type])
-    return window_start, window_end, target_time
+def compute_window(
+    kickoff_at: datetime, checkpoint_type: str, windows_config: dict
+) -> tuple[datetime, datetime, datetime]:
+    """Back-compatible tuple form. The arithmetic itself lives in
+    `checkpoint_window.compute_window`, which is also what the preflight
+    uses -- two copies would let the preflight and the capture disagree
+    about eligibility, and the disagreement would be paid for in provider
+    credits."""
+
+    w = _compute_window(kickoff_at, checkpoint_type, windows_config)
+    return w.window_start, w.window_end, w.target_time
 
 
 def capture_checkpoint(
@@ -56,20 +66,30 @@ def capture_checkpoint(
         return run
 
     if run is None:
-        window_start, window_end, target_time = compute_window(game.kickoff_at, checkpoint_type, windows_config)
+        w = _compute_window(game.kickoff_at, checkpoint_type, windows_config)
         run = CheckpointRun(
             game_id=game.id,
             checkpoint_type=checkpoint_type,
-            window_start=window_start,
-            window_end=window_end,
-            target_time=target_time,
+            window_start=w.window_start,
+            window_end=w.window_end,
+            target_time=w.target_time,
             status="PENDING",
         )
         checkpoint_repo.add(run)
 
-    if now < run.window_start:
-        return run  # too early - stays PENDING
-    if now > run.window_end:
+    # The same eligibility function the preflight calls, over the same
+    # window. If these two ever diverged, a scheduler would pay for a
+    # refresh the capture then refused to use.
+    state = disposition(
+        status=run.status,
+        window=CheckpointWindow(run.window_start, run.window_end, run.target_time),
+        now=now,
+    )
+    if state is CheckpointDisposition.ALREADY_CAPTURED:
+        return run
+    if state is CheckpointDisposition.TOO_EARLY:
+        return run  # stays PENDING
+    if state is CheckpointDisposition.EXPIRED:
         run.status = "MISSED"
         session.flush()
         return run
