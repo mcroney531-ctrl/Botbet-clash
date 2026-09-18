@@ -1757,9 +1757,39 @@ coupled to the real 2026 schedule agreeing with its fixtures. No CLI flag
 reaches the seam; the season's frozen roster pin still chooses the
 implementation in production.
 
+### "If the windows are 144/96, then roughly..." is a guess
+
+That sentence kept appearing whenever the question was *when does the next
+capture window open*. It is a guess about production dressed as
+arithmetic. The frozen `checkpoint_windows` live in the season's active
+`SeasonRules` and are the only thing that decides when a capture may run,
+so `app.marketdata.checkpoint_schedule` reads them and projects the real
+timestamps. Read-only, zero credits: it may read SeasonRules, Game and
+CheckpointRun rows and fetch the free schedule, and it may not touch the
+odds provider or write anything.
+
+The window arithmetic is imported from `checkpoint_window`, never
+reimplemented — a second copy could disagree with the cycle it is supposed
+to be predicting, and a projection you cannot trust is worse than none.
+
+It exists for a specific time-boxed decision. `BenchmarkSlatePlan.week_id`
+is UNIQUE and the plan is committed once per week, *before any game's
+OPENING window opens*. That makes the earliest OPENING start a deadline
+you cannot renegotiate, and it should not be a mental calculation done
+under time pressure.
+
+**Fixtures come from two places on purpose.** Registered `Game` rows are
+authoritative. The schedule fills in fixtures that exist in the real world
+but have no `Game` row yet — because the deadline is computed over *every*
+fixture, registered or not. A deadline computed only from registered games
+moves later each time the provider is slow to list one, which is exactly
+backwards: the unlisted game is the reason to hurry. The week-3 preview
+found this live — The Odds API listed 14 of nflverse's 16 fixtures, with
+LAC @ BUF and NYJ @ DET missing.
+
 ### Acceptance
 
-457 passed, 4 skipped. Mutation-tested twenty-two ways across both passes.
+469 passed, 4 skipped. Mutation-tested twenty-two ways across both passes.
 The census half: deleting each of the benchmark-slot, ticket, wager,
 bankroll, pass-decision, research-settlement and stake-recommendation
 traversals; ignoring `BenchmarkSlot.resolved_market_id`; deleting the
