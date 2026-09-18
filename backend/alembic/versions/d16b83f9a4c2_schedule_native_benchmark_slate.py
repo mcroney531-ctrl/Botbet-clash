@@ -69,7 +69,6 @@ def upgrade() -> None:
         batch.add_column(sa.Column("fixture_key_version", sa.String(), nullable=True))
         batch.add_column(sa.Column("fixture_pool_count", sa.Integer(), nullable=True))
         batch.add_column(sa.Column("fixture_pool_fingerprint", sa.String(length=64), nullable=True))
-        batch.add_column(sa.Column("planning_input_fingerprint", sa.String(length=64), nullable=True))
         batch.add_column(sa.Column("earliest_opening_at", sa.DateTime(timezone=True), nullable=True))
         batch.create_foreign_key(
             None, "provider_calls", ["schedule_provider_call_id"], ["id"],
@@ -80,10 +79,7 @@ def upgrade() -> None:
         "NOT is_official OR ("
         " rules_version IS NOT NULL"
         " AND schedule_provider_call_id IS NOT NULL"
-        " AND resolver_version IS NOT NULL"
-        " AND fixture_key_version IS NOT NULL"
         " AND fixture_pool_fingerprint IS NOT NULL"
-        " AND planning_input_fingerprint IS NOT NULL"
         " AND fixture_pool_count IS NOT NULL"
         " AND earliest_opening_at IS NOT NULL)",
     )
@@ -115,8 +111,7 @@ def downgrade() -> None:
             type_="foreignkey",
         )
         for column in (
-            "earliest_opening_at", "planning_input_fingerprint",
-            "fixture_pool_fingerprint", "fixture_pool_count",
+            "earliest_opening_at", "fixture_pool_fingerprint", "fixture_pool_count",
             "fixture_key_version", "resolver_version", "schedule_provider_call_id",
             "rules_version", "is_official",
         ):
