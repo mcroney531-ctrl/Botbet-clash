@@ -13,11 +13,22 @@ from app.db.models.season import Season as SeasonRow
 from app.db.models.season import SeasonRules as SeasonRulesRow
 from app.db.models.season import Week as WeekRow
 from app.domain.models import SeasonRules as DomainSeasonRules
+from app.domain.week_profile import WeekFlags, WeekProfile, flags_for, profile_of
 from app.marketdata.provenance import SYNTHETIC_SOURCE
 
 
 class WeekConfigurationConflict(RuntimeError):
     """An existing week row contradicts what was asked for."""
+
+
+def week_flags(row: WeekRow) -> WeekFlags:
+    """The three durable booleans, read off a persisted week."""
+
+    return WeekFlags(
+        is_real_money=row.is_real_money,
+        counts_toward_standings=row.counts_toward_standings,
+        counts_toward_awards=row.counts_toward_awards,
+    )
 
 
 class SeasonRepository:
@@ -90,7 +101,7 @@ class SeasonRepository:
         return row
 
     def prepare_week(
-        self, *, season_id: uuid.UUID, week_number: int, is_real_money: bool
+        self, *, season_id: uuid.UUID, week_number: int, profile: WeekProfile
     ) -> WeekRow:
         """Create the week PENDING. Creation is not opening.
 
@@ -101,31 +112,36 @@ class SeasonRepository:
         Preparing a week creates the FK target and emits no event, moves no
         bankroll and touches no competitor.
 
-        Idempotent for an identical PENDING week; a contradictory existing
-        row is refused rather than adjusted, because `is_real_money` decides
-        whether a week's results count and silently changing it under a
-        committed slate would rewrite what the season agreed to.
+        Takes a PROFILE, not three loose booleans. All three flags are
+        frozen together, and idempotency requires ALL of them to match: a
+        row that agrees about money but disagrees about standings is not
+        the same week, and adjusting it in place would rewrite what the
+        season already agreed to.
         """
 
+        flags = flags_for(profile)
         existing = self.session.execute(
             select(WeekRow).where(
                 WeekRow.season_id == season_id, WeekRow.week_number == week_number
             )
         ).scalar_one_or_none()
         if existing is not None:
-            if existing.is_real_money != is_real_money:
+            current = week_flags(existing)
+            if current != flags:
                 raise WeekConfigurationConflict(
-                    f"week {week_number} already exists with "
-                    f"is_real_money={existing.is_real_money}, not {is_real_money}. "
-                    "That flag decides whether the week counts; it is not "
-                    "adjusted in place."
+                    f"week {week_number} already exists as "
+                    f"{profile_of(current) or 'NONSTANDARD'} ({current.describe()}), "
+                    f"not {profile} ({flags.describe()}). These flags decide "
+                    "whether the week counts; they are not adjusted in place."
                 )
             return existing
 
         row = WeekRow(
             season_id=season_id,
             week_number=week_number,
-            is_real_money=is_real_money,
+            is_real_money=flags.is_real_money,
+            counts_toward_standings=flags.counts_toward_standings,
+            counts_toward_awards=flags.counts_toward_awards,
             status="PENDING",
             opened_at=None,
         )
@@ -133,27 +149,44 @@ class SeasonRepository:
         self.session.flush()
         return row
 
-    def open_week(self, *, season_id: uuid.UUID, week_number: int, is_real_money: bool, opened_at: datetime) -> WeekRow:
+    def open_week(
+        self, *, season_id: uuid.UUID, week_number: int, profile: WeekProfile,
+        opened_at: datetime,
+    ) -> tuple[WeekRow, bool]:
         """Prepare if needed, then TRANSITION to OPENED.
 
-        Creation and opening are two steps now; this keeps the old
-        single-call ergonomics by doing both, so existing callers are
-        unchanged while production can prepare a week without opening it.
+        Returns `(row, transitioned)`. The flag is what the caller needs to
+        publish `WEEK_OPENED` exactly once: the repository was already
+        idempotent for an OPENED row, but its caller published an event on
+        every call, so a second open emitted a second "the week opened"
+        into the competition log for something that did not happen.
+
+        The row is taken `FOR UPDATE` first, so two concurrent opens
+        serialize and only one of them sees PENDING. Relying on Python call
+        ordering would make the duplicate event a race rather than a bug.
         """
 
-        row = self.prepare_week(
-            season_id=season_id, week_number=week_number, is_real_money=is_real_money
+        self.prepare_week(
+            season_id=season_id, week_number=week_number, profile=profile
         )
+        row = self.session.execute(
+            select(WeekRow)
+            .where(WeekRow.season_id == season_id, WeekRow.week_number == week_number)
+            .with_for_update()
+        ).scalar_one()
+
         if row.status == "OPENED":
-            return row
+            return row, False
         if row.status != "PENDING":
             raise WeekConfigurationConflict(
-                f"week {week_number} is {row.status}; only a PENDING week opens"
+                f"week {week_number} is {row.status}; only a PENDING week opens. "
+                "A closed week is not reopened -- its results are already part "
+                "of the season record."
             )
         row.status = "OPENED"
         row.opened_at = opened_at
         self.session.flush()
-        return row
+        return row, True
 
     def get_week(self, week_id: uuid.UUID) -> WeekRow:
         row = self.session.get(WeekRow, week_id)

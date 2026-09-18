@@ -2062,7 +2062,57 @@ requires each rejected allocator's recorded defect to cite
 production-slot-count evidence. A defect measured at five slots is not
 evidence about a ten-slot season.
 
+### "Rehearsal" was three loose booleans
+
+`Week` carries `is_real_money`, `counts_toward_standings` and
+`counts_toward_awards`, and the preparation CLI asked only about the first
+while the other two defaulted `True`. So `--no-real-money` created a week
+with no money on it that **still counted toward standings and awards** —
+not a rehearsal under any reading of the documents. Three free booleans is
+eight combinations; the documents describe two.
+
+The mapping is read from the documents, not invented: `CONSTITUTION.md` §6
+("Week 0 carries no real wagers / no official bankroll results / no
+standings / no season awards") and `RULES.md` §3 spell the rehearsal shape
+as three false flags; a competitive week is the complement.
+
+| Mode | `is_real_money` | standings | awards |
+| --- | --- | --- | --- |
+| `COMPETITIVE` | true | true | true |
+| `REHEARSAL` | false | false | false |
+
+The CLI now takes `--mode competitive|rehearsal`. Preparation freezes all
+three together, and idempotency requires **all three** to match — a row
+that agrees about money and differs about standings is not the same week.
+Anything matching no reviewed profile is reported `NONSTANDARD` rather than
+named after the nearest one; a half-rehearsal is a state nobody approved
+and guessing would hide it.
+
+Week 0 is preparable: `CONSTITUTION.md` §6 puts it at `week_number = 0`, so
+refusing zero would make the documented rehearsal week unpreparable.
+Registration keeps its own `>= 1` guard, because a `Game` must belong to a
+real NFL week.
+
+### WEEK_OPENED fired on every call
+
+The repository was already idempotent for an `OPENED` row, but the
+commissioner published `WEEK_OPENED` after **every** call — writing a second
+"the week opened" into the competition log for something that did not
+happen. The repository now returns `(row, transitioned)` and the event
+follows the transition, not the call.
+
+It takes the row `FOR UPDATE` first, so two concurrent opens serialize and
+exactly one sees `PENDING`. Relying on Python call ordering would have made
+the duplicate event a race rather than a bug. A `CLOSED` week never
+reopens — its results are already part of the season record.
+
 ### Acceptance
+
+611 passed, 4 skipped. Ten mutations on this pass; the two that survived
+first — idempotency comparing only the money flag, and readiness printing
+only the money flag — each got a test and now fail.
+
+### Earlier acceptance
 
 598 passed, 4 skipped. Five mutations on this pass, including the
 provisioner drifting to five and a rejection reason losing its evidence.

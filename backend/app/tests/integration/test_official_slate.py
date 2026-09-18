@@ -25,6 +25,7 @@ from app.db.models.forecast_lab import (
 from app.db.models.markets import Game
 from app.db.models.season import Season, SeasonRules, Week
 from app.db.session import session_scope
+from app.domain.week_profile import WeekProfile, flags_for
 from app.forecast_lab.benchmark_slate_service import (
     SlateBindingRefused,
     bind_fixture_to_game,
@@ -152,8 +153,17 @@ def _season(tag, *, method="STABLE_HASH_V1", slate_size=PRODUCTION_SLATE_SIZE,
             effective_from=datetime(2026, 9, 1, tzinfo=timezone.utc),
         ))
         if week_number is not None:
-            session.add(Week(season_id=season.id, week_number=week_number,
-                             is_real_money=False))
+            # A REVIEWED profile. Setting is_real_money alone leaves
+            # standings and awards at their column default of True, which is
+            # the half-rehearsal state the week-profile work exists to make
+            # unreachable -- and readiness correctly reports it NONSTANDARD.
+            flags = flags_for(WeekProfile.REHEARSAL)
+            session.add(Week(
+                season_id=season.id, week_number=week_number,
+                is_real_money=flags.is_real_money,
+                counts_toward_standings=flags.counts_toward_standings,
+                counts_toward_awards=flags.counts_toward_awards,
+            ))
         return season.id
 
 
@@ -1223,8 +1233,34 @@ def test_readiness_reports_a_pending_week_as_committable():
     assert report.week_status == "PENDING"
     text = report.render()
     assert "week row                PRESENT" in text
-    assert "is PENDING" in text
+    # All THREE durable flags, not just the money one. A report that showed
+    # only is_real_money would read identically for a rehearsal and for a
+    # half-rehearsal that still counts toward standings and awards.
+    assert "week mode               REHEARSAL" in text
+    assert "is_real_money           False" in text
+    assert "counts_toward_standings False" in text
+    assert "counts_toward_awards    False" in text
+    assert "is PENDING REHEARSAL" in text
     assert "A slate may be committed against it" in text
+
+
+def test_readiness_reports_a_half_rehearsal_week_as_nonstandard():
+    """The exact state the old preparation CLI could create: no money on
+    it, still counting toward standings and awards. Not a rehearsal with a
+    typo -- a combination nobody approved."""
+
+    season_id = _season("nonstandard-week", week_number=None)
+    with session_scope() as session:
+        session.add(Week(
+            season_id=season_id, week_number=3, is_real_money=False,
+            counts_toward_standings=True, counts_toward_awards=True,
+        ))
+
+    report = _readiness(season_id)
+    assert report.week_profile == "NONSTANDARD"
+    text = report.render()
+    assert "week mode               NONSTANDARD" in text
+    assert "half rehearsal and half competitive" in text
 
 
 def test_readiness_reports_an_opened_week_distinctly():

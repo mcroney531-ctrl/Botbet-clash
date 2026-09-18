@@ -26,8 +26,12 @@ from typing import Sequence
 from sqlalchemy import select
 
 from app.db.models.season import Season, Week
-from app.db.repositories.season_repository import WeekConfigurationConflict
+from app.db.repositories.season_repository import (
+    WeekConfigurationConflict,
+    week_flags,
+)
 from app.db.session import session_scope
+from app.domain.week_profile import WeekFlags, WeekProfile, flags_for, profile_of
 from app.services.season_commissioner import SeasonCommissioner
 
 
@@ -40,12 +44,16 @@ class WeekPreparation:
     season_id: uuid.UUID
     season_name: str
     week_number: int
-    is_real_money: bool
+    profile: WeekProfile
     existing_id: uuid.UUID | None = None
     existing_status: str | None = None
-    existing_real_money: bool | None = None
+    existing_flags: WeekFlags | None = None
     applied: bool = False
     week_id: uuid.UUID | None = None
+
+    @property
+    def flags(self) -> WeekFlags:
+        return flags_for(self.profile)
 
     @property
     def already_present(self) -> bool:
@@ -58,16 +66,25 @@ class WeekPreparation:
             "=" * 74,
             f"  season          {self.season_name}  ({self.season_id})",
             f"  week number     {self.week_number}",
-            f"  is_real_money   {self.is_real_money}",
+            f"  mode            {self.profile}",
+            "",
+            "  --- the three durable flags this freezes -----------------------",
+            f"    is_real_money              {self.flags.is_real_money}",
+            f"    counts_toward_standings    {self.flags.counts_toward_standings}",
+            f"    counts_toward_awards       {self.flags.counts_toward_awards}",
             "",
         ]
         if self.already_present:
+            existing_profile = profile_of(self.existing_flags) or "NONSTANDARD"
             out += [
                 f"  EXISTS ALREADY  {self.existing_id}",
                 f"    status        {self.existing_status}",
-                f"    is_real_money {self.existing_real_money}",
+                f"    mode          {existing_profile}",
+                f"    flags         {self.existing_flags.describe()}",
                 "",
-                "  Nothing to do. Preparation is idempotent for an identical week.",
+                "  Nothing to do. Preparation is idempotent only when ALL three",
+                "  flags match, so this is the same week, not merely the same",
+                "  number.",
             ]
         else:
             out += [
@@ -82,11 +99,15 @@ class WeekPreparation:
 
 
 def plan_preparation(
-    *, season_id: uuid.UUID, week_number: int, is_real_money: bool
+    *, season_id: uuid.UUID, week_number: int, profile: WeekProfile
 ) -> WeekPreparation:
-    if week_number < 1:
+    # Week 0 is allowed here, unlike in registration. CONSTITUTION.md §6 and
+    # RULES.md §3 define a formal Week 0 at `week_number = 0`, so refusing it
+    # would make the documented rehearsal week unpreparable. Registration
+    # keeps its own >= 1 guard, because a Game must belong to a real NFL week.
+    if week_number < 0:
         raise WeekPreparationRefused(
-            f"--week-number must be a real NFL week, got {week_number}"
+            f"--week-number cannot be negative, got {week_number}"
         )
     with session_scope() as session:
         season = session.get(Season, season_id)
@@ -94,7 +115,7 @@ def plan_preparation(
             raise WeekPreparationRefused(f"season {season_id} not found")
         plan = WeekPreparation(
             season_id=season_id, season_name=season.name,
-            week_number=week_number, is_real_money=is_real_money,
+            week_number=week_number, profile=profile,
         )
         existing = session.execute(
             select(Week).where(
@@ -104,27 +125,29 @@ def plan_preparation(
         if existing is not None:
             plan.existing_id = existing.id
             plan.existing_status = existing.status
-            plan.existing_real_money = existing.is_real_money
-            if existing.is_real_money != is_real_money:
+            plan.existing_flags = week_flags(existing)
+            if plan.existing_flags != plan.flags:
                 raise WeekPreparationRefused(
-                    f"week {week_number} already exists with "
-                    f"is_real_money={existing.is_real_money}, not {is_real_money}. "
-                    "That flag decides whether the week counts toward the season; "
-                    "it is not adjusted in place."
+                    f"week {week_number} already exists as "
+                    f"{profile_of(plan.existing_flags) or 'NONSTANDARD'}\n"
+                    f"    existing:  {plan.existing_flags.describe()}\n"
+                    f"    requested: {plan.flags.describe()}\n"
+                    "  These flags decide whether the week counts toward the "
+                    "season. They are frozen together and not adjusted in place."
                 )
         return plan
 
 
 def apply_preparation(
-    *, season_id: uuid.UUID, week_number: int, is_real_money: bool
+    *, season_id: uuid.UUID, week_number: int, profile: WeekProfile
 ) -> WeekPreparation:
     plan = plan_preparation(
-        season_id=season_id, week_number=week_number, is_real_money=is_real_money
+        season_id=season_id, week_number=week_number, profile=profile
     )
     commissioner = SeasonCommissioner(season_id=season_id)
     try:
         week_id = commissioner.prepare_week(
-            week_number=week_number, is_real_money=is_real_money
+            week_number=week_number, profile=profile
         )
     except WeekConfigurationConflict as exc:
         raise WeekPreparationRefused(str(exc)) from exc
@@ -141,9 +164,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--season-id", required=True, type=uuid.UUID)
     parser.add_argument("--week-number", required=True, type=int)
     parser.add_argument(
-        "--real-money", action=argparse.BooleanOptionalAction, required=True,
-        help="whether this week's results count toward the season. Required "
-             "rather than defaulted: it is not adjustable afterwards.",
+        "--mode", required=True, choices=[p.value.lower() for p in WeekProfile],
+        help="which reviewed week profile to freeze. A MODE rather than three "
+             "loose booleans: --no-real-money used to leave a week that still "
+             "counted toward standings and awards, which is not a rehearsal "
+             "under RULES.md §3 or CONSTITUTION.md §6. Not adjustable "
+             "afterwards.",
     )
     parser.add_argument(
         "--apply", action="store_true",
@@ -152,15 +178,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
+        profile = WeekProfile(args.mode.upper())
         if args.apply:
             plan = apply_preparation(
                 season_id=args.season_id, week_number=args.week_number,
-                is_real_money=args.real_money,
+                profile=profile,
             )
         else:
             plan = plan_preparation(
                 season_id=args.season_id, week_number=args.week_number,
-                is_real_money=args.real_money,
+                profile=profile,
             )
     except WeekPreparationRefused as exc:
         print("REFUSED — nothing written.")

@@ -42,7 +42,9 @@ from app.db.models.forecast_lab import (
 )
 from app.db.models.markets import CheckpointRun, Game
 from app.db.models.season import Week
+from app.db.repositories.season_repository import week_flags
 from app.db.session import session_scope
+from app.domain.week_profile import WeekFlags, profile_of
 from app.forecast_lab.checkpoint_window import compute_window
 from app.forecast_lab.fixture_identity import FixtureKey, planned_pool
 from app.marketdata.game_registration import (
@@ -93,8 +95,21 @@ class WeekReadiness:
     slot_count: int = 0
     week_id: uuid.UUID | None = None
     week_status: str | None = None
-    week_is_real_money: bool | None = None
+    week_flags: WeekFlags | None = None
     week_opened_at: datetime | None = None
+
+    @property
+    def week_profile(self) -> str:
+        """The reviewed profile these flags are, or NONSTANDARD.
+
+        Never a best guess. "No real money but it still counts toward
+        awards" is not a rehearsal with a typo; it is a combination nobody
+        approved, and naming it after the nearest profile would hide that.
+        """
+
+        if self.week_flags is None:
+            return "—"
+        return str(profile_of(self.week_flags) or "NONSTANDARD")
     fixtures: list[FixtureReadiness] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
@@ -144,7 +159,10 @@ class WeekReadiness:
             out += [
                 f"  week id                 {self.week_id}",
                 f"  week status             {self.week_status}",
-                f"  is_real_money           {self.week_is_real_money}",
+                f"  week mode               {self.week_profile}",
+                f"  is_real_money           {self.week_flags.is_real_money}",
+                f"  counts_toward_standings {self.week_flags.counts_toward_standings}",
+                f"  counts_toward_awards    {self.week_flags.counts_toward_awards}",
                 f"  opened_at               "
                 f"{self.week_opened_at.isoformat() if self.week_opened_at else '—'}",
             ]
@@ -219,14 +237,21 @@ class WeekReadiness:
                 "Preparing a week creates it PENDING; it does not open the "
                 "competition. See app.services.prepare_week."
             )
+        elif self.week_profile == "NONSTANDARD":
+            lines.append(
+                f"Week row {self.week_id} has a NONSTANDARD profile "
+                f"({self.week_flags.describe()}). It matches no reviewed week "
+                "mode; a week that is half rehearsal and half competitive is "
+                "not a state anyone approved."
+            )
         elif self.week_status == "PENDING":
             lines.append(
-                f"Week row {self.week_id} is PENDING — prepared, not opened. "
-                "A slate may be committed against it."
+                f"Week row {self.week_id} is PENDING {self.week_profile} — "
+                "prepared, not opened. A slate may be committed against it."
             )
         elif self.week_status == "OPENED":
             lines.append(
-                f"Week row {self.week_id} is OPENED"
+                f"Week row {self.week_id} is OPENED {self.week_profile}"
                 + (f" at {self.week_opened_at.isoformat()}" if self.week_opened_at else "")
                 + " — the competition week has begun."
             )
@@ -298,7 +323,7 @@ def assess_week(
         if week is not None:
             report.week_id = week.id
             report.week_status = week.status
-            report.week_is_real_money = week.is_real_money
+            report.week_flags = week_flags(week)
             report.week_opened_at = week.opened_at
             plan = session.execute(
                 select(BenchmarkSlatePlan).where(BenchmarkSlatePlan.week_id == week.id)

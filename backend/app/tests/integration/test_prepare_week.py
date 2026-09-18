@@ -19,6 +19,7 @@ from app.db.models.events import CompetitionEvent
 from app.db.models.markets import Game
 from app.db.models.season import Season, SeasonRules, Week
 from app.db.session import session_scope
+from app.domain.week_profile import WEEK_PROFILES, WeekFlags, WeekProfile, profile_of
 from app.services.prepare_week import (
     WeekPreparationRefused,
     apply_preparation,
@@ -69,7 +70,7 @@ def _count(model) -> int:
 
 def test_a_prepared_week_is_pending_and_not_opened():
     season_id = _season("pending")
-    apply_preparation(season_id=season_id, week_number=4, is_real_money=False)
+    apply_preparation(season_id=season_id, week_number=4, profile=WeekProfile.REHEARSAL)
 
     week = _week(season_id)
     assert week is not None
@@ -83,7 +84,7 @@ def test_preparing_emits_no_week_opened_event():
 
     season_id = _season("no-event")
     before = _count(CompetitionEvent)
-    apply_preparation(season_id=season_id, week_number=4, is_real_money=False)
+    apply_preparation(season_id=season_id, week_number=4, profile=WeekProfile.REHEARSAL)
     assert _count(CompetitionEvent) == before
 
 
@@ -93,14 +94,14 @@ def test_preparing_touches_nothing_else():
 
     season_id = _season("narrow")
     before = (_count(Game), _count(BankrollTransaction), _count(BenchmarkSlatePlan))
-    apply_preparation(season_id=season_id, week_number=4, is_real_money=False)
+    apply_preparation(season_id=season_id, week_number=4, profile=WeekProfile.REHEARSAL)
     assert (_count(Game), _count(BankrollTransaction), _count(BenchmarkSlatePlan)) == before
 
 
 def test_preparation_is_idempotent():
     season_id = _season("idempotent")
-    first = apply_preparation(season_id=season_id, week_number=4, is_real_money=False)
-    second = apply_preparation(season_id=season_id, week_number=4, is_real_money=False)
+    first = apply_preparation(season_id=season_id, week_number=4, profile=WeekProfile.REHEARSAL)
+    second = apply_preparation(season_id=season_id, week_number=4, profile=WeekProfile.REHEARSAL)
     assert first.week_id == second.week_id
     with session_scope() as session:
         assert session.execute(
@@ -108,15 +109,17 @@ def test_preparation_is_idempotent():
         ).scalar() == 1
 
 
-def test_a_contradictory_real_money_flag_is_refused_not_adjusted():
-    """That flag decides whether a week counts toward the season. Changing
-    it under an already-committed slate would rewrite what was agreed."""
+def test_a_contradictory_profile_is_refused_not_adjusted():
+    """These flags decide whether a week counts toward the season. Changing
+    them under an already-committed slate would rewrite what was agreed."""
 
     season_id = _season("conflict")
-    apply_preparation(season_id=season_id, week_number=4, is_real_money=False)
-    with pytest.raises(WeekPreparationRefused, match="is not adjusted in place"):
-        apply_preparation(season_id=season_id, week_number=4, is_real_money=True)
-    assert _week(season_id).is_real_money is False
+    apply_preparation(season_id=season_id, week_number=4, profile=WeekProfile.REHEARSAL)
+    with pytest.raises(WeekPreparationRefused, match="not adjusted in place"):
+        apply_preparation(season_id=season_id, week_number=4, profile=WeekProfile.COMPETITIVE)
+    week = _week(season_id)
+    assert (week.is_real_money, week.counts_toward_standings, week.counts_toward_awards) \
+        == (False, False, False)
 
 
 def test_the_repository_refuses_a_conflicting_flag_on_its_own():
@@ -132,14 +135,60 @@ def test_the_repository_refuses_a_conflicting_flag_on_its_own():
     season_id = _season("repo-guard")
     with session_scope() as session:
         SeasonRepository(session).prepare_week(
-            season_id=season_id, week_number=4, is_real_money=False
+            season_id=season_id, week_number=4, profile=WeekProfile.REHEARSAL
         )
     with pytest.raises(WeekConfigurationConflict, match="not adjusted in place"):
         with session_scope() as session:
             SeasonRepository(session).prepare_week(
-                season_id=season_id, week_number=4, is_real_money=True
+                season_id=season_id, week_number=4, profile=WeekProfile.COMPETITIVE
             )
     assert _week(season_id).is_real_money is False
+
+
+def test_idempotency_checks_all_three_flags_not_just_the_money():
+    """Two profiles that AGREE about money and differ about standings must
+    not be treated as the same week. Comparing only `is_real_money` would
+    accept a half-rehearsal row as a match for a rehearsal request -- the
+    exact confusion week profiles exist to remove."""
+
+    from app.db.repositories.season_repository import (
+        SeasonRepository,
+        WeekConfigurationConflict,
+    )
+
+    season_id = _season("same-money-different-week")
+    with session_scope() as session:
+        # A half-rehearsal planted directly: no money, but it counts.
+        session.add(Week(
+            season_id=season_id, week_number=4, is_real_money=False,
+            counts_toward_standings=True, counts_toward_awards=True,
+            status="PENDING",
+        ))
+
+    with pytest.raises(WeekConfigurationConflict, match="not adjusted in place"):
+        with session_scope() as session:
+            SeasonRepository(session).prepare_week(
+                season_id=season_id, week_number=4, profile=WeekProfile.REHEARSAL
+            )
+
+    week = _week(season_id)
+    assert (week.counts_toward_standings, week.counts_toward_awards) == (True, True), (
+        "the conflicting row was adjusted rather than refused"
+    )
+
+
+def test_the_service_also_refuses_a_money_matching_profile_mismatch():
+    season_id = _season("service-same-money")
+    with session_scope() as session:
+        session.add(Week(
+            season_id=season_id, week_number=4, is_real_money=False,
+            counts_toward_standings=True, counts_toward_awards=False,
+            status="PENDING",
+        ))
+    with pytest.raises(WeekPreparationRefused, match="NONSTANDARD"):
+        plan_preparation(
+            season_id=season_id, week_number=4, profile=WeekProfile.REHEARSAL
+        )
 
 
 def test_the_repository_returns_the_same_row_for_an_identical_request():
@@ -148,11 +197,11 @@ def test_the_repository_returns_the_same_row_for_an_identical_request():
     season_id = _season("repo-idempotent")
     with session_scope() as session:
         first = SeasonRepository(session).prepare_week(
-            season_id=season_id, week_number=4, is_real_money=False
+            season_id=season_id, week_number=4, profile=WeekProfile.REHEARSAL
         ).id
     with session_scope() as session:
         second = SeasonRepository(session).prepare_week(
-            season_id=season_id, week_number=4, is_real_money=False
+            season_id=season_id, week_number=4, profile=WeekProfile.REHEARSAL
         ).id
     assert first == second
 
@@ -161,10 +210,10 @@ def test_opening_transitions_a_prepared_week_rather_than_creating_one():
     from app.services.season_commissioner import SeasonCommissioner
 
     season_id = _season("transition")
-    prepared = apply_preparation(season_id=season_id, week_number=4, is_real_money=False)
+    prepared = apply_preparation(season_id=season_id, week_number=4, profile=WeekProfile.REHEARSAL)
 
     opened_id = SeasonCommissioner(season_id=season_id).open_week(
-        week_number=4, is_real_money=False
+        week_number=4, profile=WeekProfile.REHEARSAL
     )
     assert uuid.UUID(opened_id) == prepared.week_id, "opening created a second row"
 
@@ -193,7 +242,7 @@ def test_opening_without_preparing_first_still_works():
 def test_the_dry_run_writes_nothing(capsys):
     season_id = _season("dry")
     code = main([
-        "--season-id", str(season_id), "--week-number", "4", "--no-real-money",
+        "--season-id", str(season_id), "--week-number", "4", "--mode", "rehearsal",
     ])
     out = capsys.readouterr().out
     assert code == 0
@@ -205,22 +254,37 @@ def test_the_dry_run_writes_nothing(capsys):
 
 def test_the_dry_run_reports_an_existing_week(capsys):
     season_id = _season("dry-existing")
-    apply_preparation(season_id=season_id, week_number=4, is_real_money=False)
-    main(["--season-id", str(season_id), "--week-number", "4", "--no-real-money"])
+    apply_preparation(season_id=season_id, week_number=4, profile=WeekProfile.REHEARSAL)
+    main(["--season-id", str(season_id), "--week-number", "4", "--mode", "rehearsal"])
     out = capsys.readouterr().out
     assert "EXISTS ALREADY" in out
     assert "PENDING" in out
 
 
-def test_week_zero_is_refused():
+def test_week_zero_is_allowed_because_the_documents_define_it():
+    """CONSTITUTION.md §6 and RULES.md §3 define a formal Week 0 at
+    `week_number = 0`. Refusing it here would make the documented rehearsal
+    week unpreparable. Registration keeps its own >= 1 guard, because a Game
+    must belong to a real NFL week."""
+
     season_id = _season("week-zero")
-    with pytest.raises(WeekPreparationRefused, match="real NFL week"):
-        plan_preparation(season_id=season_id, week_number=0, is_real_money=False)
+    plan = plan_preparation(
+        season_id=season_id, week_number=0, profile=WeekProfile.REHEARSAL
+    )
+    assert plan.week_number == 0
+
+
+def test_a_negative_week_is_refused():
+    season_id = _season("week-negative")
+    with pytest.raises(WeekPreparationRefused, match="cannot be negative"):
+        plan_preparation(
+            season_id=season_id, week_number=-1, profile=WeekProfile.REHEARSAL
+        )
 
 
 def test_the_cli_refuses_cleanly(capsys):
     code = main([
-        "--season-id", str(uuid.uuid4()), "--week-number", "4", "--no-real-money",
+        "--season-id", str(uuid.uuid4()), "--week-number", "4", "--mode", "rehearsal",
     ])
     out = capsys.readouterr().out
     assert code == 1
@@ -241,3 +305,171 @@ def test_preparation_reaches_no_provider():
     for forbidden in ("fetch_schedule", "list_events", "fetch_quotes",
                       "TheOddsApiProvider", "commit_official_slate"):
         assert forbidden not in names, f"week preparation reaches {forbidden}"
+
+
+# --- the profiles are read from the documents, not invented -------------
+
+
+def test_the_two_profiles_match_the_governing_documents():
+    """CONSTITUTION.md §6: Week 0 carries "no real wagers / no official
+    bankroll results / no standings / no season awards". RULES.md §3 spells
+    the same thing as three false flags. A competitive week is the
+    complement."""
+
+    assert WEEK_PROFILES[WeekProfile.REHEARSAL] == WeekFlags(False, False, False)
+    assert WEEK_PROFILES[WeekProfile.COMPETITIVE] == WeekFlags(True, True, True)
+    assert len(WEEK_PROFILES) == 2, (
+        "a third profile appeared; modes are read from the documents, not "
+        "invented, so a new one needs a documented requirement"
+    )
+
+
+def test_preparation_persists_all_three_flags():
+    for mode, expected in (
+        (WeekProfile.REHEARSAL, (False, False, False)),
+        (WeekProfile.COMPETITIVE, (True, True, True)),
+    ):
+        season_id = _season(f"flags-{mode}")
+        apply_preparation(season_id=season_id, week_number=4, profile=mode)
+        week = _week(season_id)
+        assert (
+            week.is_real_money, week.counts_toward_standings, week.counts_toward_awards
+        ) == expected, f"{mode} did not persist {expected}"
+
+
+def test_a_half_rehearsal_is_nonstandard_not_a_rehearsal():
+    """The exact state the old CLI could create: no money on it, still
+    counting toward standings and awards."""
+
+    assert profile_of(WeekFlags(False, True, True)) is None
+    assert profile_of(WeekFlags(True, False, False)) is None
+
+
+def test_the_cli_has_no_loose_boolean_interface():
+    """--no-real-money used to leave standings and awards True. A mode
+    selects a reviewed combination instead."""
+
+    import pytest as _pytest
+
+    # Introspected, not grepped out of the help text -- the help PROSE
+    # deliberately mentions the old flag to explain why it is gone.
+    with _pytest.raises(SystemExit):
+        main(["--season-id", str(uuid.uuid4()), "--week-number", "4",
+              "--no-real-money"])
+    with _pytest.raises(SystemExit):
+        main(["--season-id", str(uuid.uuid4()), "--week-number", "4",
+              "--real-money"])
+    with _pytest.raises(SystemExit):
+        # A mode is required; there is no default that silently picks one.
+        main(["--season-id", str(uuid.uuid4()), "--week-number", "4"])
+
+
+# --- WEEK_OPENED fires exactly once ------------------------------------
+
+
+def _week_opened(season_id) -> int:
+    with session_scope() as session:
+        return session.execute(
+            select(func.count()).select_from(CompetitionEvent).where(
+                CompetitionEvent.season_id == season_id,
+                CompetitionEvent.event_type == "WEEK_OPENED",
+            )
+        ).scalar()
+
+
+def test_the_first_open_emits_exactly_one_week_opened():
+    from app.services.season_commissioner import SeasonCommissioner
+
+    season_id = _season("open-once")
+    SeasonCommissioner(season_id=season_id).open_week(
+        week_number=4, profile=WeekProfile.REHEARSAL
+    )
+    assert _week_opened(season_id) == 1
+
+
+def test_a_repeated_open_emits_no_second_event():
+    """The repository was already idempotent, but the commissioner
+    published on every call -- writing a second "the week opened" into the
+    competition log for something that did not happen."""
+
+    from app.services.season_commissioner import SeasonCommissioner
+
+    season_id = _season("open-twice")
+    commissioner = SeasonCommissioner(season_id=season_id)
+    first = commissioner.open_week(week_number=4, profile=WeekProfile.REHEARSAL)
+    second = commissioner.open_week(week_number=4, profile=WeekProfile.REHEARSAL)
+    assert first == second
+    assert _week_opened(season_id) == 1
+
+
+def test_two_concurrent_opens_emit_exactly_one_event():
+    """Serialized by a row lock, not by Python call ordering -- otherwise
+    the duplicate event is a race rather than a bug."""
+
+    import threading
+
+    from app.services.season_commissioner import SeasonCommissioner
+
+    season_id = _season("open-race")
+    apply_preparation(season_id=season_id, week_number=4, profile=WeekProfile.REHEARSAL)
+    start = threading.Barrier(2)
+    errors: list[str] = []
+
+    def worker():
+        try:
+            start.wait(timeout=10)
+            SeasonCommissioner(season_id=season_id).open_week(
+                week_number=4, profile=WeekProfile.REHEARSAL
+            )
+        except Exception as exc:  # pragma: no cover - diagnostic
+            errors.append(f"{type(exc).__name__}: {exc}")
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+
+    assert errors == [], errors
+    assert _week_opened(season_id) == 1, "two opens wrote two WEEK_OPENED events"
+    assert _week(season_id).status == "OPENED"
+
+
+def test_a_closed_week_never_reopens():
+    from app.db.repositories.season_repository import (
+        SeasonRepository,
+        WeekConfigurationConflict,
+    )
+    from app.services.season_commissioner import SeasonCommissioner
+
+    season_id = _season("closed")
+    week_id = uuid.UUID(
+        SeasonCommissioner(season_id=season_id).open_week(
+            week_number=4, profile=WeekProfile.REHEARSAL
+        )
+    )
+    with session_scope() as session:
+        SeasonRepository(session).close_week(week_id, closed_at=NOW)
+
+    with pytest.raises(WeekConfigurationConflict, match="not reopened"):
+        SeasonCommissioner(season_id=season_id).open_week(
+            week_number=4, profile=WeekProfile.REHEARSAL
+        )
+    assert _week(season_id).status == "CLOSED"
+    assert _week_opened(season_id) == 1
+
+
+def test_opening_locks_the_row_rather_than_trusting_call_order():
+    import ast
+    import inspect
+    import textwrap
+
+    from app.db.repositories.season_repository import SeasonRepository
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(SeasonRepository.open_week)))
+    locked = [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "with_for_update"
+    ]
+    assert locked, "open_week reads the week without locking it"

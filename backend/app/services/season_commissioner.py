@@ -51,6 +51,7 @@ from app.db.repositories.ledger_repository import LedgerRepository
 from app.db.repositories.market_repository import MarketRepository
 from app.db.repositories.season_repository import SeasonRepository
 from app.db.session import session_scope
+from app.domain.week_profile import WeekProfile
 from app.domain.enums import (
     CompetitionEventType,
     CompetitorStatus,
@@ -179,7 +180,7 @@ class SeasonCommissioner:
 
     # -- weeks -------------------------------------------------------------
 
-    def prepare_week(self, *, week_number: int, is_real_money: bool) -> str:
+    def prepare_week(self, *, week_number: int, profile: WeekProfile) -> str:
         """Create the week PENDING without opening the competition.
 
         A benchmark slate must be committed before the first OPENING
@@ -196,18 +197,46 @@ class SeasonCommissioner:
 
         with session_scope() as session:
             week = SeasonRepository(session).prepare_week(
-                season_id=self.season_id, week_number=week_number,
-                is_real_money=is_real_money,
+                season_id=self.season_id, week_number=week_number, profile=profile,
             )
             return str(week.id)
 
-    def open_week(self, *, week_number: int, is_real_money: bool) -> str:
-        with session_scope() as session:
-            week = SeasonRepository(session).open_week(
-                season_id=self.season_id, week_number=week_number, is_real_money=is_real_money, opened_at=self.clock.now()
+    def open_week(
+        self, *, week_number: int, is_real_money: bool | None = None,
+        profile: WeekProfile | None = None,
+    ) -> str:
+        """Open the week, publishing WEEK_OPENED for a REAL transition only.
+
+        The repository was already idempotent for an OPENED row, but this
+        published on every call -- so a second open wrote a second "the week
+        opened" into the competition log for something that did not happen.
+        The repository now reports whether it transitioned, and the event
+        follows that rather than the call.
+
+        `is_real_money` is kept for existing callers and maps to the
+        matching reviewed profile, which is the coherent reading: a week
+        with real money on it counts, and one without it does not. New
+        production callers pass `profile` and say so explicitly.
+        """
+
+        if profile is None:
+            if is_real_money is None:
+                raise ValueError("open_week needs a profile (or is_real_money)")
+            profile = (
+                WeekProfile.COMPETITIVE if is_real_money else WeekProfile.REHEARSAL
             )
-            self._publish(session, week_id=week.id, season_competitor_id=None, event_type=CompetitionEventType.WEEK_OPENED,
-                           payload={"week_number": week_number})
+
+        with session_scope() as session:
+            week, transitioned = SeasonRepository(session).open_week(
+                season_id=self.season_id, week_number=week_number,
+                profile=profile, opened_at=self.clock.now(),
+            )
+            if transitioned:
+                self._publish(
+                    session, week_id=week.id, season_competitor_id=None,
+                    event_type=CompetitionEventType.WEEK_OPENED,
+                    payload={"week_number": week_number, "profile": str(profile)},
+                )
             return str(week.id)
 
     def close_week(self, week_id: str) -> None:
