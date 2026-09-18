@@ -1735,9 +1735,31 @@ and CHECK on `game_scope_corrections` are evaluated at that flush, so a
 correction that cannot name its schedule call fails *before* `Game` is
 touched.
 
+### A refusal is an outcome, not a crash
+
+The first live refusal — a second dry run after the DET correction had
+already landed, so the row said 2 when the guard expected 3 — printed a
+Python traceback. The guard worked exactly as designed and the output read
+like the tool broke.
+
+Refusal is this tool's normal, designed outcome: a stale expected week, an
+unresolvable fixture, a disputed kickoff, an unreachable schedule, a
+no-op. `main` now catches `RepairRefused` and `ScheduleSourceUnavailable`
+at both the plan and the write step, prints `REFUSED — nothing written`
+with the wrapped reason, and returns exit code 1. The apply step gets its
+own handler because it re-checks under the row lock and can still refuse
+after a clean plan.
+
+`main` also gained the `schedule_provider` test seam that
+`register_week_events` already had. Without it, a test of this entry point
+fetched the live nflverse release — slow, network-dependent, and quietly
+coupled to the real 2026 schedule agreeing with its fixtures. No CLI flag
+reaches the seam; the season's frozen roster pin still chooses the
+implementation in production.
+
 ### Acceptance
 
-455 passed, 4 skipped. Mutation-tested twenty-two ways across both passes.
+457 passed, 4 skipped. Mutation-tested twenty-two ways across both passes.
 The census half: deleting each of the benchmark-slot, ticket, wager,
 bankroll, pass-decision, research-settlement and stake-recommendation
 traversals; ignoring `BenchmarkSlot.resolved_market_id`; deleting the

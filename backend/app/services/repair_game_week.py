@@ -37,6 +37,7 @@ Dry run by default. `--apply` required.
 from __future__ import annotations
 
 import argparse
+import textwrap
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -76,7 +77,11 @@ from app.db.models.settlement import (
     Settlement,
 )
 from app.db.session import session_scope
-from app.marketdata.game_registration import _schedule_provider_for, _season_pins
+from app.marketdata.game_registration import (
+    ScheduleSourceUnavailable,
+    _schedule_provider_for,
+    _season_pins,
+)
 from app.marketdata.telemetry import finish_run, record_call, start_run
 from app.marketdata.week_resolution import (
     RESOLVER_VERSION,
@@ -820,7 +825,17 @@ def apply_repair(
 # the resolver version, which is the provenance a correction owes.
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(argv: Sequence[str] | None = None, *, schedule_provider=None) -> int:
+    """`schedule_provider` is a TEST SEAM only -- no CLI flag reaches it.
+
+    The same seam `register_week_events` uses, for the same reason: without
+    it a test of this entry point fetches the live nflverse release, which
+    makes the suite slow, network-dependent, and quietly dependent on the
+    real 2026 schedule agreeing with its fixtures. It cannot be used to
+    substitute a schedule from the command line -- the season's frozen
+    roster pin still chooses the implementation in production.
+    """
+
     parser = argparse.ArgumentParser(
         description="Audited correction of a game's week_number. The SCHEDULE "
                     "decides the corrected week; no flag can supply it.",
@@ -846,16 +861,32 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    verdict = derive_authoritative_week(game_id=args.game_id)
-
-    with session_scope() as session:
-        plan = plan_repair(
-            session, verdict=verdict,
-            expected_current_week=args.expect_current_week,
-            expect_authoritative_week=args.expect_authoritative_week,
-            reason=args.reason,
+    # A refusal is this tool's NORMAL, DESIGNED outcome -- a stale expected
+    # week, an unresolvable fixture, a disputed kickoff, an unreachable
+    # schedule, a no-op. Letting `RepairRefused` escape printed a traceback
+    # for all of them, which reads like the tool broke rather than like the
+    # tool worked. The guard firing is the success signal; it should look
+    # like one, and the exit code carries the outcome for anything scripting
+    # this.
+    try:
+        verdict = derive_authoritative_week(
+            game_id=args.game_id, schedule_provider=schedule_provider,
         )
-        print(plan.render())
+
+        with session_scope() as session:
+            plan = plan_repair(
+                session, verdict=verdict,
+                expected_current_week=args.expect_current_week,
+                expect_authoritative_week=args.expect_authoritative_week,
+                reason=args.reason,
+            )
+            print(plan.render())
+    except (RepairRefused, ScheduleSourceUnavailable) as exc:
+        print("REFUSED — nothing written.")
+        print()
+        for line in textwrap.wrap(str(exc), 74):
+            print(f"  {line}")
+        return 1
 
     if not plan.safe:
         print()
@@ -866,17 +897,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("DRY RUN — no Game row written. Re-run with --apply to correct it.")
         return 0
 
-    with session_scope() as session:
-        correction = apply_repair(
-            session, verdict=verdict,
-            expected_current_week=args.expect_current_week,
-            expect_authoritative_week=args.expect_authoritative_week,
-            reason=args.reason,
-        )
+    # Re-checked under the row lock in here, so it can still refuse even
+    # though the plan above was safe: the dry run and this write are
+    # separate transactions and the row may have moved between them.
+    try:
+        with session_scope() as session:
+            correction = apply_repair(
+                session, verdict=verdict,
+                expected_current_week=args.expect_current_week,
+                expect_authoritative_week=args.expect_authoritative_week,
+                reason=args.reason,
+            )
+            print()
+            print(f"APPLIED. Audit row {correction.id}: week_number "
+                  f"{correction.old_value} -> {correction.new_value} "
+                  f"(schedule call {correction.schedule_provider_call_id})")
+    except (RepairRefused, ScheduleSourceUnavailable) as exc:
         print()
-        print(f"APPLIED. Audit row {correction.id}: week_number "
-              f"{correction.old_value} -> {correction.new_value} "
-              f"(schedule call {correction.schedule_provider_call_id})")
+        print("REFUSED at write time — nothing written.")
+        print()
+        for line in textwrap.wrap(str(exc), 74):
+            print(f"  {line}")
+        return 1
     return 0
 
 

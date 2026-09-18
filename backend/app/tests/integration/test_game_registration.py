@@ -1233,6 +1233,45 @@ def test_the_operator_cannot_supply_an_authoritative_week():
               "--authoritative-week", "2"])
 
 
+def test_a_refusal_exits_cleanly_instead_of_raising(capsys):
+    """A refusal is this tool's NORMAL outcome -- a stale expected week, an
+    unresolvable fixture, a no-op. Letting the exception escape printed a
+    traceback, which reads like the tool broke rather than like the guard
+    worked."""
+
+    from app.services.repair_game_week import main
+
+    game_id = _mis_scoped_game("clean-exit")
+    code = main([
+        "--game-id", str(game_id),
+        "--expect-current-week", "9",          # the row says 3
+        "--expect-authoritative-week", "2",
+    ], schedule_provider=_truth())
+    out = capsys.readouterr().out
+
+    assert code == 1, "a refusal must carry a non-zero exit code"
+    assert "REFUSED" in out
+    assert "expected week_number 9 but the row says 3" in out
+    assert "Traceback" not in out
+
+
+def test_a_successful_dry_run_exits_zero(capsys):
+    from app.services.repair_game_week import main
+
+    game_id = _mis_scoped_game("clean-exit-ok")
+    code = main([
+        "--game-id", str(game_id),
+        "--expect-current-week", "3",
+        "--expect-authoritative-week", "2",
+    ], schedule_provider=_truth())
+    out = capsys.readouterr().out
+
+    assert code == 0
+    assert "DRY RUN" in out
+    with session_scope() as session:
+        assert session.get(Game, game_id).week_number == 3, "a dry run wrote"
+
+
 def test_the_corrected_week_comes_from_the_schedule():
     from app.services.repair_game_week import apply_repair
 
