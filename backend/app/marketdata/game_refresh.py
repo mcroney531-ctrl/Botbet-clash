@@ -17,9 +17,13 @@ What it deliberately does NOT do:
     no MarketSnapshot      that is the capture's job, at the capture clock
     no EvidenceSnapshot    same
     no model call          Phase 3 territory, and never inside ingestion
-    no list_events call    the game identity is already persisted, so
-                           re-discovering it would spend a credit to learn
-                           something we already know permanently
+    no list_events call    the game identity is already persisted and
+                           permanent, so rediscovering it buys nothing and
+                           adds a network dependency that can fail. (NOT a
+                           cost argument: /events is FREE on this provider
+                           -- see the seam doc §16. An earlier version of
+                           this comment claimed it saved a credit, which
+                           was simply wrong.)
 
 The quote-persistence loop is shared with `live_ingest` rather than
 copied. A second implementation of identity resolution would be able to
@@ -194,9 +198,9 @@ def refresh_game_market_data(
 ):
     """Refresh one game's market data and COMMIT. Returns a RefreshOutcome.
 
-    Two provider calls, not three: the roster and the event odds. The
-    game's identity is already persisted, so `list_events` would spend a
-    credit to rediscover something permanent.
+    Two provider calls: the roster and the event odds. `list_events` is
+    skipped because the game's identity is already persisted and
+    permanent, not to save money -- /events is free on this provider.
     """
 
     # Imported here rather than at module scope: checkpoint_cycle imports

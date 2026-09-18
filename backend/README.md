@@ -1349,7 +1349,9 @@ adding its refresh, not relaxing the check.
 `Game.external_ref` already holds the provider event identity
 permanently, so there is no `--event-id` for an operator to get wrong and
 no `list_events` call to rediscover something we already know — two
-provider calls per logical attempt, not three.
+provider calls per logical attempt, not three. (Correctness and failure
+surface, **not** cost: `/events` is free on this provider. An earlier
+version of this readout claimed the skip saved a credit; it doesn't.)
 
 Which matters for accounting: `provider_calls_spent` sums what each
 attempt actually reports rather than counting one per attempt. A retry of

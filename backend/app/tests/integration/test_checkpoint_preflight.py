@@ -401,8 +401,9 @@ def test_the_first_paid_attempt_is_guarded_by_the_remaining_window():
     A cycle starting seconds before window_end would buy a refresh and
     then cross the boundary, so the capture it paid for is marked MISSED.
     The guard is sized from the real call sequence: an nflverse roster
-    download (60s timeout) plus list_events (30s) plus fetch_quotes (30s),
-    then a reserve for the capture itself.
+    download (60s timeout) plus fetch_quotes (30s), then a reserve for the
+    capture itself. The budget carries headroom over that sum rather than
+    equalling it.
     """
 
     game_id = _game("first-guard")
@@ -484,18 +485,27 @@ def test_the_two_guards_are_one_rule():
 
 
 def test_the_request_budget_covers_the_real_call_sequence():
-    """Sized, not guessed. The production refresh is a roster download plus
-    two odds calls, and the default must cover all three timeouts."""
+    """Sized against the ACTUAL sequence, not a remembered one.
+
+    The production refresh is two calls -- an nflverse roster download and
+    one Odds fetch_quotes -- because the event identity is already
+    persisted. The budget must cover both timeouts with room to spare;
+    tying it to the exact sum would make it fail the moment either adapter
+    changed its timeout by a second.
+    """
 
     from app.marketdata.checkpoint_cycle import DEFAULT_REQUEST_BUDGET_SECONDS
     from app.marketdata.providers.the_odds_api import DEFAULT_TIMEOUT_SECONDS as ODDS_TIMEOUT
     from app.rosterdata.providers.nflverse import DEFAULT_TIMEOUT_SECONDS as ROSTER_TIMEOUT
 
-    worst_case = ROSTER_TIMEOUT + 2 * ODDS_TIMEOUT
-    assert DEFAULT_REQUEST_BUDGET_SECONDS >= worst_case, (
-        f"a {DEFAULT_REQUEST_BUDGET_SECONDS}s budget cannot cover {worst_case}s "
+    timeout_sum = ROSTER_TIMEOUT + ODDS_TIMEOUT
+    assert DEFAULT_REQUEST_BUDGET_SECONDS >= timeout_sum, (
+        f"a {DEFAULT_REQUEST_BUDGET_SECONDS}s budget cannot cover {timeout_sum}s "
         "of provider timeouts"
     )
+    # Headroom, deliberately: connection setup, redirects and parsing all
+    # sit outside the per-request timeouts.
+    assert DEFAULT_REQUEST_BUDGET_SECONDS > timeout_sum
 
 
 def test_model_a_is_the_single_attempt_policy():

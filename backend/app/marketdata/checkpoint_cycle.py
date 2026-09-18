@@ -84,9 +84,13 @@ from app.marketdata.provenance import SYNTHETIC_SOURCE
 #                             so a retry pays again for the same garbage
 # Reserve kept clear after the refresh so the capture itself can finish.
 DEFAULT_WINDOW_GUARD_SECONDS = 60.0
-# One refresh's worst-case wall clock, from the real call sequence:
-# nflverse roster (60s timeout) + list_events (30s) + fetch_quotes (30s),
-# rounded up for connection setup and parsing.
+# One refresh's worst-case wall clock. The real production sequence is TWO
+# calls -- nflverse roster (60s timeout) + Odds fetch_quotes (30s) -- so
+# 90s is the literal timeout sum. 180 is deliberate headroom on top of
+# that, for connection setup, redirects, response parsing, and a future
+# third call, not an arithmetic result. An earlier comment here claimed it
+# was the sum of three calls; that was before the production refresh
+# stopped calling list_events.
 DEFAULT_REQUEST_BUDGET_SECONDS = 180.0
 
 RETRYABLE_ERROR_CATEGORIES: frozenset[str] = frozenset(
@@ -132,10 +136,10 @@ class RefreshRetryPolicy:
     # How long one refresh may take before we stop believing it will land.
     #
     # Sized from the real call sequence, not guessed: a production refresh
-    # is an nflverse roster download (60s timeout) plus list_events (30s)
-    # plus fetch_quotes (30s) -- 120s of pure timeout budget. A guard that
-    # only covered the 30s odds timeout would let a cycle start work it
-    # could not finish inside the window.
+    # is an nflverse roster download (60s timeout) plus fetch_quotes (30s),
+    # so 90s of pure timeout budget, and this carries headroom over it. A
+    # guard that only covered the 30s odds timeout would let a cycle start
+    # work it could not finish inside the window.
     request_budget_seconds: float = DEFAULT_REQUEST_BUDGET_SECONDS
 
     def __post_init__(self) -> None:

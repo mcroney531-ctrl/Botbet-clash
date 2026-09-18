@@ -587,10 +587,14 @@ its refresh to `REFRESH_BUILDERS`, not relaxing the check.
 `refresh_game_market_data` takes only a `game_id`: `Game.external_ref`
 already holds the provider event identity permanently, so there is no
 `--event-id` for an operator to get wrong, and no `list_events` call to
-rediscover something we already know. Two provider calls per logical
-attempt — the nflverse roster and the Odds event odds — which is why
-`provider_calls_spent` sums what each attempt actually reports rather than
-counting one per attempt.
+rediscover something we already know. That is an argument about
+correctness and failure surface, **not** about cost — `/events` is free on
+this provider (§16), and an earlier version of this section wrongly
+claimed the skip saved a credit.
+
+Two provider calls per logical attempt — the nflverse roster and the Odds
+event odds — which is why `provider_calls_spent` sums what each attempt
+actually reports rather than counting one per attempt.
 
 The identity-resolution and quote-persistence loop is SHARED with
 `live_ingest` (`persist_resolved_quotes`), not copied. A second
@@ -620,11 +624,18 @@ The size comes from the real call sequence, not a guess:
 | | timeout |
 | --- | --- |
 | nflverse roster download | 60s |
-| The Odds API `list_events` | 30s |
 | The Odds API `fetch_quotes` | 30s |
-| **request budget (default)** | **180s** |
+| **literal timeout sum** | **90s** |
+| **request budget (default)** | **180s** — the above plus deliberate headroom |
 | capture reserve (`window_guard_seconds`) | 60s |
 | **room needed before any paid attempt** | **240s** |
+
+The 180s budget is headroom over the 90s timeout sum, not an arithmetic
+result: connection setup, redirects and response parsing all sit outside
+the per-request timeouts, and a future third call should not require a
+rules amendment. An earlier version of this table listed `list_events` as
+a third leg and presented 180 as the sum; the production refresh does not
+call it (§3.9a).
 
 A 60s guard alone would have covered only the odds timeout and let a cycle
 start work it could not finish.
@@ -1357,7 +1368,7 @@ reasoning is not lost.
 | Coerce frozen retry-policy JSON with `int()`/`float()` | **Rejected.** `int("3")`, `int(True)` and `int(3.7)` all succeed, turning a typo in the research contract into a plausible-looking policy (§3.7). |
 | Guard only retries against the window end | **Rejected.** Attempt 1 can be bought seconds before `window_end` and land as MISSED. One rule covers both, sized to the real call sequence (§3.9). |
 | Let the official runner capture with no refresh wired | **Rejected, and fixed.** `refresh=None` means "proceed to the capture", so the official command would have consumed an irreversible checkpoint on stale quotes (§3.9a). |
-| Require an operator `--event-id` for the production refresh | **Rejected.** `Game.external_ref` holds the event identity permanently; asking for it again invites a typo into a permanent decision, and `list_events` would spend a credit to rediscover it (§3.9a). |
+| Require an operator `--event-id` for the production refresh | **Rejected.** `Game.external_ref` holds the event identity permanently; asking for it again invites a typo into a permanent decision, and rediscovering it adds a failure surface for zero information. (The first version of this row said the skip saved a credit — wrong, `/events` is free per §16.) |
 | Copy the resolution loop into the production refresh | **Rejected.** Two implementations of identity resolution could drift from the one that wrote the existing research record, and both would keep producing plausible rows (§3.9a). |
 | Count one ProviderCall per retry attempt | **Rejected.** One logical refresh is a roster call plus an odds call, so that understates what a retry costs (§3.9a). |
 | Apply an amendment without re-checking the parent under a lock | **Rejected.** Two amendments racing would both supersede the same row and leave two active clones; the operator must also supersede the row they reviewed (§3.7). |
