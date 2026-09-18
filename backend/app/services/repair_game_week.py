@@ -56,6 +56,7 @@ from app.db.models.competition import (
 from app.db.models.forecast_lab import (
     AgentSession,
     AgentSessionEvidenceSnapshot,
+    BenchmarkSlateFixture,
     BenchmarkSlatePlan,
     BenchmarkSlot,
     EvidenceSnapshot,
@@ -294,6 +295,15 @@ CENSUS_CLASSIFICATION: dict[str, Reach] = {
     "agent_session_evidence_snapshots": Reach.BLOCKING,
     "research_settlements": Reach.BLOCKING,
     "benchmark_slots": Reach.BLOCKING,
+    # The frozen plan-time fixture pool (4A.7). It reaches a game through
+    # its own game_id once bound, and a committed plan naming this fixture
+    # under a week is exactly the cross-week contradiction a correction
+    # must not create. Found by the FK-closure check, not by hand.
+    "benchmark_slate_fixtures": Reach.BLOCKING,
+    # A committed plan that owns a fixture bound to this game names a week
+    # of its own, and BenchmarkSlatePlan.week_id is UNIQUE -- it cannot be
+    # recommitted to agree with a correction.
+    "benchmark_slate_plans": Reach.BLOCKING,
     # -- committed competition state ----------------------------------
     "stake_recommendations": Reach.BLOCKING,
     "tickets": Reach.BLOCKING,
@@ -367,6 +377,8 @@ class DependencyCensus:
     agent_sessions: int = 0
     batched_agent_sessions: int = 0
     benchmark_slots: int = 0
+    slate_fixtures: int = 0
+    slate_plans: int = 0
     stake_recommendations: int = 0
     tickets: int = 0
     wagers: int = 0
@@ -417,6 +429,10 @@ class DependencyCensus:
                           f"{self.batched_agent_sessions} via the batch join table"),
             ArtifactCount("benchmark slots", self.benchmark_slots,
                           self.benchmark_slots > 0, self._weeks("benchmark_slots")),
+            ArtifactCount("planned slate fixtures", self.slate_fixtures,
+                          self.slate_fixtures > 0),
+            ArtifactCount("committed slate plans", self.slate_plans,
+                          self.slate_plans > 0, self._weeks("slate_plans")),
             ArtifactCount("stake recommendations", self.stake_recommendations,
                           self.stake_recommendations > 0),
             ArtifactCount("tickets", self.tickets, self.tickets > 0, self._weeks("tickets")),
@@ -503,8 +519,31 @@ def take_census(session: Session, game_id: uuid.UUID) -> DependencyCensus:
     )
     # Either link counts: a slot names the game directly, and a resolved
     # slot also names the market it picked inside it.
+    planned = (
+        select(BenchmarkSlateFixture.id)
+        .where(BenchmarkSlateFixture.game_id == game_id)
+        .scalar_subquery()
+    )
+    c.slate_fixtures = count(BenchmarkSlateFixture, BenchmarkSlateFixture.game_id == game_id)
+    owning_plans = (
+        select(BenchmarkSlateFixture.plan_id)
+        .where(BenchmarkSlateFixture.game_id == game_id)
+        .scalar_subquery()
+    )
+    c.slate_plans = count(BenchmarkSlatePlan, BenchmarkSlatePlan.id.in_(owning_plans))
+    c.committed_weeks["slate_plans"] = sorted({
+        w for (w,) in session.execute(
+            select(Week.week_number).distinct().select_from(BenchmarkSlatePlan)
+            .join(Week, Week.id == BenchmarkSlatePlan.week_id)
+            .where(BenchmarkSlatePlan.id.in_(owning_plans))
+        )
+    })
+    # Three routes, because a slot reaches its game through its planned
+    # fixture (4A.7) while pre-4A.7 rows still carry a direct game_id.
     slot_where = (
-        (BenchmarkSlot.game_id == game_id) | (BenchmarkSlot.resolved_market_id.in_(markets))
+        (BenchmarkSlot.game_id == game_id)
+        | (BenchmarkSlot.resolved_market_id.in_(markets))
+        | (BenchmarkSlot.slate_fixture_id.in_(planned))
     )
     c.benchmark_slots = count(BenchmarkSlot, slot_where)
     c.committed_weeks["benchmark_slots"] = sorted({

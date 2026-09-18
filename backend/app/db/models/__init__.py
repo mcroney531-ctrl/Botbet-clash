@@ -7,6 +7,7 @@ from app.db.models.markets import CheckpointRun, Game, MarketSnapshot, Player, P
 from app.db.models.forecast_lab import (
     AgentSession,
     AgentSessionEvidenceSnapshot,
+    BenchmarkSlateFixture,
     BenchmarkSlatePlan,
     BenchmarkSlot,
     EvidenceSnapshot,
@@ -36,6 +37,7 @@ __all__ = [
     "BenchmarkSlot",
     "AgentSession",
     "AgentSessionEvidenceSnapshot",
+    "BenchmarkSlateFixture",
     "StakeRecommendation",
     "Ticket",
     "Wager",

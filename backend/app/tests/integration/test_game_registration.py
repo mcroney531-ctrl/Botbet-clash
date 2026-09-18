@@ -2059,6 +2059,8 @@ def test_every_blocking_table_is_actually_queried():
         "agent_session_evidence_snapshots": "AgentSessionEvidenceSnapshot",
         "research_settlements": "ResearchSettlement",
         "benchmark_slots": "BenchmarkSlot",
+        "benchmark_slate_fixtures": "BenchmarkSlateFixture",
+        "benchmark_slate_plans": "BenchmarkSlatePlan",
         "stake_recommendations": "StakeRecommendation",
         "tickets": "Ticket",
         "wagers": "Wager",

@@ -48,6 +48,7 @@ METHODOLOGY_FIELDS = (
     "supported_prop_types",
     "devig_method",
     "benchmark_slate_size",
+    "benchmark_allocation_method",
     "batch_methodology",
     "checkpoint_windows",
     "kelly_fraction",

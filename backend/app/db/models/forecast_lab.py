@@ -9,7 +9,7 @@ from decimal import Decimal
 
 from sqlalchemy import BigInteger, CheckConstraint, ForeignKey, Integer, Numeric, String, UniqueConstraint
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base, created_at_column, uuid_pk
 
@@ -73,7 +73,20 @@ class ForecastObservation(Base):
 
 
 class BenchmarkSlatePlan(Base):
-    """Committed once per week, before any game's OPENING window opens."""
+    """Committed once per week, before any game's OPENING window opens.
+
+    Phase 4A.7 made the plan answer one question it previously could not:
+    WHAT COMPLETE FIXTURE POOL DID THE ALLOCATOR SEE? Without that, a plan
+    could only be re-derived by re-fetching a schedule release that may
+    since have changed, so "this sample was precommitted" was an
+    assertion rather than a reproducible fact.
+
+    The provenance columns are nullable because Phase-2B synthetic plans
+    legitimately have no provider call behind them. `is_official` is the
+    discriminator, and the CHECK below makes an official plan without its
+    provenance impossible at the DATABASE level rather than merely
+    discouraged in the service.
+    """
 
     __tablename__ = "benchmark_slate_plans"
 
@@ -83,23 +96,114 @@ class BenchmarkSlatePlan(Base):
     allocation_method: Mapped[str] = mapped_column(String, nullable=False)
     committed_at: Mapped[datetime] = mapped_column(nullable=False)
 
+    # --- Phase 4A.7 provenance ---------------------------------------
+    is_official: Mapped[bool] = mapped_column(nullable=False, default=False)
+    rules_version: Mapped[str | None] = mapped_column(String, nullable=True)
+    schedule_provider_call_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("provider_calls.id"), nullable=True
+    )
+    resolver_version: Mapped[str | None] = mapped_column(String, nullable=True)
+    fixture_key_version: Mapped[str | None] = mapped_column(String, nullable=True)
+    fixture_pool_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # sha256 over the canonical ordered fixture keys -- never row ids, never
+    # kickoff times. This is what survives a clean database rebuild.
+    fixture_pool_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # The deadline this commitment was checked against, kept so the check
+    # can be audited later rather than merely trusted.
+    earliest_opening_at: Mapped[datetime | None] = mapped_column(nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "NOT is_official OR ("
+            " rules_version IS NOT NULL"
+            " AND schedule_provider_call_id IS NOT NULL"
+            " AND fixture_pool_fingerprint IS NOT NULL"
+            " AND fixture_pool_count IS NOT NULL"
+            " AND earliest_opening_at IS NOT NULL)",
+            name="official_plan_requires_provenance",
+        ),
+    )
+
+
+class BenchmarkSlateFixture(Base):
+    """The COMPLETE fixture pool the allocator saw, frozen under its plan.
+
+    All sixteen of a week's fixtures, not just the five selected. Owned by
+    the plan rather than kept in a global table on purpose: this is a
+    historical artifact of one commitment, and a shared mutable
+    `ScheduledFixture` table would become a second source of truth that
+    later schedule releases could rewrite underneath a committed sample.
+
+    `game_id` is NULL until the market provider posts the event and
+    `game_registration` BINDS it. Binding moves that one column and
+    nothing else -- the planned week, teams and kickoff are what the
+    allocator actually saw, and rewriting them to match a later schedule
+    release would destroy the record it exists to keep.
+    """
+
+    __tablename__ = "benchmark_slate_fixtures"
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    plan_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("benchmark_slate_plans.id"), nullable=False
+    )
+    # The canonical key: season:game_type:Www:AWAY@HOME. Kickoff is
+    # deliberately not part of it -- broadcast times move, fixtures do not.
+    fixture_key: Mapped[str] = mapped_column(String, nullable=False)
+    week_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    away_team_canonical: Mapped[str] = mapped_column(String, nullable=False)
+    home_team_canonical: Mapped[str] = mapped_column(String, nullable=False)
+    planned_kickoff_at: Mapped[datetime] = mapped_column(nullable=False)
+    game_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("games.id"), nullable=True)
+    bound_at: Mapped[datetime | None] = mapped_column(nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("plan_id", "fixture_key", name="one_fixture_per_plan"),
+    )
+
 
 class BenchmarkSlot(Base):
-    """One row per planned slot; resolved asynchronously per game."""
+    """One row per SELECTED slot; resolved asynchronously per game.
+
+    `slate_fixture_id` replaced `game_id` as the link to what the slot is
+    about. A slot now points at a planned FIXTURE, which exists whether or
+    not the odds provider has posted the event -- that coupling is what let
+    two unlisted Week-3 events change a slate nflverse already knew all
+    sixteen fixtures for.
+
+    `game_id` remains, nullable, for pre-4A.7 rows only. Nothing written
+    by the current core sets it.
+    """
 
     __tablename__ = "benchmark_slots"
 
     id: Mapped[uuid.UUID] = uuid_pk()
     plan_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("benchmark_slate_plans.id"), nullable=False)
     slot_index: Mapped[int] = mapped_column(Integer, nullable=False)
-    game_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("games.id"), nullable=False)
+    slate_fixture_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("benchmark_slate_fixtures.id"), nullable=True
+    )
+    game_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("games.id"), nullable=True)
     target_stat_type: Mapped[str] = mapped_column(String, nullable=False)
     fallback_stat_types: Mapped[list[str]] = mapped_column(ARRAY(String), nullable=False, default=list)
     status: Mapped[str] = mapped_column(String, nullable=False, default="PENDING")
     resolved_market_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("prop_markets.id"), nullable=True)
     resolved_at: Mapped[datetime | None] = mapped_column(nullable=True)
 
+    # How a slot reaches its game: through the planned fixture, which holds
+    # the binding. Deliberately not a denormalized `game_id` on the slot --
+    # two columns naming the same game is two places for it to be wrong.
+    slate_fixture: Mapped["BenchmarkSlateFixture | None"] = relationship(lazy="joined")
+
     __table_args__ = (UniqueConstraint("plan_id", "slot_index", name="one_slot_per_index"),)
+
+    @property
+    def bound_game_id(self) -> uuid.UUID | None:
+        """The game this slot is about, or None until the provider posts it."""
+
+        if self.slate_fixture is not None:
+            return self.slate_fixture.game_id
+        return self.game_id  # pre-4A.7 rows only
 
 
 class AgentSession(Base):

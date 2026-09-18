@@ -57,9 +57,15 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.db.models.forecast_lab import BenchmarkSlateFixture
 from app.db.models.markets import Game, GameScopeObservation
 from app.db.models.season import Season, SeasonRules
 from app.db.session import session_scope
+from app.forecast_lab.benchmark_slate_service import (
+    SlateBindingRefused,
+    bind_fixture_to_game,
+    planned_fixture_from_game,
+)
 from app.marketdata.dto import ProviderEvent
 from app.marketdata.providers.the_odds_api import (
     DEFAULT_SPORT,
@@ -137,6 +143,8 @@ class RegistrationReport:
     quota_cost: int = 0
     quota_remaining: int | None = None
     schedule_provider_call_id: uuid.UUID | None = None
+    bound: list[str] = field(default_factory=list)
+    binding_drift: list[str] = field(default_factory=list)
     failures: list[str] = field(default_factory=list)
 
     @property
@@ -477,6 +485,31 @@ def register_week_events(
                     resolver_version=RESOLVER_VERSION,
                     observed_at=datetime.now(timezone.utc),
                 ))
+                # A committed benchmark plan may have been waiting for this
+                # event since before it was posted. Binding moves ONE column
+                # on the planned fixture; it never rewrites what the
+                # allocator saw and never reallocates a slot.
+                for planned in session.execute(
+                    select(BenchmarkSlateFixture).where(
+                        BenchmarkSlateFixture.fixture_key
+                        == planned_fixture_from_game(session, game).key.value,
+                        BenchmarkSlateFixture.game_id.is_(None),
+                    )
+                ).scalars().all():
+                    try:
+                        bind_fixture_to_game(
+                            session, fixture=planned, game=game,
+                            bound_at=datetime.now(timezone.utc),
+                            kickoff_tolerance=DEFAULT_KICKOFF_TOLERANCE,
+                        )
+                        report.bound.append(
+                            f"{planned.fixture_key} -> plan {planned.plan_id}"
+                        )
+                    except SlateBindingRefused as exc:
+                        # Drift is REPORTED, never resolved by rewriting the
+                        # plan. A precommitted sample that edits itself to
+                        # match later data is not precommitted.
+                        report.binding_drift.append(str(exc))
                 session.flush()
         except EventScopeConflict as exc:
             report.conflicts.append(str(exc))

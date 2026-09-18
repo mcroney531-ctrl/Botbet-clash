@@ -152,7 +152,10 @@ def test_mocked_research_week_survives_a_full_reload():
     with session_scope() as session:
         from app.db.repositories.benchmark_repository import BenchmarkRepository
 
-        slots = {s.game_id: s for s in BenchmarkRepository(session).slots_for_plan(plan_id)}
+        # A slot reaches its game through its planned fixture (4A.7): the
+        # pool is schedule-native, so a slot is about a FIXTURE and the
+        # Game binding hangs off that.
+        slots = {s.bound_game_id: s for s in BenchmarkRepository(session).slots_for_plan(plan_id)}
         assert slots[game_a_id].status == "RESOLVED"
         assert slots[game_a_id].resolved_market_id == market_good_id  # not the canonical-unavailable one
         assert slots[game_d_id].status == "UNFILLABLE"  # step 12: no eligible market, nothing to fall back to

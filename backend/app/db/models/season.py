@@ -53,6 +53,12 @@ class SeasonRules(Base):
     supported_prop_types: Mapped[list[str]] = mapped_column(ARRAY(String), nullable=False)
     devig_method: Mapped[str] = mapped_column(String, nullable=False)
     benchmark_slate_size: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Which reviewed allocator chooses the slate (Phase 4A.7). NULL means NO
+    # METHODOLOGY HAS BEEN FROZEN -- it is not a default and not permission
+    # to use the inherited V0. An official commitment refuses on NULL, the
+    # same way a capture refuses a NULL freshness policy, so a slate cannot
+    # inherit an allocator nobody reviewed.
+    benchmark_allocation_method: Mapped[str | None] = mapped_column(String, nullable=True)
     batch_methodology: Mapped[str] = mapped_column(String, nullable=False)
     checkpoint_windows: Mapped[dict] = mapped_column(JSONB, nullable=False)
     # --- capture policy (Phase 4A.5) ---------------------------------
