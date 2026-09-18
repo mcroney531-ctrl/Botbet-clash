@@ -567,6 +567,43 @@ so two concurrent workers cannot both win.
 
 ---
 
+### 3.9a The official runner always refreshes
+
+`official_capture` resolves game → season → active rules → policy **and the
+production refresh for that season's pinned provider**. It never runs a
+cycle with `refresh=None`.
+
+The first version did. `run_checkpoint_cycle` treats `refresh is None` as
+"no refresh supplied" and proceeds straight to the capture, so the
+official command would have consumed a real, irreversible checkpoint using
+whatever stale quotes happened to be sitting in Postgres. The freshness
+gate would have invalidated them — and the checkpoint would still be
+CAPTURED and gone.
+
+A season pinned to a provider with no production refresh now raises
+`NoProductionRefresh` and captures nothing. Adding a provider means adding
+its refresh to `REFRESH_BUILDERS`, not relaxing the check.
+
+`refresh_game_market_data` takes only a `game_id`: `Game.external_ref`
+already holds the provider event identity permanently, so there is no
+`--event-id` for an operator to get wrong, and no `list_events` call to
+rediscover something we already know. Two provider calls per logical
+attempt — the nflverse roster and the Odds event odds — which is why
+`provider_calls_spent` sums what each attempt actually reports rather than
+counting one per attempt.
+
+The identity-resolution and quote-persistence loop is SHARED with
+`live_ingest` (`persist_resolved_quotes`), not copied. A second
+implementation could drift — different alias handling, a different
+quarantine rule — and nothing would flag it, because both would keep
+producing plausible rows. `live_ingest` is now a thin acceptance CLI over
+the shared service.
+
+The refresh builds no `MarketSnapshot`, no `EvidenceSnapshot`, and calls
+no model; its job ends at committed quotes. A structural test asserts it.
+
+---
+
 ### 3.9 The window guard covers the FIRST paid attempt
 
 "ELIGIBLE at this instant" is not "there is enough window left to sensibly
@@ -1319,6 +1356,11 @@ reasoning is not lost.
 | `SELECT FOR UPDATE` for the claim | **Rejected.** It would hold a lock across an unbounded provider wait (§3.8). |
 | Coerce frozen retry-policy JSON with `int()`/`float()` | **Rejected.** `int("3")`, `int(True)` and `int(3.7)` all succeed, turning a typo in the research contract into a plausible-looking policy (§3.7). |
 | Guard only retries against the window end | **Rejected.** Attempt 1 can be bought seconds before `window_end` and land as MISSED. One rule covers both, sized to the real call sequence (§3.9). |
+| Let the official runner capture with no refresh wired | **Rejected, and fixed.** `refresh=None` means "proceed to the capture", so the official command would have consumed an irreversible checkpoint on stale quotes (§3.9a). |
+| Require an operator `--event-id` for the production refresh | **Rejected.** `Game.external_ref` holds the event identity permanently; asking for it again invites a typo into a permanent decision, and `list_events` would spend a credit to rediscover it (§3.9a). |
+| Copy the resolution loop into the production refresh | **Rejected.** Two implementations of identity resolution could drift from the one that wrote the existing research record, and both would keep producing plausible rows (§3.9a). |
+| Count one ProviderCall per retry attempt | **Rejected.** One logical refresh is a roster call plus an odds call, so that understates what a retry costs (§3.9a). |
+| Apply an amendment without re-checking the parent under a lock | **Rejected.** Two amendments racing would both supersede the same row and leave two active clones; the operator must also supersede the row they reviewed (§3.7). |
 | `as_of_at` derived from vendor `last_update` | **Rejected.** Wrong granularity (market-level, not bookmaker-level) and, more importantly, the wrong meaning: a quote row records an observation, not the vendor's belief about market change (§3). |
 | Timestamp-based retry idempotency | **Replaced** by `provider_call_id` + fingerprint (§5). Provenance beats inference. |
 | Hash-only raw retention for successful runs | **Rejected.** A hash cannot reconstruct a bad normalization (§11.1). |

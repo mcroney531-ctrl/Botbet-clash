@@ -1324,3 +1324,67 @@ before/after diff are in the session notes awaiting approval.
 **338 passed, 4 skipped.** Migration `a71e5c3d94f8` (the lease table)
 applied through the full chain on a clean database and round-tripped
 twice.
+
+---
+
+## Phase 4A.5 final — the official command did not actually refresh
+
+`official_capture.main()` called `run_official_checkpoint` with no refresh.
+`run_checkpoint_cycle` treats `refresh is None` as "no refresh supplied"
+and proceeds straight to the capture. So the shiny new official command
+would have consumed a real, irreversible checkpoint using whatever stale
+quotes happened to be sitting in Postgres — the 900s gate would have
+invalidated them, and the checkpoint would still be CAPTURED and gone.
+
+That is the whole refresh→capture contract defeated by a default argument.
+
+### What changed
+
+The official runner now resolves the production refresh for the season's
+pinned provider alongside the policy. A provider with no refresh wired
+raises `NoProductionRefresh` and captures nothing; adding a provider means
+adding its refresh, not relaxing the check.
+
+`refresh_game_market_data(game_id, ...)` takes only a game id.
+`Game.external_ref` already holds the provider event identity
+permanently, so there is no `--event-id` for an operator to get wrong and
+no `list_events` call to rediscover something we already know — two
+provider calls per logical attempt, not three.
+
+Which matters for accounting: `provider_calls_spent` sums what each
+attempt actually reports rather than counting one per attempt. A retry of
+a two-call refresh costs two more calls, and the report says so.
+
+The identity-resolution and quote-persistence loop is now shared with
+`live_ingest` rather than copied. A second implementation could drift —
+different alias handling, a different quarantine rule — and nothing would
+flag it, because both would keep producing plausible rows. `live_ingest`
+is a thin acceptance CLI over the shared service, and a test asserts it no
+longer names `resolve_and_record` or `resolve_prop_market` itself.
+
+The refresh builds no snapshot, no evidence, and calls no model.
+
+### Amendment hardening
+
+`apply_amendment` re-reads the active rules row **under a lock** and
+re-checks its version, so two amendment commands racing cannot both
+supersede the same parent and leave two active clones. The CLI's dry run
+now prints the exact `--apply --expect-current-version <parent>` line to
+re-run with, so the row you reviewed is the row that gets superseded.
+
+### One design note found while testing
+
+`run_official_checkpoint` accepts `refresh` and `sleep_fn` as test seams
+but has **no `now_fn`** — an official capture must not be told what time it
+is. The retry tests move the kickoff instead of the clock.
+
+### Acceptance
+
+349 passed, 4 skipped. Verified by mutation:
+
+| mutation | what went red |
+| --- | --- |
+| restore `refresh=None` in the official runner | the fail-closed test |
+| allow an unwired provider | the fail-closed test |
+| count one ProviderCall per attempt | the multi-call accounting test |
+| ignore the expected amendment parent | both amendment-race tests |

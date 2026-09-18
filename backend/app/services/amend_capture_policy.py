@@ -109,15 +109,41 @@ class PolicyDiff:
         return "\n".join(out)
 
 
-def active_rules(session: Session, season_id: uuid.UUID) -> SeasonRules:
-    row = session.execute(
+def active_rules(session: Session, season_id: uuid.UUID, *, lock: bool = False) -> SeasonRules:
+    """The one un-superseded rules row.
+
+    `lock=True` takes a row lock for the amendment transaction. No network
+    happens inside that transaction -- this is a pure database operation --
+    so a short lock is appropriate here, unlike in the capture cycle where
+    a lock would span a provider call.
+    """
+
+    stmt = (
         select(SeasonRules)
         .where(SeasonRules.season_id == season_id, SeasonRules.superseded_by.is_(None))
         .order_by(SeasonRules.effective_from.desc())
-    ).scalars().first()
+    )
+    if lock:
+        stmt = stmt.with_for_update()
+    row = session.execute(stmt).scalars().first()
     if row is None:
         raise AmendmentRefused(f"season {season_id} has no active SeasonRules")
     return row
+
+
+def _require_expected_parent(current: SeasonRules, expected: str | None) -> None:
+    """The row the operator reviewed must be the row being superseded.
+
+    Optional, but the CLI always supplies it: an amendment reviewed against
+    one parent and applied against another is a silent methodology change.
+    """
+
+    if expected is not None and current.rules_version != expected:
+        raise AmendmentRefused(
+            f"expected the active rules to be {expected!r} but they are "
+            f"{current.rules_version!r}. Another amendment landed since the dry "
+            "run; re-read the diff before applying."
+        )
 
 
 def _snapshot(rules: SeasonRules) -> dict:
@@ -133,6 +159,7 @@ def plan_amendment(
     rules_version: str,
     amendment_reason: str,
     effective_from: datetime,
+    expected_current_version: str | None = None,
 ) -> PolicyDiff:
     """Build the diff WITHOUT writing anything.
 
@@ -160,6 +187,7 @@ def plan_amendment(
             f"rules_version {rules_version!r} is already the active version; an "
             "amendment must introduce a new one"
         )
+    _require_expected_parent(current, expected_current_version)
 
     season = session.get(Season, season_id)
     return PolicyDiff(
@@ -186,8 +214,15 @@ def apply_amendment(
     rules_version: str,
     amendment_reason: str,
     effective_from: datetime,
+    expected_current_version: str | None = None,
 ) -> SeasonRules:
-    """Clone-and-supersede, in one transaction."""
+    """Clone-and-supersede, in one transaction.
+
+    The active row is re-read UNDER A LOCK after validation, and its
+    version re-checked, so two amendment commands racing cannot both
+    supersede the same parent and leave two active clones. The dry run the
+    operator read is therefore the row that actually gets superseded.
+    """
 
     plan_amendment(
         session,
@@ -197,8 +232,18 @@ def apply_amendment(
         rules_version=rules_version,
         amendment_reason=amendment_reason,
         effective_from=effective_from,
+        expected_current_version=expected_current_version,
     )
-    current = active_rules(session, season_id)
+    # Re-read under the lock: between the validation above and here another
+    # amendment could have won, in which case the parent we validated is no
+    # longer active and superseding it would leave two active rows.
+    current = active_rules(session, season_id, lock=True)
+    _require_expected_parent(current, expected_current_version)
+    if current.rules_version == rules_version:
+        raise AmendmentRefused(
+            f"rules_version {rules_version!r} became the active version while this "
+            "amendment was being prepared; another amendment won the race"
+        )
     parsed = RefreshRetryPolicy.from_record(refresh_retry_policy)
 
     clone = SeasonRules(
@@ -239,7 +284,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--window-guard-seconds", type=float, default=60.0)
     parser.add_argument("--request-budget-seconds", type=float, default=180.0)
-    parser.add_argument("--rules-version", required=True)
+    parser.add_argument("--rules-version", required=True, help="the NEW version")
+    parser.add_argument(
+        "--expect-current-version",
+        help="the version the dry run showed as active. Supplied on --apply so the "
+             "row you reviewed is the row that gets superseded.",
+    )
     parser.add_argument("--reason", required=True)
     parser.add_argument(
         "--apply", action="store_true",
@@ -265,12 +315,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             rules_version=args.rules_version,
             amendment_reason=args.reason,
             effective_from=effective_from,
+            expected_current_version=args.expect_current_version,
         )
         print(diff.render())
+        observed_parent = diff.old_rules_version
 
     if not args.apply:
         print()
-        print("DRY RUN — nothing written. Re-run with --apply to commit this amendment.")
+        print("DRY RUN — nothing written.")
+        print("To commit, re-run with:")
+        print(f"    --apply --expect-current-version {observed_parent}")
         return 0
 
     with session_scope() as session:
@@ -282,6 +336,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             rules_version=args.rules_version,
             amendment_reason=args.reason,
             effective_from=effective_from,
+            expected_current_version=args.expect_current_version or observed_parent,
         )
         print()
         print(f"APPLIED. New active rules row: {clone.id} ({clone.rules_version})")

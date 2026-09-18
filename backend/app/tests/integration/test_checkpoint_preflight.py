@@ -1078,7 +1078,14 @@ def test_the_official_runner_takes_no_policy_arguments():
     from app.marketdata import official_capture
 
     signature = inspect.signature(official_capture.run_official_checkpoint)
-    assert set(signature.parameters) == {"game_id", "checkpoint_type", "refresh", "owner"}
+    # `refresh` and `sleep_fn` are test seams, not operator options -- the
+    # CLI check below proves neither is reachable from the command line.
+    # There is deliberately NO now_fn: an official capture must not be told
+    # what time it is.
+    assert set(signature.parameters) == {
+        "game_id", "checkpoint_type", "refresh", "owner", "sleep_fn"
+    }
+    assert "now_fn" not in signature.parameters
 
     source = inspect.getsource(official_capture)
     for flag in (
@@ -1100,7 +1107,7 @@ def test_the_official_runner_refuses_an_unfrozen_policy():
 
     refresh = CountingRefresh()
     with pytest.raises(CapturePolicyNotFrozen):
-        run_official_checkpoint(game_id=game_id, checkpoint_type="FINAL", refresh=refresh)
+        run_official_checkpoint(game_id=game_id, checkpoint_type="FINAL", refresh=refresh, sleep_fn=lambda _s: None)
     assert refresh.calls == 0
 
 
@@ -1274,3 +1281,310 @@ def test_the_dry_run_writes_nothing():
             .where(SeasonRules.season_id == season_id)
         ).scalar()
     assert count == 1
+
+
+# =====================================================================
+# 7. THE OFFICIAL RUNNER ACTUALLY REFRESHES
+# =====================================================================
+#
+# The hole this section closes: official_capture.main() called
+# run_official_checkpoint with no refresh, and run_checkpoint_cycle treats
+# `refresh is None` as "no refresh supplied" and proceeds to the capture.
+# Since a capture is irreversible, the shiny new official command would
+# have consumed a real checkpoint on whatever stale quotes happened to be
+# sitting in Postgres.
+
+
+def _frozen_season(tag: str, *, provider=PROVIDER) -> uuid.UUID:
+    """A game whose FINAL window is open against the REAL clock.
+
+    The official runner deliberately exposes no `now_fn` -- an operator
+    must not be able to tell an official capture what time it is -- so
+    these tests move the kickoff instead of the clock.
+    """
+
+    game_id = _game(tag)
+    with session_scope() as session:
+        game = session.get(Game, game_id)
+        # now + 4h puts now inside FINAL (kickoff-6h .. kickoff-2h).
+        game.kickoff_at = datetime.now(timezone.utc) + timedelta(hours=4)
+        session.flush()
+        _rules(
+            session, game.season_id,
+            market_data_provider=provider,
+            max_observation_age_seconds=900,
+            refresh_retry_policy=V1_RETRY,
+        )
+    return game_id
+
+
+def test_an_official_capture_without_a_wired_refresh_fails_closed():
+    """A season pinned to a provider with no production refresh must never
+    capture. "We could not fetch anything, so we froze whatever was lying
+    around" is not a recoverable outcome -- it consumes the checkpoint."""
+
+    import sqlalchemy
+
+    from app.db.models.markets import CheckpointRun
+    from app.marketdata.official_capture import NoProductionRefresh, run_official_checkpoint
+
+    game_id = _frozen_season("no-refresh", provider="SOME_OTHER_PROVIDER")
+    _market(game_id, "no-refresh")
+
+    with pytest.raises(NoProductionRefresh):
+        run_official_checkpoint(game_id=game_id, checkpoint_type="FINAL")
+
+    with session_scope() as session:
+        runs = session.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(CheckpointRun)
+        ).scalar()
+    assert runs == 0, "the official runner captured without refreshing"
+
+
+def test_the_official_runner_refreshes_before_it_captures():
+    """Order, not just presence. The capture must see the quotes the
+    refresh wrote."""
+
+    from app.marketdata.official_capture import run_official_checkpoint
+
+    game_id = _frozen_season("refresh-first")
+    market_id = _market(game_id, "refresh-first")
+    order: list[str] = []
+
+    def refresh() -> RefreshOutcome:
+        order.append("refresh")
+        _write_quote(market_id, sportsbook=CANONICAL, as_of_at=datetime.now(timezone.utc))
+        return RefreshOutcome(
+            ok=True,
+            started_at=datetime.now(timezone.utc),
+            completed_at=datetime.now(timezone.utc),
+            quotes_written=1,
+            provider_calls=2,
+        )
+
+    report = run_official_checkpoint(
+        game_id=game_id, checkpoint_type="FINAL", refresh=refresh,
+        sleep_fn=lambda _s: None,
+    )
+    order.append("captured" if report.checkpoint_status == "CAPTURED" else report.checkpoint_status)
+
+    assert order == ["refresh", "captured"]
+    assert report.valid_baselines == 1, "the capture consumed the refresh's quotes"
+    assert report.policy_is_official is True
+
+
+def test_the_refresh_commits_before_the_capture_reads():
+    """The refresh owns its own transactions. If it had not committed, the
+    capture -- which opens a separate session -- would not see its rows."""
+
+    from app.marketdata.official_capture import run_official_checkpoint
+
+    game_id = _frozen_season("commits")
+    market_id = _market(game_id, "commits")
+    seen: dict[str, int] = {}
+
+    def refresh() -> RefreshOutcome:
+        _write_quote(market_id, sportsbook=CANONICAL, as_of_at=datetime.now(timezone.utc))
+        # A SEPARATE session, exactly as the capture will use.
+        import sqlalchemy
+
+        from app.db.models.markets import PropQuote
+
+        with session_scope() as other:
+            seen["visible"] = other.execute(
+                sqlalchemy.select(sqlalchemy.func.count()).select_from(PropQuote)
+                .where(PropQuote.market_id == market_id)
+            ).scalar()
+        return RefreshOutcome(
+            ok=True, started_at=datetime.now(timezone.utc),
+            completed_at=datetime.now(timezone.utc), quotes_written=1,
+        )
+
+    run_official_checkpoint(game_id=game_id, checkpoint_type="FINAL", refresh=refresh, sleep_fn=lambda _s: None)
+    assert seen["visible"] == 1, "the refresh had not committed"
+
+
+def test_a_failed_official_refresh_enters_the_frozen_retry_policy():
+    """The retry budget comes from the rules, not from the runner."""
+
+    from app.marketdata.official_capture import run_official_checkpoint
+
+    game_id = _frozen_season("official-retry")
+    _market(game_id, "official-retry")
+
+    refresh = CountingRefresh(outcomes=[_fail("TIMEOUT")])
+    report = run_official_checkpoint(
+        game_id=game_id, checkpoint_type="FINAL", refresh=refresh,
+        sleep_fn=lambda _s: None,
+    )
+
+    assert refresh.calls == V1_RETRY["max_attempts"]
+    assert [a.waited_seconds for a in report.attempts] == [0.0, 30.0, 120.0]
+
+
+def test_one_logical_attempt_reports_its_real_provider_call_count():
+    """A logical refresh is several actual provider calls -- the nflverse
+    roster and the Odds event odds -- so "one attempt == one ProviderCall"
+    would understate what a retry costs."""
+
+    from app.marketdata.official_capture import run_official_checkpoint
+
+    game_id = _frozen_season("multi-call")
+    _market(game_id, "multi-call")
+
+    multi = RefreshOutcome(
+        ok=False, started_at=datetime.now(timezone.utc),
+        completed_at=datetime.now(timezone.utc),
+        error="simulated", error_category="TIMEOUT",
+        provider_calls=2, quota_cost=5,
+    )
+    refresh = CountingRefresh(outcomes=[multi])
+    report = run_official_checkpoint(
+        game_id=game_id, checkpoint_type="FINAL", refresh=refresh,
+        sleep_fn=lambda _s: None,
+    )
+
+    assert refresh.calls == 3
+    assert report.provider_calls_spent == 6, "2 calls x 3 attempts"
+    assert report.quota_cost == 15
+
+
+def test_the_official_cli_exposes_no_policy_or_event_overrides():
+    import inspect
+
+    from app.marketdata import official_capture
+
+    source = inspect.getsource(official_capture)
+    for flag in (
+        "--max-observation-age-seconds", "--max-attempts", "--canonical-sportsbook",
+        "--market-data-provider", "--event-id", "--retry-policy",
+    ):
+        assert flag not in source, f"{flag} must not be an official-capture option"
+
+    parser_args = {"--game-id", "--checkpoint-type", "--dry-run"}
+    for token in parser_args:
+        assert token in source
+
+
+def test_the_production_refresh_uses_the_persisted_game_identity():
+    """No operator-supplied event id: Game.external_ref already holds the
+    provider event identity, permanently."""
+
+    from app.marketdata.game_refresh import event_ref_from_game
+
+    game_id = _game("identity")
+    with session_scope() as session:
+        game = session.get(Game, game_id)
+        game.external_ref = "THE_ODDS_API:abc123:withcolon"
+        session.flush()
+        ref = event_ref_from_game(game)
+
+    assert ref.provider == "THE_ODDS_API"
+    assert ref.external_event_id == "abc123:withcolon", "split on the FIRST colon only"
+
+
+def test_the_production_refresh_builds_no_snapshot_or_evidence_and_calls_no_model():
+    """Structural. The refresh's job ends at committed quotes; the capture
+    clock and everything downstream belong to the capture."""
+
+    import ast
+    import inspect
+
+    from app.marketdata import game_refresh
+
+    tree = ast.parse(inspect.getsource(game_refresh))
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.FunctionDef, ast.ClassDef)):
+            body = node.body
+            if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+                node.body = body[1:] or [ast.Pass()]
+    code = ast.unparse(tree)
+    for forbidden in (
+        "MarketSnapshotService", "build_snapshot", "create_evidence_snapshot",
+        "capture_checkpoint", "AIOrchestrator", "list_events",
+    ):
+        assert forbidden not in code, f"the production refresh must not use {forbidden}"
+
+
+def test_the_resolution_loop_has_one_implementation():
+    """live_ingest and the production refresh share it. A second copy could
+    drift -- different alias handling, a different quarantine rule -- and
+    nothing would flag it, because both would keep producing plausible
+    rows."""
+
+    import ast
+    import inspect
+
+    from app.marketdata import live_ingest
+
+    code = ast.unparse(ast.parse(inspect.getsource(live_ingest)))
+    assert "persist_resolved_quotes" in code
+    assert "resolve_and_record" not in code, "live_ingest re-implements identity resolution"
+    assert "resolve_prop_market" not in code, "live_ingest re-implements market resolution"
+
+
+def test_the_amendment_refuses_a_stale_parent():
+    """The row the operator reviewed must be the row superseded. An
+    amendment reviewed against one parent and applied against another is a
+    silent methodology change."""
+
+    from app.services.amend_capture_policy import AmendmentRefused, apply_amendment
+
+    game_id = _game("stale-parent")
+    with session_scope() as session:
+        game = session.get(Game, game_id)
+        season_id = game.season_id
+        _rules(session, season_id, rules_version="2026-research-v1")
+
+    with pytest.raises(AmendmentRefused, match="expected the active rules"):
+        with session_scope() as session:
+            apply_amendment(
+                session, season_id=season_id,
+                max_observation_age_seconds=900, refresh_retry_policy=V1_RETRY,
+                rules_version="2026-research-v2", amendment_reason="freeze",
+                effective_from=datetime(2026, 9, 18, tzinfo=timezone.utc),
+                expected_current_version="some-other-version",
+            )
+
+
+def test_a_second_amendment_cannot_leave_two_active_rows():
+    """Two amendment commands racing must not both supersede the same
+    parent."""
+
+    import sqlalchemy
+
+    from app.services.amend_capture_policy import AmendmentRefused, apply_amendment
+
+    game_id = _game("two-amendments")
+    with session_scope() as session:
+        game = session.get(Game, game_id)
+        season_id = game.season_id
+        _rules(session, season_id, rules_version="2026-research-v1")
+
+    with session_scope() as session:
+        apply_amendment(
+            session, season_id=season_id,
+            max_observation_age_seconds=900, refresh_retry_policy=V1_RETRY,
+            rules_version="2026-research-v2", amendment_reason="freeze",
+            effective_from=datetime(2026, 9, 18, tzinfo=timezone.utc),
+            expected_current_version="2026-research-v1",
+        )
+
+    # The second command still believes v1 is active -- it is not.
+    with pytest.raises(AmendmentRefused):
+        with session_scope() as session:
+            apply_amendment(
+                session, season_id=season_id,
+                max_observation_age_seconds=600, refresh_retry_policy=V1_RETRY,
+                rules_version="2026-research-v3", amendment_reason="freeze again",
+                effective_from=datetime(2026, 9, 18, tzinfo=timezone.utc),
+                expected_current_version="2026-research-v1",
+            )
+
+    with session_scope() as session:
+        active = session.execute(
+            sqlalchemy.select(SeasonRules)
+            .where(SeasonRules.season_id == season_id, SeasonRules.superseded_by.is_(None))
+        ).scalars().all()
+    assert len(active) == 1
+    assert active[0].rules_version == "2026-research-v2"

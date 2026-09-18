@@ -37,7 +37,8 @@ from app.db.repositories.market_repository import MarketRepository
 from app.db.session import session_scope
 from app.domain.enums import StatFamily
 from app.forecast_lab.market_snapshot_service import MarketSnapshotService
-from app.marketdata.ingestion import IngestionService, partition_ambiguous_lines
+from app.marketdata.game_refresh import PersistCounts, persist_resolved_quotes
+from app.marketdata.ingestion import partition_ambiguous_lines
 from app.marketdata.providers.the_odds_api import (
     API_KEY_ENV_VAR,
     DEFAULT_SPORT,
@@ -46,11 +47,9 @@ from app.marketdata.providers.the_odds_api import (
 )
 from app.marketdata.telemetry import finish_run, record_call, sanitize_message, start_run
 from app.rosterdata.base import LIVE_ROSTER_MAX_AGE_HOURS
-from app.rosterdata.identity_service import RosterIdentityConflict, resolve_and_record
 from app.rosterdata.providers.nflverse import PROVIDER_NAME as ROSTER_PROVIDER
 from app.rosterdata.providers.nflverse import NflverseRosterProvider
-from app.rosterdata.resolution import resolve_player
-from app.rosterdata.teams import CanonicalTeam, TeamMappingError, canonical_from_odds_api
+from app.rosterdata.teams import TeamMappingError, canonical_from_odds_api
 
 CANONICAL_BOOK = "DRAFTKINGS"
 
@@ -368,62 +367,37 @@ def run(
             )
         report.game_id = str(game.id)
 
-        service = IngestionService(session)
         run_row = session.get(IngestionRun, odds_run_id)
-        provider_call = session.get(ProviderCall, quote_call_id)
 
-        resolved_cache: dict[str, uuid.UUID | None] = {}
-        for quote in accepted:
-            name = quote.player.display_name
-            if name not in resolved_cache:
-                resolution = resolve_player(
-                    odds_display_name=name,
-                    home_team=home,
-                    away_team=away,
-                    snapshot=snapshot,
-                    provider=ODDS_PROVIDER,
-                )
-                if not resolution.resolved:
-                    resolved_cache[name] = None
-                    bucket = report.ambiguous if resolution.outcome == "AMBIGUOUS_PLAYER" else report.unresolved
-                    if name not in bucket:
-                        bucket.append(name)
-                    continue
-                try:
-                    game_player = resolve_and_record(
-                        session, game_id=game.id, resolution=resolution, display_name=name,
-                        snapshot=snapshot, roster_provider_call_id=roster_call_id, observed_at=now,
-                    )
-                except RosterIdentityConflict as exc:
-                    resolved_cache[name] = None
-                    report.conflicts.append(str(exc))
-                    continue
-                resolved_cache[name] = game_player.player_id
-                label = f"{name} [{resolution.team.value}/{resolution.position}] vs {resolution.opponent.value}"
-                if label not in report.resolved:
-                    report.resolved.append(label)
-
-            player_id = resolved_cache[name]
-            if player_id is None:
-                continue
-
-            market = service.resolve_prop_market(
-                game_id=game.id, player_id=player_id, stat_type=quote.stat_family.value
-            )
-            report.markets_created += 1
-            written = service.persist_quote(
-                quote=quote, market_id=market.id, provider_call=provider_call, run=run_row
-            )
-            if written is None:
-                report.quotes_deduplicated += 1
-            else:
-                report.quotes_written += 1
-                if quote.provider_market_updated_at:
-                    report.provider_market_change_age_seconds.append(
-                        (quote.as_of_at - quote.provider_market_updated_at).total_seconds()
-                    )
-            if quote.sportsbook not in report.books:
-                report.books.append(quote.sportsbook)
+        # The identity-resolution and quote-persistence loop is SHARED with
+        # the production refresh (game_refresh.persist_resolved_quotes), not
+        # copied. A second implementation could drift -- different alias
+        # handling, a different quarantine rule -- and nothing would flag
+        # it, because both would keep producing plausible rows.
+        counts = PersistCounts(quotes_observed=report.quotes_observed)
+        counts.ambiguous.extend(report.ambiguous)
+        persist_resolved_quotes(
+            session,
+            game=game,
+            home=home,
+            away=away,
+            quotes=accepted,
+            roster_snapshot=snapshot,
+            roster_provider_call_id=roster_call_id,
+            provider_call=session.get(ProviderCall, quote_call_id),
+            run=run_row,
+            observed_at=now,
+            counts=counts,
+        )
+        report.quotes_written = counts.quotes_written
+        report.quotes_deduplicated = counts.quotes_deduplicated
+        report.markets_created = counts.markets_touched
+        report.resolved = counts.resolved
+        report.unresolved = counts.unresolved
+        report.ambiguous = counts.ambiguous
+        report.conflicts = counts.conflicts
+        report.books = counts.books
+        report.provider_market_change_age_seconds = counts.provider_market_change_age_seconds
 
         run_row.quotes_observed = report.quotes_observed
         run_row.quotes_written = report.quotes_written
