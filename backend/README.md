@@ -1985,7 +1985,89 @@ it. And `committed_at` is the **write-boundary** clock, not
 calling the earlier moment "committed" put a timestamp in the durable
 record that no write ever happened at.
 
+## The allocator review was run at the wrong slot count
+
+Production `SeasonRules` say `benchmark_slate_size = 10`. The Phase 4A.7
+comparison, its documentation and its production-shaped test helpers were
+all built around **five**. Five appears in no governing document — it came
+from test fixtures. So the approval package justifying `STABLE_HASH_V1` was
+evaluated under a sampling regime the season will never run.
+
+The evidence for 10 is unambiguous and four-fold: `CONSTITUTION.md` §20
+("a standardized benchmark slate of approximately: 10 props"), §3192
+("Benchmark slate size / Current recommendation: 10"), `RULES.md` §7
+(`benchmark_slate_size = 10`), `ARCHITECTURE.md` §4a ("Allocate
+`benchmark_slate_size` (10) slots"), and the Phase 4 seam doc. The
+production provisioner has always written 10. **Nothing changed in
+production; the review was wrong, not the rules.**
+
+### Redone at 10 slots, against the real 2026 schedule
+
+| Method | W3 blocks | W4 blocks | Survived the real 16→14 gap |
+| --- | --- | --- | --- |
+| `ROUND_ROBIN_BY_KICKOFF_V0` | **2/6** | **3/7** | 8/10 |
+| `STRATIFIED_BY_KICKOFF_V1` | 5/6 | 5/7 | **7/10** |
+| `STABLE_HASH_V1` | 5/6 | 4/7 | **9/10** |
+| `KICKOFF_BLOCK_STRATIFIED_V1` | **6/6** | **7/7** | 9/10 |
+
+Two conclusions inverted.
+
+**V0 is far worse at ten than at five.** One Thursday game plus a nine-game
+early-Sunday window *is* the first ten by kickoff, so it drew every slot
+from two blocks in Week 3 and three in Week 4, excluding every
+late-afternoon, Sunday-night and Monday-night fixture in both — every week,
+structurally. `ARCHITECTURE.md` §4a predicted exactly this and called for a
+rule seeded only from schedule identifiers. The five-slot comparison
+understated it.
+
+**The kickoff-block candidate's defect does not manifest at ten.** Its
+exclusion of the latest block requires `slots < blocks`; with ten slots and
+six or seven blocks the chronological walk completes a full pass, covering
+6/6 and 7/7. The old verdict was not carried forward — it was re-measured.
+Its standing objection is different: one slot per block gives a singleton
+Monday-night block the same share as a nine-game Sunday block, making a
+primetime fixture roughly three times likelier to be benchmarked.
+
+**`STABLE_HASH_V1` misses Thursday in both weeks, and that is not the same
+kind of miss.** Selecting 10 of 16 means each singleton block has a 62.5%
+chance of inclusion, so missing some in a given week is sampling variance.
+V0 misses the same blocks every week by construction. A single week's block
+count cannot distinguish those, and comparing them on it would be the
+mistake the whole re-review exists to avoid.
+
+Its pool behaviour is the best of the four at ten slots: the real Week-3
+provider gap cost it exactly one selection, removing an unselected fixture
+changes nothing, and a kickoff correction changes nothing. `STRATIFIED` is
+the only candidate whose selection moves when *only* a kickoff changes.
+
+### Ten slots over five prop types is two targets each
+
+| Slot | Target | Fallback order |
+| --- | --- | --- |
+| 1, 6 | `passing_yards` | pass TD → rush → rec → recv |
+| 2, 7 | `passing_touchdowns` | rush → rec → recv → pass |
+| 3, 8 | `rushing_yards` | rec → recv → pass → pass TD |
+| 4, 9 | `receptions` | recv → pass → pass TD → rush |
+| 5, 10 | `receiving_yards` | pass → pass TD → rush → rec |
+
+Exactly two targets per stat type, every slot carrying all five in a
+deterministic rotation. That is a property of 10/5 specifically, so a
+change to either number silently changes the research design.
+
+### A guard so it cannot drift again
+
+`test_slate_size_methodology.py` pins the intended size against the
+documents that define it and against the production provisioner, and
+requires each rejected allocator's recorded defect to cite
+production-slot-count evidence. A defect measured at five slots is not
+evidence about a ten-slot season.
+
 ### Acceptance
+
+598 passed, 4 skipped. Five mutations on this pass, including the
+provisioner drifting to five and a rejection reason losing its evidence.
+
+### Earlier acceptance
 
 593 passed, 4 skipped. Twelve mutations on this pass, including the
 stale-parent lock — reverting it to `_season_pins` turns the race test red.

@@ -57,6 +57,10 @@ WINDOWS = {
 DEADLINE = THURSDAY - timedelta(hours=144)
 IN_TIME = DEADLINE - timedelta(hours=2)
 
+# A realistic SIXTEEN-fixture week: one Thursday, nine early Sunday, two
+# late-afternoon, two more, one Sunday night, one Monday night. Sixteen and
+# not ten, because a ten-slot slate over a ten-fixture week selects
+# EVERYTHING and every coverage assertion below becomes vacuous.
 FIXTURES = (
     ("ATL", "GB", THURSDAY),
     ("CAR", "CLE", SUNDAY),
@@ -66,8 +70,14 @@ FIXTURES = (
     ("KC", "MIA", SUNDAY),
     ("LAC", "BUF", SUNDAY),
     ("NYJ", "DET", SUNDAY),
+    ("SEA", "WAS", SUNDAY),
+    ("TEN", "NYG", SUNDAY),
     ("ARI", "SF", SUNDAY + timedelta(hours=3)),
+    ("MIN", "TB", SUNDAY + timedelta(hours=3)),
+    ("BAL", "DAL", SUNDAY + timedelta(hours=3, minutes=25)),
+    ("LV", "NO", SUNDAY + timedelta(hours=3, minutes=25)),
     ("LA", "DEN", SUNDAY + timedelta(hours=7)),
+    ("PHI", "CHI", SUNDAY + timedelta(days=1, hours=7)),
 )
 
 
@@ -112,7 +122,15 @@ class StubSchedule:
         )
 
 
-def _season(tag, *, method="STABLE_HASH_V1", slate_size=5, week_number=3, windows=None):
+# The PRODUCTION slot count (CONSTITUTION.md §20, RULES.md §7). This helper
+# builds production-shaped seasons, so it must not encode a number no
+# governing document specifies -- reviewing the allocators at five slots
+# is what made the first Phase 4A.7 approval package unsound.
+PRODUCTION_SLATE_SIZE = 10
+
+
+def _season(tag, *, method="STABLE_HASH_V1", slate_size=PRODUCTION_SLATE_SIZE,
+            week_number=3, windows=None):
     with session_scope() as session:
         season = Season(year=2026, name=f"slate-{tag}", status="ACTIVE")
         session.add(season)
@@ -170,13 +188,13 @@ def test_the_pool_is_the_complete_schedule_with_zero_games_registered():
 
     proposal = _commit(season_id)
 
-    assert len(proposal.pool) == 10
+    assert len(proposal.pool) == 16
     with session_scope() as session:
         fixtures = session.execute(
             select(BenchmarkSlateFixture)
             .where(BenchmarkSlateFixture.plan_id == proposal.plan_id)
         ).scalars().all()
-    assert len(fixtures) == 10, "the complete pool was not frozen under the plan"
+    assert len(fixtures) == 16, "the complete pool was not frozen under the plan"
     assert all(f.game_id is None for f in fixtures)
 
 
@@ -217,7 +235,7 @@ def test_the_fingerprint_and_pool_count_are_persisted():
     proposal = _commit(season_id)
     with session_scope() as session:
         plan = session.get(BenchmarkSlatePlan, proposal.plan_id)
-        assert plan.fixture_pool_count == 10
+        assert plan.fixture_pool_count == 16
         assert plan.fixture_pool_fingerprint == proposal.fingerprint
         assert len(plan.fixture_pool_fingerprint) == 64
         assert plan.is_official is True
@@ -232,7 +250,7 @@ def test_slots_point_at_planned_fixtures_not_games():
         slots = session.execute(
             select(BenchmarkSlot).where(BenchmarkSlot.plan_id == proposal.plan_id)
         ).scalars().all()
-    assert len(slots) == 5
+    assert len(slots) == PRODUCTION_SLATE_SIZE
     assert all(s.slate_fixture_id is not None for s in slots)
     assert all(s.game_id is None for s in slots), "a slot was coupled to a Game row"
 
@@ -320,7 +338,7 @@ def test_the_frozen_method_actually_selects_the_slate():
 
     season_id = _season("method-drives")
     proposal = _commit(season_id)
-    expected = allocate(proposal.pool, slots=5, method="STABLE_HASH_V1")
+    expected = allocate(proposal.pool, slots=PRODUCTION_SLATE_SIZE, method="STABLE_HASH_V1")
     assert [f.key.value for f in proposal.chosen] == [f.key.value for f in expected]
     with session_scope() as session:
         plan = session.get(BenchmarkSlatePlan, proposal.plan_id)
@@ -620,7 +638,7 @@ def test_an_official_plan_without_the_new_provenance_is_refused_by_the_database(
                 allocation_method="STABLE_HASH_V1", committed_at=IN_TIME,
                 is_official=True, rules_version="x",
                 schedule_provider_call_id=None,
-                fixture_pool_fingerprint="a" * 64, fixture_pool_count=10,
+                fixture_pool_fingerprint="a" * 64, fixture_pool_count=16,
                 earliest_opening_at=DEADLINE,
                 fixture_key_version=FIXTURE_KEY_VERSION,
                 resolver_version="r",
@@ -919,8 +937,8 @@ def test_the_cli_preview_shows_the_complete_pool_and_the_slots(capsys):
     out = capsys.readouterr().out
     for away, home, _ in FIXTURES:
         assert f"2026:REG:W03:{away}@{home}" in out
-    assert out.count("<-- SLOT") == 5
-    assert "slot 1" in out and "slot 5" in out
+    assert out.count("<-- SLOT") == PRODUCTION_SLATE_SIZE
+    assert "slot 1" in out and "slot 10" in out
 
 
 def test_the_cli_refuses_cleanly(capsys):
@@ -957,7 +975,7 @@ def test_readiness_reports_the_exact_state_that_actually_occurred():
     season_id = _season("readiness")
     report = _readiness(season_id)
 
-    assert report.schedule_fixture_count == 10
+    assert report.schedule_fixture_count == 16
     assert report.plan_committed is False
     assert report.registered_count == 0
     assert report.earliest_opening_at == DEADLINE
@@ -965,8 +983,8 @@ def test_readiness_reports_the_exact_state_that_actually_occurred():
 
     text = report.render()
     assert "NOT COMMITTED" in text
-    assert "Odds Games registered   0/10" in text
-    assert "incomplete (0/10)" in text
+    assert "Odds Games registered   0/16" in text
+    assert "incomplete (0/16)" in text
 
 
 def test_readiness_marks_a_week_past_its_commit_deadline_as_ineligible():
@@ -982,7 +1000,7 @@ def test_readiness_counts_partial_provider_listing():
         _game(season_id, away, home, kickoff=kickoff)
     report = _readiness(season_id)
     assert report.registered_count == 8
-    assert "incomplete (8/10)" in report.render()
+    assert "incomplete (8/16)" in report.render()
 
 
 def test_readiness_uses_the_committed_plans_own_frozen_pool():
@@ -996,7 +1014,7 @@ def test_readiness_uses_the_committed_plans_own_frozen_pool():
     report = _readiness(season_id, schedule=smaller)
     assert report.plan_committed is True
     assert report.plan_id == proposal.plan_id
-    assert report.schedule_fixture_count == 10, "it recomputed from a fresh fetch"
+    assert report.schedule_fixture_count == 16, "it recomputed from a fresh fetch"
     assert report.plan_fingerprint == proposal.fingerprint
     assert smaller.calls == 0, "it fetched a schedule it did not need"
 
@@ -1006,8 +1024,8 @@ def test_readiness_names_slotted_fixtures_with_no_registered_game():
     _commit(season_id)
     report = _readiness(season_id)
 
-    assert len(report.slotted) == 5
-    assert len(report.unbound_slots) == 5
+    assert len(report.slotted) == PRODUCTION_SLATE_SIZE
+    assert len(report.unbound_slots) == PRODUCTION_SLATE_SIZE
     text = report.render()
     assert "COVERAGE FAILURE" in text
     assert "never reallocated" in text
@@ -1180,7 +1198,7 @@ def test_an_official_plan_without_the_planning_version_is_refused_by_the_databas
                 schedule_provider_call_id=None,
                 fixture_pool_fingerprint="a" * 64,
                 planning_input_fingerprint="b" * 64,
-                fixture_pool_count=10, earliest_opening_at=DEADLINE,
+                fixture_pool_count=16, earliest_opening_at=DEADLINE,
                 fixture_key_version=FIXTURE_KEY_VERSION, resolver_version="r",
             ))
 

@@ -1,4 +1,11 @@
-"""How five benchmark slots are chosen from a sixteen-fixture week. Pure.
+"""How a week's benchmark slots are chosen from its fixture pool. Pure.
+
+The slot count comes from `SeasonRules.benchmark_slate_size`, which the
+constitution (§20), RULES.md §7 and ARCHITECTURE.md all put at **10**. The
+first version of this comparison was run at five, which is not a number any
+document specifies -- it came from test fixtures -- and the conclusions did
+not survive being redone at ten. Both are recorded below because the
+difference is the point.
 
 **Nothing here is frozen.** The V1 candidates exist to be compared on
 methodology, and the comparison belongs to a human before a season depends
@@ -12,11 +19,22 @@ wrong with it.
 
 It is not a round robin. The code is
 `games_by_kickoff[i % len(games)]` for `i` in `0..slots-1`, which is a
-genuine rotation only when there are FEWER fixtures than slots. With five
+genuine rotation only when there are FEWER fixtures than slots. With ten
 slots and sixteen fixtures every index is distinct and it simply takes the
-first five in sort order — a pure recency bias toward whichever games kick
-earliest, which in an NFL week means Thursday night and the early Sunday
-block, every week, forever.
+first ten in kickoff order.
+
+**At ten slots that is not a mild bias, it is total.** An NFL week has one
+Thursday game and eight or nine in the early Sunday window, so the first
+ten by kickoff are exactly those two blocks. Against the real 2026
+schedule it drew all ten slots from 2 of Week 3's 6 kickoff blocks and 3 of
+Week 4's 7, excluding every late-afternoon, Sunday-night and Monday-night
+fixture in both. Every week, structurally, forever.
+
+ARCHITECTURE.md §4a predicted this in as many words -- "with 10 slots
+against a 16-game week, round-robin by kickoff ... systematically favors
+Thursday/early-Sunday games and could under-select late-Sunday/Monday games
+every single week" -- and called for a rule seeded only from schedule
+identifiers. It was right, and the five-slot comparison understated it.
 
 Its tie-break was a database UUID. Ten of the sixteen 2026 Week-3 fixtures
 kick at exactly the same instant, so four of five slots were decided by
@@ -121,9 +139,20 @@ def _stable_hash(
     The strongest reproducibility story here: the result depends on
     nothing but the set of keys, so input order, kickoff drift and a
     database rebuild all leave it untouched. It is also the least
-    NFL-aware — a hash has no opinion about time, so it can legitimately
-    put four of five slots in the same kickoff block, or none in the late
-    window at all.
+    NFL-aware — a hash has no opinion about time.
+
+    At ten slots against the real 2026 schedule it covered 5 of Week 3's 6
+    kickoff blocks and 4 of Week 4's 7, missing Thursday in both. That
+    looks worse than the block-stratified candidate and is a DIFFERENT KIND
+    of miss: selecting 10 of 16 fixtures means each singleton block has a
+    62.5% chance of inclusion, so missing some in a given week is sampling
+    variance, not bias. V0 misses the same blocks every week by
+    construction. A random miss and a structural one should not be compared
+    on a single week's block count.
+
+    Its pool behaviour is the best of the four: the real Week-3 provider
+    gap (16 -> 14) cost it exactly one selection, removing an unselected
+    fixture changes nothing, and a kickoff correction changes nothing.
     """
 
     return tuple(sorted(fixtures, key=_digest)[:slots])
@@ -149,6 +178,14 @@ def _kickoff_block_stratified(
     reported in the Phase 4A.7 comparison as if it were balance, which it
     is not — the reviewer caught it, not the tests, because the test
     asserted only that it beat V0.
+
+    **The defect does NOT manifest at the production slot count.** With ten
+    slots and six or seven blocks the chronological walk completes a full
+    pass before running out, so every block gets at least one selection: it
+    covered 6/6 in real Week 3 and 7/7 in real Week 4. The exclusion is an
+    artifact of `slots < blocks`, which is only reachable below the frozen
+    slate size. Recorded honestly rather than carried forward as a
+    permanent verdict.
 
     A second objection stands regardless of the walk order: dealing one
     slot per block weights a one-game Thursday block equally with a
@@ -193,8 +230,10 @@ ALLOCATION_METHODS: dict[str, AllocationMethod] = {
         reproducible=True,
         approved=False,
         defect="Not a round robin when slots < fixtures: it takes the first N "
-               "by kickoff, a permanent bias toward Thursday night and the "
-               "early Sunday block. REJECTED in the Phase 4A.7 review.",
+               "by kickoff. At the production slot count of 10 that is TOTAL "
+               "temporal bias -- all ten from 2 of 6 kickoff blocks in real "
+               "Week 3 and 3 of 7 in Week 4, excluding every late-afternoon, "
+               "Sunday-night and Monday-night fixture in both. REJECTED.",
     ),
     "STRATIFIED_BY_KICKOFF_V1": AllocationMethod(
         name="STRATIFIED_BY_KICKOFF_V1",
@@ -204,8 +243,11 @@ ALLOCATION_METHODS: dict[str, AllocationMethod] = {
         reproducible=True,
         approved=False,
         defect="Samples POSITIONS rather than fixtures, so changing the pool "
-               "size moves every rank: removing two fixtures from a 16-game "
-               "week replaced three of five selections. Not selected.",
+               "size moves every rank: at 10 slots, the real Week-3 provider "
+               "gap (16 -> 14) replaced three of ten selections, and removing "
+               "one selected fixture cascaded into four further changes. It "
+               "is also the only candidate whose selection moves when only a "
+               "KICKOFF changes. Not selected.",
     ),
     "STABLE_HASH_V1": AllocationMethod(
         name="STABLE_HASH_V1",
@@ -222,11 +264,15 @@ ALLOCATION_METHODS: dict[str, AllocationMethod] = {
         allocate=_kickoff_block_stratified,
         reproducible=True,
         approved=False,
-        defect="Stops once `slots` selections exist while walking blocks "
-               "chronologically, so with six blocks and five slots the LATEST "
-               "block (Monday night) is structurally excluded. Its reported "
-               "'5/6 blocks' is always the FIRST five. Also weights a one-game "
-               "Thursday block equally with a ten-game Sunday block.",
+        defect="Structurally excludes the latest kickoff block whenever "
+               "slots < blocks (six blocks, five slots -> Monday night can "
+               "never be selected). At the production count of 10 that does "
+               "NOT occur -- it covered 6/6 and 7/7 blocks on the real 2026 "
+               "weeks. The standing objection is weighting: one slot per "
+               "block deals a singleton Monday-night block the same share as "
+               "a nine-game Sunday block, so a primetime fixture is roughly "
+               "three times likelier to be benchmarked than an early one. "
+               "Deliberate over-representation, not neutrality.",
     ),
 }
 

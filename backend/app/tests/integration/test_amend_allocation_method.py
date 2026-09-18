@@ -43,7 +43,7 @@ def _season(tag, *, version="2026-research-v2", method=None):
             market_data_provider="THE_ODDS_API", roster_data_provider="NFLVERSE",
             research_settlement_provider="NFLVERSE", research_settlement_delay_hours=24,
             supported_prop_types=["receiving_yards"], devig_method="PROPORTIONAL_V1",
-            benchmark_slate_size=5, benchmark_allocation_method=method,
+            benchmark_slate_size=10, benchmark_allocation_method=method,
             batch_methodology="SINGLE_BATCH",
             checkpoint_windows={
                 "OPENING": {"start_hours_before_kickoff": 144, "end_hours_before_kickoff": 96},
@@ -292,8 +292,12 @@ def test_the_dry_run_names_the_rejected_methods_and_why(capsys):
     ])
     out = capsys.readouterr().out
     assert "KICKOFF_BLOCK_STRATIFIED_V1" in out
-    assert "structurally excluded" in out or "structurally excludes" in out
     assert "ROUND_ROBIN_BY_KICKOFF_V0" in out
+    assert "STRATIFIED_BY_KICKOFF_V1" in out
+    # The V0 rejection must state the bias at the PRODUCTION slot count, not
+    # at the five-slot regime the first review ran under.
+    assert "2 of 6 kickoff blocks" in out
+    assert "Monday-night" in out
 
 
 def test_the_cli_refuses_cleanly(capsys):
@@ -330,7 +334,7 @@ def test_the_amended_season_can_then_commit_an_official_slate():
         schedule_provider=StubSchedule(), now=IN_TIME,
     )
     assert proposal.allocation_method == "STABLE_HASH_V1"
-    assert len(proposal.chosen) == 5
+    assert len(proposal.chosen) == 10
 
 
 def test_the_amendment_requires_a_reason_and_persists_it():
