@@ -1787,7 +1787,90 @@ backwards: the unlisted game is the reason to hurry. The week-3 preview
 found this live — The Odds API listed 14 of nflverse's 16 fixtures, with
 LAC @ BUF and NYJ @ DET missing.
 
+## Phase 4A.7 — the benchmark pool was `list[Game]`
+
+`commit_benchmark_slate_plan` said it committed *using only the schedule*
+and then required `games: list[Game]`. A `Game` exists only once THE ODDS
+API has posted the event, so the market provider's posting horizon
+silently decided which fixtures a precommitted research sample could draw
+from. That is how two unlisted Week-3 events could change a slate nflverse
+already knew all sixteen fixtures for.
+
+The allocator also ordered by `(kickoff_at, str(Game.id))`, and `Game.id`
+is `uuid.uuid4()`. Ten of the sixteen 2026 Week-3 fixtures kick at exactly
+the same instant, so four of five slots were decided by UUID ordering —
+deterministic inside one database, different after a rebuild.
+
+### One canonical fixture identity
+
+`fixture_identity` defines the key — `season / game_type / week / canonical
+away / canonical home` — and everything that needs to say *which fixture
+is this* imports it. **Kickoff is deliberately excluded.** Broadcast times
+move, fixtures do not, and an identity that changed with the clock would
+silently un-bind a committed plan. The week is zero-padded (`W03`) so key
+order is numeric order past week 9. `pool_fingerprint` hashes the
+canonical ordered keys, version-prefixed, so it survives a clean rebuild.
+
+### The plan owns its fixture pool
+
+`benchmark_slate_fixtures` holds the **complete** pool the allocator saw,
+owned by its plan rather than kept in a global table — a frozen historical
+artifact, not a second source of truth a later schedule release can
+rewrite. `game_id` is NULL until registration binds it, and **binding
+moves that one column**. A kickoff inside tolerance binds without writing
+itself back; a kickoff outside it is reported as drift and refused. A
+fixture the provider never lists is a coverage failure, never a
+reallocation.
+
+### One slate writer
+
+The Phase-2B `games=[...]` entry point is now a synthetic adapter that
+converts to planned fixtures and delegates to the same core. Asserted
+structurally: it may not call `allocate` or construct a `BenchmarkSlot`.
+Two independently-correct writers would pass their own tests for months
+and disagree in the week it counted.
+
+### The deadline is enforced, and checked on the right clock
+
+`official_slate` takes a season and a week. Slate size, prop types,
+allocation method and checkpoint windows all come from frozen
+`SeasonRules`. The deadline is the earliest OPENING start across the
+**whole** week — a Thursday game nobody picked still ends the precommit
+period — and it is checked on the clock read *after* the schedule fetch. A
+command that read the clock at startup could begin thirty seconds before
+the deadline, spend forty seconds fetching, and commit late while
+truthfully reporting it started in time. There is no override flag. A
+fixture with no kickoff fails the whole commit: the deadline is computed
+from kickoff, so one unknown makes it uncomputable.
+
+### The allocator is not frozen
+
+`SeasonRules.benchmark_allocation_method` is NULL until an amendment
+freezes one, and official commitment refuses on NULL *before* spending a
+fetch. `ROUND_ROBIN_BY_KICKOFF_V0` is kept only for comparison: with five
+slots and sixteen fixtures `games[i % len(games)]` is every index
+distinct, so it takes the first five by kickoff — a permanent bias toward
+Thursday night and the early Sunday block. Against the real 2026 Week-3
+schedule it draws all five from 2 of 6 kickoff blocks.
+
+| Method | Blocks covered (W3) | Survives a 2-fixture pool change |
+| --- | --- | --- |
+| `ROUND_ROBIN_BY_KICKOFF_V0` | 2/6 | 5/5 |
+| `STRATIFIED_BY_KICKOFF_V1` | 3/6 | 2/5 |
+| `STABLE_HASH_V1` | 3/6 | 5/5 |
+| `KICKOFF_BLOCK_STRATIFIED_V1` | 5/6 | 5/5 |
+
+All four are reproducible under 1,000 shuffled input orderings. **None is
+frozen** — that is a methodology decision, not an implementation one.
+
 ### Acceptance
+
+538 passed, 4 skipped. Migration `d16b83f9a4c2`. Twenty-five mutations
+across the phase; the four that survived the first pass each got a test
+and now fail — including binding writing a kickoff back, and an
+unversioned hash ranking.
+
+### Earlier acceptance
 
 469 passed, 4 skipped. Mutation-tested twenty-two ways across both passes.
 The census half: deleting each of the benchmark-slot, ticket, wager,

@@ -630,3 +630,112 @@ def test_the_cli_refuses_cleanly(capsys):
 def _count(model) -> int:
     with session_scope() as session:
         return session.execute(select(func.count()).select_from(model)).scalar()
+
+
+# --- week readiness ----------------------------------------------------
+
+
+def _readiness(season_id, *, now=IN_TIME, schedule=None, week=3):
+    from app.forecast_lab.week_readiness import assess_week
+
+    return assess_week(
+        season_id=season_id, week_number=week,
+        schedule_provider=schedule or StubSchedule(), now=now,
+    )
+
+
+def test_readiness_reports_the_exact_state_that_actually_occurred():
+    """16 schedule fixtures, no plan, zero Games registered, and a deadline
+    hours away — the state discovered at 16:53 on 2026-09-18."""
+
+    season_id = _season("readiness")
+    report = _readiness(season_id)
+
+    assert report.schedule_fixture_count == 10
+    assert report.plan_committed is False
+    assert report.registered_count == 0
+    assert report.earliest_opening_at == DEADLINE
+    assert report.past_commit_deadline is False
+
+    text = report.render()
+    assert "NOT COMMITTED" in text
+    assert "Odds Games registered   0/10" in text
+    assert "incomplete (0/10)" in text
+
+
+def test_readiness_marks_a_week_past_its_commit_deadline_as_ineligible():
+    season_id = _season("readiness-late")
+    report = _readiness(season_id, now=DEADLINE + timedelta(hours=1))
+    assert report.past_commit_deadline is True
+    assert "NOT ELIGIBLE" in report.render()
+
+
+def test_readiness_counts_partial_provider_listing():
+    season_id = _season("readiness-partial")
+    for away, home, kickoff in FIXTURES[:8]:
+        _game(season_id, away, home, kickoff=kickoff)
+    report = _readiness(season_id)
+    assert report.registered_count == 8
+    assert "incomplete (8/10)" in report.render()
+
+
+def test_readiness_uses_the_committed_plans_own_frozen_pool():
+    """A later schedule release must not silently recompute a committed
+    week. The plan froze what the allocator saw."""
+
+    season_id = _season("readiness-committed")
+    proposal = _commit(season_id)
+    smaller = StubSchedule(games=FIXTURES[:4])
+
+    report = _readiness(season_id, schedule=smaller)
+    assert report.plan_committed is True
+    assert report.plan_id == proposal.plan_id
+    assert report.schedule_fixture_count == 10, "it recomputed from a fresh fetch"
+    assert report.plan_fingerprint == proposal.fingerprint
+    assert smaller.calls == 0, "it fetched a schedule it did not need"
+
+
+def test_readiness_names_slotted_fixtures_with_no_registered_game():
+    season_id = _season("readiness-coverage")
+    _commit(season_id)
+    report = _readiness(season_id)
+
+    assert len(report.slotted) == 5
+    assert len(report.unbound_slots) == 5
+    text = report.render()
+    assert "COVERAGE FAILURE" in text
+    assert "never reallocated" in text
+
+
+def test_readiness_writes_nothing_and_calls_no_odds_provider():
+    import ast
+    import inspect
+
+    from app.forecast_lab import week_readiness
+
+    season_id = _season("readiness-readonly")
+    before = (_count(Game), _count(BenchmarkSlatePlan), _count(BenchmarkSlateFixture))
+    _readiness(season_id)
+    assert (_count(Game), _count(BenchmarkSlatePlan), _count(BenchmarkSlateFixture)) == before
+
+    tree = ast.parse(inspect.getsource(week_readiness))
+    names = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)} | {
+        n.id for n in ast.walk(tree) if isinstance(n, ast.Name)
+    }
+    for forbidden in ("fetch_quotes", "list_events", "TheOddsApiProvider",
+                      "commit_official_slate", "commit_from_planned_fixtures"):
+        assert forbidden not in names, f"the readiness report reaches {forbidden}"
+
+
+def test_the_readiness_cli_exits_cleanly_on_failure(capsys):
+    from app.forecast_lab.week_readiness import main as readiness_main
+
+    season_id = _season("readiness-cli")
+    code = readiness_main(
+        ["--season-id", str(season_id), "--week-number", "3"],
+        schedule_provider=StubSchedule(ok=False),
+    )
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "CANNOT ASSESS" in out
+    assert "Traceback" not in out
