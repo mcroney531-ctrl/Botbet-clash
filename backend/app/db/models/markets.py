@@ -343,3 +343,13 @@ class GameScopeCorrection(Base):
     reason: Mapped[str] = mapped_column(String, nullable=False)
     corrected_at: Mapped[datetime] = mapped_column(nullable=False)
     created_at: Mapped[datetime] = created_at_column()
+
+    __table_args__ = (
+        # Fail closed in the DATABASE, not only in the repair tool. A week
+        # correction that cannot name the schedule snapshot behind it is
+        # indistinguishable from the hand-typed week it replaces.
+        CheckConstraint(
+            "field_corrected <> 'week_number' OR schedule_provider_call_id IS NOT NULL",
+            name="week_correction_requires_schedule_call",
+        ),
+    )

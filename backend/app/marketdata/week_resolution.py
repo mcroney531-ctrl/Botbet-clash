@@ -84,20 +84,21 @@ class WeekResolution:
         return self.outcome.may_persist
 
 
-def resolve_event_week(
+def resolve_fixture(
     *,
     home: CanonicalTeam,
     away: CanonicalTeam,
     kickoff_at: datetime,
-    requested_week: int,
     schedule: ScheduleSnapshot,
     kickoff_tolerance: timedelta = DEFAULT_KICKOFF_TOLERANCE,
 ) -> WeekResolution:
-    """Resolve, then REQUIRE the resolved week to equal the requested one.
+    """WHICH WEEK IS THIS FIXTURE? No request to compare against.
 
-    Never "the operator asked for week 4, so this is week 4". The schedule
-    decides what week a fixture is; the request only decides whether we are
-    interested in it right now.
+    Split out from `resolve_event_week` so the audited week REPAIR can ask
+    the schedule the open question -- "what week is this game" -- using the
+    same fixture matching and the same kickoff policy that registration
+    uses. A repair that derived the week by a second route could disagree
+    with the rule that classified every other game.
     """
 
     matches: list[ScheduledGame] = [
@@ -125,17 +126,6 @@ def resolve_event_week(
         )
 
     scheduled = matches[0]
-    if scheduled.week != requested_week:
-        return WeekResolution(
-            outcome=WeekOutcome.OTHER_WEEK,
-            week=scheduled.week,
-            detail=(
-                f"{away.value} @ {home.value} is week {scheduled.week}, not the "
-                f"requested week {requested_week}"
-            ),
-            scheduled_kickoff=scheduled.kickoff_at,
-        )
-
     if scheduled.kickoff_at is not None:
         drift = abs(kickoff_at - scheduled.kickoff_at)
         if drift > kickoff_tolerance:
@@ -157,3 +147,36 @@ def resolve_event_week(
         detail=f"week {scheduled.week} confirmed by the {schedule.provider} schedule",
         scheduled_kickoff=scheduled.kickoff_at,
     )
+
+
+def resolve_event_week(
+    *,
+    home: CanonicalTeam,
+    away: CanonicalTeam,
+    kickoff_at: datetime,
+    requested_week: int,
+    schedule: ScheduleSnapshot,
+    kickoff_tolerance: timedelta = DEFAULT_KICKOFF_TOLERANCE,
+) -> WeekResolution:
+    """Resolve the fixture, then REQUIRE it to be the requested week.
+
+    Never "the operator asked for week 4, so this is week 4". The schedule
+    decides what week a fixture is; the request only decides whether we are
+    interested in it right now.
+    """
+
+    resolution = resolve_fixture(
+        home=home, away=away, kickoff_at=kickoff_at,
+        schedule=schedule, kickoff_tolerance=kickoff_tolerance,
+    )
+    if resolution.outcome is WeekOutcome.MATCHED and resolution.week != requested_week:
+        return WeekResolution(
+            outcome=WeekOutcome.OTHER_WEEK,
+            week=resolution.week,
+            detail=(
+                f"{away.value} @ {home.value} is week {resolution.week}, not the "
+                f"requested week {requested_week}"
+            ),
+            scheduled_kickoff=resolution.scheduled_kickoff,
+        )
+    return resolution

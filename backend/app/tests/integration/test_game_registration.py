@@ -613,7 +613,11 @@ def test_the_duplicate_recovery_branch_works_deterministically():
 # game as Week 4 -- and caught ZERO real Week 4 games, since Week 4 runs
 # 2026-10-01..10-05.
 
-from app.marketdata.week_resolution import WeekOutcome, resolve_event_week
+from app.marketdata.week_resolution import (
+    RESOLVER_VERSION,
+    WeekOutcome,
+    resolve_event_week,
+)
 from app.scheduledata.base import ScheduledGame, ScheduleFetchResult, ScheduleSnapshot
 
 
@@ -1171,59 +1175,457 @@ def test_a_game_accepted_outside_tolerance_can_never_reach_a_checkpoint():
         ).scalar() == 0
 
 
+def _count(model) -> int:
+    with session_scope() as session:
+        return session.execute(select(func.count()).select_from(model)).scalar()
+
+
 # --- the audited repair -----------------------------------------------
+#
+# The repair used to take `--authoritative-week 2` and trust it. That
+# reproduced, inside the repair tool, the exact defect the repair exists to
+# undo: Phase 4A.2 wrote week 3 because a human typed 3. These tests pin
+# the property that replaced it -- THE SCHEDULE DECIDES -- and the lock
+# that makes the write safe against a concurrent one.
 
 
 def _mis_scoped_game(tag: str, *, week=3):
+    """A game registered under a week the schedule would not give it.
+
+    Registered with a schedule that agrees at registration time (so the row
+    is created normally), then repaired against a schedule that says
+    something else -- which is the real history: the week was hand-typed
+    before schedule verification existed.
+    """
+
     season_id = _season(f"repair-{tag}")
     schedule = _schedule(_scheduled("DET", "BUF", week=week))
     report = _register_verified(season_id, [_event("e1")], schedule, apply=True, week=week)
     return report.created[0].game_id
 
 
-def test_the_repair_refuses_without_the_expected_current_week():
+def _truth(week=2, *, kickoff=KICKOFF):
+    """The authoritative schedule the repair consults."""
+
+    return StubSchedule(_schedule(_scheduled("DET", "BUF", week=week, kickoff=kickoff)))
+
+
+def _verdict(game_id, *, truth=None):
+    from app.services.repair_game_week import derive_authoritative_week
+
+    return derive_authoritative_week(
+        game_id=game_id, schedule_provider=truth or _truth(),
+    )
+
+
+# --- the schedule decides, not the operator ---------------------------
+
+
+def test_the_operator_cannot_supply_an_authoritative_week():
+    """No flag can name the corrected week. If one existed, the repair
+    would just be the original hand-typing with an audit row attached."""
+
+    from app.services.repair_game_week import main
+
+    with pytest.raises(SystemExit):
+        main(["--game-id", str(uuid.uuid4()), "--expect-current-week", "3",
+              "--authoritative-week", "2"])
+
+
+def test_the_corrected_week_comes_from_the_schedule():
+    from app.services.repair_game_week import apply_repair
+
+    game_id = _mis_scoped_game("derived")
+    verdict = _verdict(game_id, truth=_truth(week=2))
+    with session_scope() as session:
+        apply_repair(session, verdict=verdict, expected_current_week=3)
+
+    with session_scope() as session:
+        assert session.get(Game, game_id).week_number == 2
+
+
+def test_a_different_schedule_answer_produces_a_different_correction():
+    """The corrected value TRACKS the schedule. If it were hard-coded or
+    operator-supplied, this test would write 2 like the one above."""
+
+    from app.services.repair_game_week import apply_repair
+
+    game_id = _mis_scoped_game("derived-7")
+    verdict = _verdict(game_id, truth=_truth(week=7))
+    with session_scope() as session:
+        apply_repair(session, verdict=verdict, expected_current_week=3)
+
+    with session_scope() as session:
+        assert session.get(Game, game_id).week_number == 7
+
+
+def test_the_repair_uses_the_same_resolver_as_registration():
+    """One matcher, not two. A repair that derived the week by a second
+    route could disagree with the rule that classified every other game."""
+
+    import ast
+    import inspect
+
+    from app.services import repair_game_week
+
+    tree = ast.parse(inspect.getsource(repair_game_week))
+    imported = {
+        alias.name
+        for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
+        for alias in node.names
+        if node.module == "app.marketdata.week_resolution"
+    }
+    assert "resolve_fixture" in imported
+    called = {
+        node.func.id for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    assert "resolve_fixture" in called
+
+
+def test_the_expected_authoritative_week_is_a_guard_not_an_override():
     from app.services.repair_game_week import RepairRefused, plan_repair
 
-    game_id = _mis_scoped_game("expect")
+    game_id = _mis_scoped_game("guard")
+    verdict = _verdict(game_id, truth=_truth(week=2))
     with session_scope() as session:
-        with pytest.raises(RepairRefused, match="expected week_number"):
+        with pytest.raises(RepairRefused, match="schedule says week 2"):
             plan_repair(
-                session, game_id=game_id,
-                expected_current_week=9, authoritative_week=2,
+                session, verdict=verdict, expected_current_week=3,
+                expect_authoritative_week=5,
             )
 
+    with session_scope() as session:
+        assert session.get(Game, game_id).week_number == 3
 
-def test_the_repair_is_audited_and_changes_only_the_week():
+
+def test_a_matching_guard_lets_the_repair_through():
+    from app.services.repair_game_week import plan_repair
+
+    game_id = _mis_scoped_game("guard-ok")
+    verdict = _verdict(game_id, truth=_truth(week=2))
+    with session_scope() as session:
+        plan = plan_repair(
+            session, verdict=verdict, expected_current_week=3,
+            expect_authoritative_week=2,
+        )
+    assert plan.safe is True
+    assert plan.verdict.authoritative_week == 2
+
+
+def test_an_unresolvable_fixture_is_never_corrected():
+    """UNKNOWN_FIXTURE means the schedule cannot confirm any week. Falling
+    back to an operator guess there is the whole failure mode."""
+
+    from app.services.repair_game_week import RepairRefused, plan_repair
+
+    game_id = _mis_scoped_game("unknown")
+    truth = StubSchedule(_schedule(_scheduled("KC", "DEN", week=2)))
+    verdict = _verdict(game_id, truth=truth)
+    with session_scope() as session:
+        with pytest.raises(RepairRefused, match="did not resolve"):
+            plan_repair(session, verdict=verdict, expected_current_week=3)
+
+
+def test_a_kickoff_disagreement_blocks_the_repair():
+    """`Game.kickoff_at` is NOT corrected here, and it drives the checkpoint
+    windows. Relabelling the week while leaving a clock the schedule
+    disputes would be half a repair."""
+
+    from app.services.repair_game_week import RepairRefused, plan_repair
+
+    game_id = _mis_scoped_game("drift")
+    truth = _truth(week=2, kickoff=KICKOFF + timedelta(hours=3))
+    verdict = _verdict(game_id, truth=truth)
+    assert verdict.resolution.outcome is WeekOutcome.KICKOFF_DISAGREEMENT
+    assert verdict.authoritative_week is None, "a disputed kickoff still yielded a week"
+    with session_scope() as session:
+        with pytest.raises(RepairRefused, match="did not resolve"):
+            plan_repair(session, verdict=verdict, expected_current_week=3)
+
+
+def test_a_small_kickoff_difference_still_repairs():
+    from app.services.repair_game_week import plan_repair
+
+    game_id = _mis_scoped_game("drift-ok")
+    verdict = _verdict(game_id, truth=_truth(week=2, kickoff=KICKOFF + timedelta(minutes=10)))
+    with session_scope() as session:
+        plan = plan_repair(session, verdict=verdict, expected_current_week=3)
+    assert plan.safe is True
+    assert plan.verdict.drift_seconds == 600
+
+
+def test_an_unreachable_schedule_refuses_before_anything_is_planned():
+    from app.services.repair_game_week import RepairRefused, derive_authoritative_week
+
+    game_id = _mis_scoped_game("sched-down")
+    with pytest.raises(RepairRefused, match="schedule unavailable"):
+        derive_authoritative_week(game_id=game_id, schedule_provider=StubSchedule(None, ok=False))
+
+
+# --- provenance -------------------------------------------------------
+
+
+def test_the_correction_links_the_exact_schedule_call_that_decided_it():
+    from app.db.models.ingestion import ProviderCall
     from app.db.models.markets import GameScopeCorrection
     from app.services.repair_game_week import apply_repair
 
-    game_id = _mis_scoped_game("audited")
+    game_id = _mis_scoped_game("prov")
+    verdict = _verdict(game_id)
     with session_scope() as session:
-        before = session.get(Game, game_id)
-        snapshot = (
-            before.external_ref, before.home_team_canonical,
-            before.away_team_canonical, before.kickoff_at,
-        )
+        apply_repair(session, verdict=verdict, expected_current_week=3)
 
     with session_scope() as session:
-        apply_repair(
-            session, game_id=game_id, expected_current_week=3, authoritative_week=2,
-        )
-
-    with session_scope() as session:
-        after = session.get(Game, game_id)
         correction = session.execute(
             select(GameScopeCorrection).where(GameScopeCorrection.game_id == game_id)
         ).scalar_one()
+        assert correction.schedule_provider_call_id == verdict.schedule_provider_call_id
+        call = session.get(ProviderCall, correction.schedule_provider_call_id)
+        assert call is not None, "the correction points at a call that does not exist"
+        assert call.endpoint_capability == "FETCH_SCHEDULE"
+        assert correction.resolver_version == RESOLVER_VERSION
 
-    assert after.week_number == 2
-    assert (
-        after.external_ref, after.home_team_canonical,
-        after.away_team_canonical, after.kickoff_at,
-    ) == snapshot, "the repair touched something other than the week"
-    assert correction.field_corrected == "week_number"
-    assert (correction.old_value, correction.new_value) == ("3", "2")
-    assert correction.reason and correction.resolver_version
+
+def test_a_failed_schedule_fetch_is_still_recorded():
+    """"The schedule was unreachable at 14:03" is itself the answer to why
+    a repair wrote nothing."""
+
+    from app.db.models.ingestion import ProviderCall
+    from app.services.repair_game_week import RepairRefused, derive_authoritative_week
+
+    game_id = _mis_scoped_game("prov-fail")
+    before = _count(ProviderCall)
+    with pytest.raises(RepairRefused):
+        derive_authoritative_week(game_id=game_id, schedule_provider=StubSchedule(None, ok=False))
+    assert _count(ProviderCall) == before + 1
+
+
+def test_a_week_correction_cannot_have_null_schedule_provenance():
+    """Enforced by the DATABASE, not only by the repair tool. The tool is
+    not the only thing that can reach this table, and a correction that
+    cannot name its schedule snapshot is the hand-typed week it replaces."""
+
+    from sqlalchemy.exc import IntegrityError
+
+    from app.db.models.markets import GameScopeCorrection
+
+    game_id = _mis_scoped_game("null-prov")
+    with pytest.raises(IntegrityError):
+        with session_scope() as session:
+            session.add(GameScopeCorrection(
+                game_id=game_id, field_corrected="week_number",
+                old_value="3", new_value="2",
+                schedule_provider_call_id=None,
+                resolver_version=RESOLVER_VERSION, reason="smuggled in",
+                corrected_at=NOW,
+            ))
+
+
+# --- the lock ---------------------------------------------------------
+
+
+def test_apply_rechecks_the_week_under_the_lock():
+    """The dry run and the apply are separate processes minutes apart.
+    Nothing observed in the dry run is trusted at write time."""
+
+    from app.services.repair_game_week import RepairRefused, apply_repair
+
+    game_id = _mis_scoped_game("stale")
+    verdict = _verdict(game_id)
+
+    # Somebody else corrects it first.
+    with session_scope() as session:
+        session.get(Game, game_id).week_number = 2
+
+    with session_scope() as session:
+        with pytest.raises(RepairRefused, match="moved while this repair"):
+            apply_repair(session, verdict=verdict, expected_current_week=3)
+
+
+def test_apply_takes_the_row_for_update():
+    import ast
+    import inspect
+
+    from app.services import repair_game_week
+
+    source = inspect.getsource(repair_game_week.apply_repair)
+    tree = ast.parse(source.lstrip())
+    called = {
+        node.func.attr for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    assert "with_for_update" in called, "apply_repair reads the row without locking it"
+
+
+def test_no_network_happens_inside_the_locked_transaction():
+    """The lock is bounded by local queries only. A provider call inside it
+    would put an unbounded network wait inside a row lock."""
+
+    import ast
+    import inspect
+
+    from app.services import repair_game_week
+
+    tree = ast.parse(inspect.getsource(repair_game_week.apply_repair).lstrip())
+    names = {
+        node.func.attr for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    } | {
+        node.func.id for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    for forbidden in ("fetch_schedule", "derive_authoritative_week", "load_fixture"):
+        assert forbidden not in names, f"apply_repair calls {forbidden} inside the lock"
+
+
+def test_two_concurrent_repairs_produce_exactly_one_correction():
+    """The lock serializes them; the loser sees the corrected row and
+    refuses rather than appending a second audit trail for the same move."""
+
+    import threading
+
+    from app.db.models.markets import GameScopeCorrection
+    from app.db.session import get_session_factory
+    from app.services.repair_game_week import RepairRefused, apply_repair
+
+    game_id = _mis_scoped_game("race")
+    verdict = _verdict(game_id)
+
+    start = threading.Barrier(2)
+    outcomes: list[str] = []
+    lock = threading.Lock()
+
+    def worker():
+        session = get_session_factory()()
+        try:
+            start.wait(timeout=10)
+            apply_repair(session, verdict=verdict, expected_current_week=3)
+            session.commit()
+            result = "applied"
+        except RepairRefused:
+            session.rollback()
+            result = "refused"
+        except Exception as exc:  # pragma: no cover - diagnostic
+            session.rollback()
+            result = f"error:{type(exc).__name__}"
+        finally:
+            session.close()
+        with lock:
+            outcomes.append(result)
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert sorted(outcomes) == ["applied", "refused"], outcomes
+    with session_scope() as session:
+        assert session.execute(
+            select(func.count()).select_from(GameScopeCorrection)
+            .where(GameScopeCorrection.game_id == game_id)
+        ).scalar() == 1
+        assert session.get(Game, game_id).week_number == 2
+
+
+# --- the dependency census --------------------------------------------
+
+
+def _market(session, game_id, *, stat="receiving_yards"):
+    from app.db.models.markets import Player, PropMarket
+
+    player = Player(external_ref=f"GSIS:{uuid.uuid4()}", name="Test Player")
+    session.add(player)
+    session.flush()
+    market = PropMarket(game_id=game_id, player_id=player.id, stat_type=stat)
+    session.add(market)
+    session.flush()
+    return market
+
+
+def _snapshot(session, market_id):
+    from app.db.models.markets import MarketSnapshot
+
+    snapshot = MarketSnapshot(
+        market_id=market_id, taken_at=NOW, canonical_sportsbook="DRAFTKINGS",
+        devig_method="PROPORTIONAL_V1", number_of_books=1,
+        books_observed=1, stale_books_excluded=0,
+        is_valid_canonical_baseline=True,
+    )
+    session.add(snapshot)
+    session.flush()
+    return snapshot
+
+
+def test_a_standalone_market_snapshot_does_not_block_the_repair():
+    """The first version blocked on ANY MarketSnapshot, which is too blunt:
+    a snapshot is a derived read of quotes hanging off game_id, and game_id
+    does not change. What makes an artifact unsafe is something having
+    COMMITTED to it."""
+
+    from app.services.repair_game_week import plan_repair
+
+    game_id = _mis_scoped_game("standalone")
+    with session_scope() as session:
+        market = _market(session, game_id)
+        _snapshot(session, market.id)
+
+    verdict = _verdict(game_id)
+    with session_scope() as session:
+        plan = plan_repair(session, verdict=verdict, expected_current_week=3)
+
+    assert plan.census.market_snapshots == 1
+    assert plan.census.standalone_snapshots == 1
+    assert plan.census.referenced_snapshots == 0
+    assert plan.safe is True, plan.blockers
+
+
+def test_a_snapshot_referenced_by_evidence_does_block_the_repair():
+    from app.db.models.forecast_lab import EvidenceSnapshot
+    from app.services.repair_game_week import plan_repair
+
+    game_id = _mis_scoped_game("referenced")
+    with session_scope() as session:
+        market = _market(session, game_id)
+        snapshot = _snapshot(session, market.id)
+        session.add(EvidenceSnapshot(
+            market_id=market.id, generated_at=NOW, payload={},
+            market_snapshot_id=snapshot.id,
+        ))
+
+    verdict = _verdict(game_id)
+    with session_scope() as session:
+        plan = plan_repair(session, verdict=verdict, expected_current_week=3)
+
+    assert plan.census.standalone_snapshots == 0
+    assert plan.census.snapshots_in_evidence == 1
+    assert plan.safe is False
+    assert any("EvidenceSnapshot" in b for b in plan.blockers)
+    assert any("referenced by" in b for b in plan.blockers)
+
+
+def test_the_census_reports_checkpoints_by_status():
+    from app.services.repair_game_week import plan_repair
+
+    game_id = _mis_scoped_game("census-cp")
+    with session_scope() as session:
+        for checkpoint, status in (("OPENING", "MISSED"), ("MID", "PENDING")):
+            session.add(CheckpointRun(
+                game_id=game_id, checkpoint_type=checkpoint,
+                window_start=KICKOFF - timedelta(hours=6),
+                window_end=KICKOFF - timedelta(hours=2),
+                target_time=KICKOFF - timedelta(hours=3),
+                status=status,
+            ))
+
+    verdict = _verdict(game_id)
+    with session_scope() as session:
+        plan = plan_repair(session, verdict=verdict, expected_current_week=3)
+
+    assert plan.census.checkpoints == {"MISSED": ["OPENING"], "PENDING": ["MID"]}
+    assert plan.census.captured_checkpoints == []
+    assert plan.safe is True
 
 
 def test_the_repair_refuses_when_a_captured_checkpoint_depends_on_it():
@@ -1242,16 +1644,13 @@ def test_the_repair_refuses_when_a_captured_checkpoint_depends_on_it():
             status="CAPTURED", captured_at=KICKOFF - timedelta(hours=3),
         ))
 
+    verdict = _verdict(game_id)
     with session_scope() as session:
-        plan = plan_repair(
-            session, game_id=game_id, expected_current_week=3, authoritative_week=2,
-        )
+        plan = plan_repair(session, verdict=verdict, expected_current_week=3)
         assert plan.safe is False
         assert any("CAPTURED" in b for b in plan.blockers)
         with pytest.raises(RepairRefused):
-            apply_repair(
-                session, game_id=game_id, expected_current_week=3, authoritative_week=2,
-            )
+            apply_repair(session, verdict=verdict, expected_current_week=3)
 
     with session_scope() as session:
         assert session.get(Game, game_id).week_number == 3, "refused but still changed it"
@@ -1273,22 +1672,68 @@ def test_a_pending_checkpoint_does_not_block_the_repair():
             status="PENDING",
         ))
 
+    verdict = _verdict(game_id)
     with session_scope() as session:
-        plan = plan_repair(
-            session, game_id=game_id, expected_current_week=3, authoritative_week=2,
-        )
+        plan = plan_repair(session, verdict=verdict, expected_current_week=3)
     assert plan.safe is True
+
+
+# --- the invariants that outlive this one repair ----------------------
+
+
+def test_the_repair_refuses_without_the_expected_current_week():
+    from app.services.repair_game_week import RepairRefused, plan_repair
+
+    game_id = _mis_scoped_game("expect")
+    verdict = _verdict(game_id)
+    with session_scope() as session:
+        with pytest.raises(RepairRefused, match="expected week_number"):
+            plan_repair(session, verdict=verdict, expected_current_week=9)
 
 
 def test_the_repair_refuses_a_no_op():
     from app.services.repair_game_week import RepairRefused, plan_repair
 
     game_id = _mis_scoped_game("noop")
+    verdict = _verdict(game_id, truth=_truth(week=3))
     with session_scope() as session:
-        with pytest.raises(RepairRefused, match="already week"):
-            plan_repair(
-                session, game_id=game_id, expected_current_week=3, authoritative_week=3,
-            )
+        with pytest.raises(RepairRefused, match="nothing to correct"):
+            plan_repair(session, verdict=verdict, expected_current_week=3)
+
+
+def test_the_repair_is_audited_and_changes_only_the_week():
+    from app.db.models.markets import GameScopeCorrection
+    from app.services.repair_game_week import apply_repair
+
+    game_id = _mis_scoped_game("audited")
+    with session_scope() as session:
+        before = session.get(Game, game_id)
+        snapshot = (
+            before.external_ref, before.home_team_canonical,
+            before.away_team_canonical, before.kickoff_at,
+            before.season_id, before.home_team, before.away_team, before.status,
+        )
+
+    verdict = _verdict(game_id)
+    with session_scope() as session:
+        apply_repair(session, verdict=verdict, expected_current_week=3)
+
+    with session_scope() as session:
+        after = session.get(Game, game_id)
+        correction = session.execute(
+            select(GameScopeCorrection).where(GameScopeCorrection.game_id == game_id)
+        ).scalar_one()
+
+        assert after.week_number == 2
+        assert (
+            after.external_ref, after.home_team_canonical,
+            after.away_team_canonical, after.kickoff_at,
+            after.season_id, after.home_team, after.away_team, after.status,
+        ) == snapshot, "the repair touched something other than the week"
+        assert after.id == game_id
+    assert correction.field_corrected == "week_number"
+    assert (correction.old_value, correction.new_value) == ("3", "2")
+    assert correction.reason and correction.resolver_version
 
 
 def test_the_repair_never_touches_identity_fields():
@@ -1302,6 +1747,22 @@ def test_the_repair_never_touches_identity_fields():
         t.attr for n in ast.walk(tree) if isinstance(n, ast.Assign)
         for t in n.targets if isinstance(t, ast.Attribute)
     }
-    for forbidden in ("external_ref", "home_team_canonical", "away_team_canonical", "kickoff_at", "id"):
+    for forbidden in ("external_ref", "home_team_canonical", "away_team_canonical",
+                      "kickoff_at", "id", "season_id"):
         assert forbidden not in assigned, f"the repair assigns Game.{forbidden}"
     assert "week_number" in assigned
+
+
+def test_the_repair_creates_no_markets_quotes_or_checkpoints():
+    from app.db.models.markets import PropQuote
+
+    game_id = _mis_scoped_game("no-writes")
+    before = (_count(PropQuote), _count(CheckpointRun))
+
+    from app.services.repair_game_week import apply_repair
+
+    verdict = _verdict(game_id)
+    with session_scope() as session:
+        apply_repair(session, verdict=verdict, expected_current_week=3)
+
+    assert (_count(PropQuote), _count(CheckpointRun)) == before

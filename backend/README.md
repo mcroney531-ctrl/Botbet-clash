@@ -1619,19 +1619,80 @@ forever is not better integrity — it's a different way to be wrong, with
 no paper trail either way.
 
 `repair_game_week` corrects `week_number` only, in one transaction, after
-appending a `game_scope_corrections` audit row. It requires
-`--expect-current-week` so you repair the row you reviewed, and **refuses
-outright** if the game carries any CAPTURED checkpoint, EvidenceSnapshot,
-ForecastObservation or MarketSnapshot — at that point it's a dependency
-graph, not a mislabelled attribute. A PENDING checkpoint doesn't block:
-it holds no research content. `Game.id`, `external_ref`, teams and
-`kickoff_at` are never assigned, asserted structurally.
+appending a `game_scope_corrections` audit row. `Game.id`, `external_ref`,
+teams and `kickoff_at` are never assigned, asserted structurally. Dry run
+by default.
 
-Dry run by default.
+### The repair may not take the week from the operator either
+
+The first version accepted `--authoritative-week 2` and trusted it. That
+reproduced, inside the repair tool, the exact defect the repair exists to
+undo: Phase 4A.2 wrote week 3 because a human typed 3. A correction
+sourced from a second human guess is not a verification — it's the same
+mistake with a nicer audit row.
+
+The flag is gone. The repair resolves the week itself, through the
+season's own frozen pins and the **same matcher registration uses**:
+
+    Game -> Season -> active SeasonRules -> frozen roster_data_provider
+         -> schedule implementation -> fetch schedule (call PERSISTED)
+         -> resolve_fixture(away, home, kickoff_at)
+
+`resolve_event_week` was split so `resolve_fixture` answers the open
+question — *what week IS this fixture* — with no request to compare
+against. Registration is now a thin wrapper that adds the `OTHER_WEEK`
+check. A repair that derived the week by a second route could disagree
+with the rule that classified every other game in the season.
+
+`--expect-authoritative-week` exists but is a **guard, not an input**: it
+asserts what you expect the schedule to say and refuses on disagreement.
+It can only ever make the repair do less. An `UNKNOWN_FIXTURE`,
+`AMBIGUOUS_FIXTURE` or `KICKOFF_DISAGREEMENT` verdict is never corrected —
+`kickoff_at` is not repaired here and it drives the checkpoint windows, so
+relabelling the week while leaving a disputed clock is half a repair.
+
+`game_scope_corrections` now carries a CHECK constraint: a `week_number`
+correction with a NULL `schedule_provider_call_id` is rejected by the
+**database**, not only by the tool. The tool isn't the only thing that can
+reach that table, and a correction that can't name its schedule snapshot
+is indistinguishable from the hand-typed week it replaces.
+
+No post-correction `GameScopeObservation` is appended, deliberately: that
+table requires a market provider call too, because an observation is a
+statement about an event we fetched. A repair fetches no event.
+
+### Apply locks the row and re-verifies everything
+
+The dry run and the apply are separate processes minutes apart, and the
+network call happens before either. So the apply takes the `Game`
+`FOR UPDATE`, then re-runs the expected-week check and the **whole
+dependency census inside the lock**. No network happens there — the
+schedule was already fetched and its call already persisted — so the lock
+is bounded by local queries. Two concurrent repairs produce exactly one
+correction: the loser sees the corrected row and refuses.
+
+### MarketSnapshots are classified, not blanket-blocked
+
+Blocking on any `MarketSnapshot` at all was too blunt. A snapshot is a
+derived read of quotes that hang off `game_id`, and `game_id` does not
+change. What makes an artifact unsafe to relabel is something having
+*committed* to it. The census now reports separately:
+
+    prop markets / prop quotes
+    market snapshots: total / referenced by evidence / referenced by
+                      agent sessions / standalone
+    evidence snapshots, forecast observations, agent sessions
+    checkpoint runs, grouped by status
+
+and blocks only on a CAPTURED checkpoint, an EvidenceSnapshot, a
+ForecastObservation, an AgentSession, or a referenced snapshot. A
+standalone snapshot and a PENDING checkpoint do not block.
 
 ### Acceptance
 
-421 passed, 4 skipped. Mutation-tested five ways — dropping the
-provenance link, not persisting the schedule call, widening the tolerance
-back to 3h, ignoring the repair's blockers, and ignoring the schedule pin
-— each turned the intended tests red.
+442 passed, 4 skipped. Mutation-tested ten ways — turning the guard into
+an override, letting an unresolved verdict yield a week, accepting an
+unresolved schedule, dropping the provenance link, removing the row lock,
+removing the under-lock recheck, blanket-blocking snapshots, widening the
+kickoff tolerance, resolving through a second matcher, and removing the
+database CHECK — each turned the intended tests red.
