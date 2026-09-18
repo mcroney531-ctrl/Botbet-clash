@@ -32,14 +32,29 @@ from enum import StrEnum
 from app.rosterdata.teams import CanonicalTeam
 from app.scheduledata.base import ScheduledGame, ScheduleSnapshot
 
-DEFAULT_KICKOFF_TOLERANCE = timedelta(hours=3)
+RESOLVER_VERSION = "schedule-ordered-pair-v1"
+"""Stamped on every scope observation. Which rule classified this game is
+part of the provenance, not an implementation detail."""
+
+DEFAULT_KICKOFF_TOLERANCE = timedelta(minutes=15)
 """How far a provider kickoff may sit from the scheduled one.
 
-Wide enough to absorb a rounded or provisional broadcast time; narrow
-enough that a flex move to another slot or another day is REFUSED rather
-than accepted. Refusing is the right outcome there: a disagreement that
-large means either the schedule snapshot is stale or the fixture is not
-the one we matched, and both deserve a human rather than a permanent row.
+**Deliberately tight, and tightened from an earlier 3 hours.** The first
+version justified 3h against WEEK identity: any drift under a day still
+lands in the same week, so the label stays right. That reasoning was
+incomplete, because the schedule is not only deciding a label.
+
+`Game.kickoff_at` drives the OPENING / MID / FINAL checkpoint windows.
+Accepting a 2h45m disagreement would produce a correctly-labelled week
+whose entire research clock is 2h45m wrong — and a FINAL window targeted
+at kickoff minus three hours would then fire at a time that means nothing.
+The tolerance has to be compatible with the timing precision the
+checkpoint system claims, not merely with week arithmetic.
+
+Fifteen minutes absorbs a rounded or provisional broadcast time and
+refuses anything that would materially move a checkpoint. A genuine flex
+should require a fresh preview and a human, not a quiet acceptance of
+hours of drift.
 """
 
 

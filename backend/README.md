@@ -1550,3 +1550,88 @@ expired leases as active — each turned the intended tests red.
 The headline test reconstructs the original poisoning scenario directly:
 a window full of other weeks' games with week 4 requested, and asserts
 zero rows written.
+
+---
+
+## Phase 4A.6 closeout — provenance for the field that decides identity
+
+Four gaps, all found in review of the week-verification fix.
+
+### The schedule decision had no durable provenance
+
+`/events` was persisted. The nflverse schedule fetch that actually decides
+`Game.week_number` was consumed and thrown away. So we could prove which
+event we saw and not which snapshot classified it — on the one field being
+treated as permanent identity scope.
+
+`game_scope_observations` now records, per successful registration: both
+provider call ids, the resolved week, the canonical teams, both kickoffs,
+the drift between them, and the resolver version. Append-only — a later
+pass adds another row rather than rewriting the first, so "what did the
+schedule say each time we looked" stays readable.
+
+Recorded for schedule *failures* too: "the schedule was unreachable at
+14:03" is itself the answer to why a pass wrote nothing.
+
+A foreign key caught a real bug while wiring this: I linked the
+observation to the `IngestionRun` id rather than the `ProviderCall` id.
+
+### The schedule source ignored the frozen pin
+
+Registration built `NflverseScheduleProvider` unconditionally and checked
+only `market_data_provider`. Correct for this season by luck; silently
+wrong for any other.
+
+V1 rule, explicit: **schedule identity follows the frozen
+`roster_data_provider`.** Both answer "who is this and where does it sit
+in the season", so splitting them across vendors would let a game be
+classified by one source and its players resolved by another. Fails closed
+if the pin has no schedule implementation.
+
+### 3 hours was the wrong tolerance, for a reason I'd missed
+
+I justified 3h against *week* identity: any drift under a day still lands
+in the same week, so the label stays right. That reasoning was incomplete.
+
+`Game.kickoff_at` drives the OPENING/MID/FINAL windows. Accepting a 2h45m
+disagreement produces a correctly-labelled week whose entire research
+clock is 2h45m wrong — a FINAL window targeted at kickoff minus three
+hours would fire at a time that means nothing. The tolerance has to match
+the timing precision the checkpoint system claims, not week arithmetic.
+
+**Now 15 minutes.** The preview prints every fixture's market-vs-schedule
+drift, including the ones it refuses — a preview that hid the outliers
+would hide exactly the cases the tolerance exists to exclude. The real
+Week-4 preview can confirm or revise the number before anything is
+applied.
+
+### "PREVIEW — nothing written" was not true
+
+Preview persists provider-call audit telemetry, deliberately. The header
+now says: *no Game rows written; provider audit telemetry recorded.*
+
+### DET @ BUF: repair, not preservation
+
+I said we shouldn't touch it because `external_ref` is permanent. That
+conflated two things. Silent repair is forbidden; **explicit, audited
+correction is not**, and leaving a known-false week in the durable record
+forever is not better integrity — it's a different way to be wrong, with
+no paper trail either way.
+
+`repair_game_week` corrects `week_number` only, in one transaction, after
+appending a `game_scope_corrections` audit row. It requires
+`--expect-current-week` so you repair the row you reviewed, and **refuses
+outright** if the game carries any CAPTURED checkpoint, EvidenceSnapshot,
+ForecastObservation or MarketSnapshot — at that point it's a dependency
+graph, not a mislabelled attribute. A PENDING checkpoint doesn't block:
+it holds no research content. `Game.id`, `external_ref`, teams and
+`kickoff_at` are never assigned, asserted structurally.
+
+Dry run by default.
+
+### Acceptance
+
+421 passed, 4 skipped. Mutation-tested five ways — dropping the
+provenance link, not persisting the schedule call, widening the tolerance
+back to 3h, ignoring the repair's blockers, and ignoring the schedule pin
+— each turned the intended tests red.

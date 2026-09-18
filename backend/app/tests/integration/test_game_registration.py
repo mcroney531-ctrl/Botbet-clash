@@ -308,11 +308,11 @@ def test_a_scope_mismatch_fails_loudly_and_does_not_relocate_the_row():
     season_id = _season("conflict")
     _register(season_id, [_event("e1")])
 
-    # Same external_ref, different kickoff. Two hours, deliberately: a
-    # bigger move is now refused by week verification (KICKOFF_DISAGREEMENT)
-    # before it ever reaches the scope check, and this test is about the
-    # scope check.
-    moved = _event("e1", kickoff=KICKOFF + timedelta(hours=2))
+    # Same external_ref, different kickoff. Five minutes, deliberately:
+    # anything past the 15-minute agreement tolerance is refused by week
+    # verification before it reaches the scope check, and this test is
+    # about the scope check.
+    moved = _event("e1", kickoff=KICKOFF + timedelta(minutes=5))
     report = _register(season_id, [moved])
 
     assert len(report.conflicts) == 1
@@ -638,6 +638,20 @@ class StubSchedule:
         self.ok = ok
         self.calls = 0
 
+    def _meta(self, ok: bool):
+        # Real metadata, because the schedule call is now PERSISTED. A stub
+        # returning None would have hidden the fact that provenance was
+        # being recorded at all.
+        return ProviderCallMetadata(
+            endpoint_capability="FETCH_SCHEDULE",
+            requested_at=NOW,
+            responded_at=NOW,
+            http_status=200 if ok else 503,
+            raw_response_body=b"season,week,home_team,away_team\n",
+            raw_response_sha256="a" * 64,
+            raw_response_bytes=32,
+        )
+
     def fetch_schedule(self, *, season):
         self.calls += 1
         if not self.ok:
@@ -646,9 +660,11 @@ class StubSchedule:
             return ScheduleFetchResult(
                 payload=None,
                 error=ScheduleDataError(category="ROSTER_SOURCE_UNAVAILABLE", message="stub down"),
-                call_metadata=None,
+                call_metadata=self._meta(False),
             )
-        return ScheduleFetchResult(payload=self.snapshot, error=None, call_metadata=None)
+        return ScheduleFetchResult(
+            payload=self.snapshot, error=None, call_metadata=self._meta(True)
+        )
 
 
 # --- the pure rule ----------------------------------------------------
@@ -727,15 +743,32 @@ def test_a_large_kickoff_disagreement_is_refused():
 
 
 def test_a_small_kickoff_difference_is_tolerated():
-    """Wide enough for a rounded or provisional broadcast time."""
+    """Wide enough for a rounded or provisional broadcast time, and no
+    wider: Game.kickoff_at drives the checkpoint windows."""
 
     schedule = _schedule(_scheduled("DET", "BUF", week=4, kickoff=KICKOFF))
     resolution = resolve_event_week(
         home=CanonicalTeam.BUF, away=CanonicalTeam.DET,
-        kickoff_at=KICKOFF + timedelta(hours=2),
+        kickoff_at=KICKOFF + timedelta(minutes=5),
         requested_week=4, schedule=schedule,
     )
     assert resolution.outcome is WeekOutcome.MATCHED
+
+
+def test_a_drift_that_would_move_a_checkpoint_is_refused():
+    """The reason the tolerance is 15 minutes rather than 3 hours: a
+    correctly-labelled week whose research clock is hours wrong is not an
+    acceptable outcome. A FINAL window targeted at kickoff minus three
+    hours would fire at a time that means nothing."""
+
+    schedule = _schedule(_scheduled("DET", "BUF", week=4, kickoff=KICKOFF))
+    resolution = resolve_event_week(
+        home=CanonicalTeam.BUF, away=CanonicalTeam.DET,
+        kickoff_at=KICKOFF + timedelta(hours=2, minutes=45),
+        requested_week=4, schedule=schedule,
+    )
+    assert resolution.outcome is WeekOutcome.KICKOFF_DISAGREEMENT
+    assert resolution.week == 4, "the week was right; the clock was not"
 
 
 def test_a_scheduled_game_with_no_kickoff_still_resolves():
@@ -957,3 +990,318 @@ def test_an_active_lease_is_reported_as_active():
 
     assert "1 ACTIVE" in text
     assert "ACTIVE  FINAL" in text
+
+
+# =====================================================================
+# SCHEDULE PROVENANCE, PIN, AND THE AUDITED REPAIR (4A.6 closeout)
+# =====================================================================
+
+
+def test_the_schedule_call_that_decided_the_week_is_persisted():
+    """Before this, /events was persisted but the schedule fetch that
+    actually DECIDED Game.week_number was consumed and thrown away. We
+    could prove which event we saw, not which snapshot classified it."""
+
+    from app.db.models.ingestion import ProviderCall
+
+    season_id = _season("sched-prov")
+    schedule = _schedule(_scheduled("DET", "BUF", week=4))
+    _register_verified(season_id, [_event("e1")], schedule, apply=True)
+
+    with session_scope() as session:
+        call = session.execute(
+            select(ProviderCall).where(ProviderCall.endpoint_capability == "FETCH_SCHEDULE")
+        ).scalar_one()
+    assert call.success is True
+    assert call.raw_response_sha256, "the raw hash is the point of the provenance"
+    assert call.raw_response_bytes > 0
+
+
+def test_an_applied_game_links_to_the_exact_call_that_resolved_its_week():
+    from app.db.models.ingestion import ProviderCall
+    from app.db.models.markets import GameScopeObservation
+
+    season_id = _season("scope-obs")
+    schedule = _schedule(_scheduled("DET", "BUF", week=4))
+    report = _register_verified(season_id, [_event("e1")], schedule, apply=True)
+    game_id = report.created[0].game_id
+
+    with session_scope() as session:
+        obs = session.execute(
+            select(GameScopeObservation).where(GameScopeObservation.game_id == game_id)
+        ).scalar_one()
+        schedule_call = session.get(ProviderCall, obs.schedule_provider_call_id)
+        market_call = session.get(ProviderCall, obs.market_provider_call_id)
+
+    assert obs.resolved_week_number == 4
+    assert obs.canonical_home == "BUF" and obs.canonical_away == "DET"
+    assert obs.resolver_version
+    assert schedule_call.endpoint_capability == "FETCH_SCHEDULE"
+    assert market_call.endpoint_capability == "LIST_EVENTS"
+
+
+def test_a_schedule_failure_is_recorded_too():
+    """"The schedule was unreachable at 14:03" is itself the answer to why
+    a registration pass wrote nothing."""
+
+    from app.db.models.ingestion import ProviderCall
+
+    season_id = _season("sched-fail-prov")
+    register_week_events(
+        season_id=season_id, week_number=4,
+        window_start=NOW, window_end=NOW + timedelta(days=21),
+        odds_provider=StubOdds([_event("e1")]),
+        schedule_provider=StubSchedule(None, ok=False), apply=True,
+    )
+
+    with session_scope() as session:
+        call = session.execute(
+            select(ProviderCall).where(ProviderCall.endpoint_capability == "FETCH_SCHEDULE")
+        ).scalar_one()
+    assert call.success is False
+
+
+def test_preview_records_telemetry_but_no_scope_observations():
+    from app.db.models.ingestion import ProviderCall
+    from app.db.models.markets import GameScopeObservation
+
+    season_id = _season("preview-telemetry")
+    schedule = _schedule(_scheduled("DET", "BUF", week=4))
+    report = _register_verified(season_id, [_event("e1")], schedule, apply=False)
+
+    with session_scope() as session:
+        calls = session.execute(select(func.count()).select_from(ProviderCall)).scalar()
+        games = session.execute(select(func.count()).select_from(Game)).scalar()
+        observations = session.execute(
+            select(func.count()).select_from(GameScopeObservation)
+        ).scalar()
+
+    assert calls == 2, "both the events and schedule calls are audited"
+    assert games == 0 and observations == 0
+    text = render(report)
+    assert "no Game rows written; provider audit telemetry recorded" in text
+
+
+def test_the_schedule_source_follows_the_frozen_roster_pin():
+    """Registration previously built nflverse unconditionally and checked
+    only the MARKET pin -- correct for this season by luck, silently wrong
+    for any other."""
+
+    from app.marketdata.game_registration import ScheduleSourceUnavailable, _schedule_provider_for
+    from app.rosterdata.providers.nflverse import NflverseScheduleProvider
+
+    assert isinstance(_schedule_provider_for("NFLVERSE"), NflverseScheduleProvider)
+    with pytest.raises(ScheduleSourceUnavailable, match="frozen roster_data_provider"):
+        _schedule_provider_for("SOME_OTHER_SOURCE")
+
+
+def test_a_wrong_roster_pin_fails_before_any_game_is_written():
+    season_id = _season("wrong-roster-pin")
+    with session_scope() as session:
+        rules = session.execute(
+            select(SeasonRules).where(SeasonRules.season_id == season_id)
+        ).scalar_one()
+        rules.roster_data_provider = "SOME_OTHER_SOURCE"
+
+    from app.marketdata.game_registration import ScheduleSourceUnavailable
+
+    stub = StubOdds([_event("e1")])
+    with pytest.raises(ScheduleSourceUnavailable):
+        register_week_events(
+            season_id=season_id, week_number=4,
+            window_start=NOW, window_end=NOW + timedelta(days=21),
+            odds_provider=stub, apply=True,
+        )
+    assert stub.calls == 0
+    with session_scope() as session:
+        assert session.execute(
+            select(func.count()).select_from(Game).where(Game.season_id == season_id)
+        ).scalar() == 0
+
+
+def test_kickoff_drift_is_recorded_on_the_observation():
+    season_id = _season("drift-obs")
+    schedule = _schedule(_scheduled("DET", "BUF", week=4, kickoff=KICKOFF))
+    events = [_event("e1", kickoff=KICKOFF + timedelta(minutes=6))]
+    report = _register_verified(season_id, events, schedule, apply=True)
+
+    from app.db.models.markets import GameScopeObservation
+
+    with session_scope() as session:
+        obs = session.execute(
+            select(GameScopeObservation)
+            .where(GameScopeObservation.game_id == report.created[0].game_id)
+        ).scalar_one()
+    assert obs.kickoff_drift_seconds == 360
+
+
+def test_a_refused_drift_still_appears_in_the_preview_table():
+    """A preview that hid the outliers would hide exactly the cases the
+    tolerance was chosen to exclude."""
+
+    season_id = _season("drift-table")
+    schedule = _schedule(_scheduled("DET", "BUF", week=4, kickoff=KICKOFF))
+    events = [_event("e1", kickoff=KICKOFF + timedelta(hours=2))]
+    report = _register_verified(season_id, events, schedule, apply=False)
+
+    assert report.eligible == []
+    assert len(report.drift) == 1
+    assert report.drift[0].refused is True
+    text = render(report)
+    assert "kickoff agreement" in text
+    assert "REFUSED" in text
+    assert "7200s" in text
+
+
+def test_a_game_accepted_outside_tolerance_can_never_reach_a_checkpoint():
+    """Because it is never persisted at all: no Game row, so no
+    CheckpointRun can be computed from its kickoff."""
+
+    season_id = _season("no-checkpoint")
+    schedule = _schedule(_scheduled("DET", "BUF", week=4, kickoff=KICKOFF))
+    events = [_event("e1", kickoff=KICKOFF + timedelta(hours=3))]
+    _register_verified(season_id, events, schedule, apply=True)
+
+    with session_scope() as session:
+        assert session.execute(
+            select(func.count()).select_from(Game).where(Game.season_id == season_id)
+        ).scalar() == 0
+        assert session.execute(
+            select(func.count()).select_from(CheckpointRun)
+        ).scalar() == 0
+
+
+# --- the audited repair -----------------------------------------------
+
+
+def _mis_scoped_game(tag: str, *, week=3):
+    season_id = _season(f"repair-{tag}")
+    schedule = _schedule(_scheduled("DET", "BUF", week=week))
+    report = _register_verified(season_id, [_event("e1")], schedule, apply=True, week=week)
+    return report.created[0].game_id
+
+
+def test_the_repair_refuses_without_the_expected_current_week():
+    from app.services.repair_game_week import RepairRefused, plan_repair
+
+    game_id = _mis_scoped_game("expect")
+    with session_scope() as session:
+        with pytest.raises(RepairRefused, match="expected week_number"):
+            plan_repair(
+                session, game_id=game_id,
+                expected_current_week=9, authoritative_week=2,
+            )
+
+
+def test_the_repair_is_audited_and_changes_only_the_week():
+    from app.db.models.markets import GameScopeCorrection
+    from app.services.repair_game_week import apply_repair
+
+    game_id = _mis_scoped_game("audited")
+    with session_scope() as session:
+        before = session.get(Game, game_id)
+        snapshot = (
+            before.external_ref, before.home_team_canonical,
+            before.away_team_canonical, before.kickoff_at,
+        )
+
+    with session_scope() as session:
+        apply_repair(
+            session, game_id=game_id, expected_current_week=3, authoritative_week=2,
+        )
+
+    with session_scope() as session:
+        after = session.get(Game, game_id)
+        correction = session.execute(
+            select(GameScopeCorrection).where(GameScopeCorrection.game_id == game_id)
+        ).scalar_one()
+
+    assert after.week_number == 2
+    assert (
+        after.external_ref, after.home_team_canonical,
+        after.away_team_canonical, after.kickoff_at,
+    ) == snapshot, "the repair touched something other than the week"
+    assert correction.field_corrected == "week_number"
+    assert (correction.old_value, correction.new_value) == ("3", "2")
+    assert correction.reason and correction.resolver_version
+
+
+def test_the_repair_refuses_when_a_captured_checkpoint_depends_on_it():
+    """At that point it is no longer a mislabelled attribute; it is a
+    dependency graph, and a human needs to see it."""
+
+    from app.services.repair_game_week import RepairRefused, apply_repair, plan_repair
+
+    game_id = _mis_scoped_game("captured")
+    with session_scope() as session:
+        session.add(CheckpointRun(
+            game_id=game_id, checkpoint_type="FINAL",
+            window_start=KICKOFF - timedelta(hours=6),
+            window_end=KICKOFF - timedelta(hours=2),
+            target_time=KICKOFF - timedelta(hours=3),
+            status="CAPTURED", captured_at=KICKOFF - timedelta(hours=3),
+        ))
+
+    with session_scope() as session:
+        plan = plan_repair(
+            session, game_id=game_id, expected_current_week=3, authoritative_week=2,
+        )
+        assert plan.safe is False
+        assert any("CAPTURED" in b for b in plan.blockers)
+        with pytest.raises(RepairRefused):
+            apply_repair(
+                session, game_id=game_id, expected_current_week=3, authoritative_week=2,
+            )
+
+    with session_scope() as session:
+        assert session.get(Game, game_id).week_number == 3, "refused but still changed it"
+
+
+def test_a_pending_checkpoint_does_not_block_the_repair():
+    """Only artifacts whose INTERPRETATION would change. A PENDING row
+    holds no research content."""
+
+    from app.services.repair_game_week import plan_repair
+
+    game_id = _mis_scoped_game("pending")
+    with session_scope() as session:
+        session.add(CheckpointRun(
+            game_id=game_id, checkpoint_type="FINAL",
+            window_start=KICKOFF - timedelta(hours=6),
+            window_end=KICKOFF - timedelta(hours=2),
+            target_time=KICKOFF - timedelta(hours=3),
+            status="PENDING",
+        ))
+
+    with session_scope() as session:
+        plan = plan_repair(
+            session, game_id=game_id, expected_current_week=3, authoritative_week=2,
+        )
+    assert plan.safe is True
+
+
+def test_the_repair_refuses_a_no_op():
+    from app.services.repair_game_week import RepairRefused, plan_repair
+
+    game_id = _mis_scoped_game("noop")
+    with session_scope() as session:
+        with pytest.raises(RepairRefused, match="already week"):
+            plan_repair(
+                session, game_id=game_id, expected_current_week=3, authoritative_week=3,
+            )
+
+
+def test_the_repair_never_touches_identity_fields():
+    import ast
+    import inspect
+
+    from app.services import repair_game_week
+
+    tree = ast.parse(inspect.getsource(repair_game_week))
+    assigned = {
+        t.attr for n in ast.walk(tree) if isinstance(n, ast.Assign)
+        for t in n.targets if isinstance(t, ast.Attribute)
+    }
+    for forbidden in ("external_ref", "home_team_canonical", "away_team_canonical", "kickoff_at", "id"):
+        assert forbidden not in assigned, f"the repair assigns Game.{forbidden}"
+    assert "week_number" in assigned

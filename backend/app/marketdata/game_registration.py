@@ -57,7 +57,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.db.models.markets import Game
+from app.db.models.markets import Game, GameScopeObservation
 from app.db.models.season import Season, SeasonRules
 from app.db.session import session_scope
 from app.marketdata.dto import ProviderEvent
@@ -67,7 +67,13 @@ from app.marketdata.providers.the_odds_api import (
     TheOddsApiProvider,
 )
 from app.marketdata.telemetry import finish_run, record_call, sanitize_message, start_run
-from app.marketdata.week_resolution import WeekOutcome, WeekResolution, resolve_event_week
+from app.marketdata.week_resolution import (
+    DEFAULT_KICKOFF_TOLERANCE,
+    RESOLVER_VERSION,
+    WeekOutcome,
+    WeekResolution,
+    resolve_event_week,
+)
 from app.rosterdata.providers.nflverse import NflverseScheduleProvider
 from app.rosterdata.teams import CanonicalTeam, TeamMappingError, canonical_from_odds_api
 
@@ -95,6 +101,14 @@ class RegisteredGame:
     # `game_id is None` means PREVIEW: this event resolved to the requested
     # week and would be registered, but nothing was written.
     previewed: bool = False
+    schedule_kickoff_at: datetime | None = None
+    refused: bool = False
+
+    @property
+    def drift_seconds(self) -> int | None:
+        if self.schedule_kickoff_at is None:
+            return None
+        return int(abs((self.kickoff_at - self.schedule_kickoff_at).total_seconds()))
 
 
 @dataclass
@@ -105,6 +119,7 @@ class RegistrationReport:
     window_start: datetime | None = None
     window_end: datetime | None = None
     provider: str | None = None
+    roster_pin: str | None = None
     applied: bool = False
     events_observed: int = 0
     created: list[RegisteredGame] = field(default_factory=list)
@@ -117,9 +132,11 @@ class RegistrationReport:
     # dropped: "we saw 16 events and registered 1" is a fact an operator
     # needs, and it is how the original bug would have been caught.
     refused: list[str] = field(default_factory=list)
+    drift: list[RegisteredGame] = field(default_factory=list)
     schedule_provider: str | None = None
     quota_cost: int = 0
     quota_remaining: int | None = None
+    schedule_provider_call_id: uuid.UUID | None = None
     failures: list[str] = field(default_factory=list)
 
     @property
@@ -220,6 +237,34 @@ def register_game(
     return row, True
 
 
+class ScheduleSourceUnavailable(RuntimeError):
+    """No schedule implementation exists for the season's frozen identity pin."""
+
+
+# V1 rule: SCHEDULE IDENTITY FOLLOWS THE FROZEN ROSTER-DATA PROVIDER.
+#
+# Both answer "who is this, and where does it sit in the season", so
+# splitting them across two vendors would let a game be classified by one
+# source and its players resolved by another. Registration previously
+# constructed nflverse unconditionally and only checked the MARKET pin,
+# which happened to be correct for this season and would have been silently
+# wrong for any other. A distinct schedule vendor would get its own
+# SeasonRules pin; until one exists, the same-source rule is simpler and
+# has fewer ways to be wrong.
+SCHEDULE_PROVIDERS: dict[str, type] = {"NFLVERSE": NflverseScheduleProvider}
+
+
+def _schedule_provider_for(roster_pin: str):
+    implementation = SCHEDULE_PROVIDERS.get(roster_pin)
+    if implementation is None:
+        raise ScheduleSourceUnavailable(
+            f"the season's frozen roster_data_provider is {roster_pin!r} and no "
+            "schedule implementation is wired for it. Refusing to classify games "
+            "with a different source than the season's frozen identity pin."
+        )
+    return implementation()
+
+
 def _season_pins(session: Session, season_id: uuid.UUID) -> tuple[Season, SeasonRules]:
     season = session.get(Season, season_id)
     if season is None:
@@ -273,6 +318,8 @@ def register_week_events(
         season, rules = _season_pins(session, season_id)
         report.season_name = season.name
         report.provider = rules.market_data_provider
+        report.roster_pin = rules.roster_data_provider
+        roster_pin = rules.roster_data_provider
         season_year = season.year
 
     if report.provider != ODDS_PROVIDER:
@@ -284,7 +331,7 @@ def register_week_events(
     # Network first, OUTSIDE any transaction -- the same rule the capture
     # cycle follows, for the same reason.
     odds = odds_provider or TheOddsApiProvider()
-    schedule_source = schedule_provider or NflverseScheduleProvider()
+    schedule_source = schedule_provider or _schedule_provider_for(roster_pin)
     report.schedule_provider = getattr(schedule_source, "provider_name", "?")
 
     # The schedule is fetched FIRST and its failure is fatal. Without an
@@ -292,6 +339,29 @@ def register_week_events(
     # safe behaviour is to register nothing -- which is exactly what the
     # old code did not do.
     schedule_result = schedule_source.fetch_schedule(season=season_year)
+
+    # Persisted, not just consumed. Until 4A.6 this call was thrown away,
+    # so we could prove WHICH EVENT we saw but not WHICH SCHEDULE SNAPSHOT
+    # classified it -- on the field we treat as permanent identity scope.
+    # Recorded for failures too: "the schedule was unreachable at 14:03"
+    # is itself the answer to why a registration pass wrote nothing.
+    with session_scope() as session:
+        schedule_run = start_run(
+            session, provider=report.schedule_provider, operation="FETCH_SCHEDULE",
+        )
+        schedule_call = record_call(
+            session, run=schedule_run, metadata=schedule_result.call_metadata,
+            success=schedule_result.ok,
+            error_category=schedule_result.error.category if schedule_result.error else None,
+            error_message=schedule_result.error.message if schedule_result.error else None,
+        )
+        schedule_call_id = schedule_call.id
+        report.schedule_provider_call_id = schedule_call_id
+        finish_run(
+            session, run=schedule_run,
+            status="SUCCEEDED" if schedule_result.ok else "FAILED",
+        )
+
     if not schedule_result.ok:
         report.failures.append(
             f"schedule: {schedule_result.error.category}: {schedule_result.error.message}"
@@ -303,12 +373,17 @@ def register_week_events(
 
     with session_scope() as session:
         run = start_run(session, provider=ODDS_PROVIDER, operation="LIST_EVENTS", sport=sport)
-        record_call(
+        events_call = record_call(
             session, run=run, metadata=result.call_metadata, success=result.ok,
             error_category=result.error.category if result.error else None,
             error_message=result.error.message if result.error else None,
         )
         run_id = run.id
+        # The CALL id, not the RUN id. A scope observation points at the
+        # provider call that produced the payload, and an IngestionRun can
+        # hold several; the foreign key caught this when the two were
+        # confused.
+        events_call_id = events_call.id
         # Recorded even though /events is free: a free call is still a call
         # we made, and the audit chain should not have holes just because a
         # row happens to cost nothing.
@@ -348,15 +423,25 @@ def register_week_events(
                 f"{away.value} @ {home.value} [{event.ref.external_event_id}]: "
                 f"{resolution.outcome} — {resolution.detail}"
             )
+            if resolution.outcome is WeekOutcome.KICKOFF_DISAGREEMENT:
+                # Still surfaced in the drift table. A preview that hid the
+                # outliers would hide exactly the cases the tolerance was
+                # chosen to exclude.
+                report.drift.append(RegisteredGame(
+                    game_id=None, external_ref=event.ref.as_external_ref(),
+                    home=home.value, away=away.value, kickoff_at=event.kickoff_at,
+                    created=False, week=resolution.week, previewed=True,
+                    schedule_kickoff_at=resolution.scheduled_kickoff, refused=True,
+                ))
             continue
 
         if not apply:
-            # Preview. Nothing is written, so no Game row can be created by
-            # a discovery mistake.
+            # Preview. No Game row can be created by a discovery mistake.
             report.eligible.append(RegisteredGame(
                 game_id=None, external_ref=event.ref.as_external_ref(),
                 home=home.value, away=away.value, kickoff_at=event.kickoff_at,
                 created=False, week=resolution.week, previewed=True,
+                schedule_kickoff_at=resolution.scheduled_kickoff,
             ))
             continue
 
@@ -373,7 +458,26 @@ def register_week_events(
                     home=home.value, away=away.value,
                     kickoff_at=game.kickoff_at, created=created,
                     week=game.week_number,
+                    schedule_kickoff_at=resolution.scheduled_kickoff,
                 )
+                # Append-only: WHY this game carries this week, and which
+                # exact pair of provider calls said so. A later pass appends
+                # another rather than rewriting this one.
+                session.add(GameScopeObservation(
+                    game_id=game.id,
+                    market_provider_call_id=events_call_id,
+                    schedule_provider_call_id=schedule_call_id,
+                    season_year=season_year,
+                    resolved_week_number=resolution.week,
+                    canonical_home=home.value,
+                    canonical_away=away.value,
+                    market_kickoff_at=event.kickoff_at,
+                    schedule_kickoff_at=resolution.scheduled_kickoff,
+                    kickoff_drift_seconds=entry.drift_seconds,
+                    resolver_version=RESOLVER_VERSION,
+                    observed_at=datetime.now(timezone.utc),
+                ))
+                session.flush()
         except EventScopeConflict as exc:
             report.conflicts.append(str(exc))
             continue
@@ -393,14 +497,23 @@ def register_week_events(
 def render(report: RegistrationReport) -> str:
     out: list[str] = []
     add = out.append
-    mode = "APPLY — Game rows written" if report.applied else "PREVIEW — nothing written"
+    # Precise, because "nothing written" was not true: preview persists the
+    # provider-call audit telemetry for both the events and schedule fetches,
+    # deliberately. What it does not write is Game or scope-observation rows.
+    mode = (
+        "APPLY — Game rows written"
+        if report.applied
+        else "PREVIEW — no Game rows written; provider audit telemetry recorded"
+    )
     add("=" * 78)
     add(f"WEEK EVENT REGISTRATION — {mode}")
     add("=" * 78)
     add(f"  season            {report.season_name}  ({report.season_id})")
     add(f"  requested week    {report.week_number}")
     add(f"  market provider   {report.provider}  (from active SeasonRules)")
-    add(f"  schedule provider {report.schedule_provider}  (decides the week)")
+    add(f"  schedule provider {report.schedule_provider}  (decides the week; "
+        f"follows roster pin {report.roster_pin})")
+    add(f"  schedule call     {report.schedule_provider_call_id}")
     add(f"  discovery window  {report.window_start}  ..  {report.window_end}")
     add("                    (a DISCOVERY filter only -- it never decides the week)")
     add("")
@@ -431,6 +544,23 @@ def render(report: RegistrationReport) -> str:
         add("  Nothing matched. If this is unexpected, check the discovery window")
         add("  against the actual week -- the window does NOT define the week.")
 
+    drift_rows = [g for g in (report.eligible + report.created + report.reused + report.drift)
+                  if g.drift_seconds is not None]
+    if drift_rows:
+        add("")
+        add("--- kickoff agreement: market vs schedule ---------------------------")
+        add(f"  tolerance in force: {int(DEFAULT_KICKOFF_TOLERANCE.total_seconds())}s")
+        add("  Game.kickoff_at drives the OPENING/MID/FINAL windows, so a drift")
+        add("  accepted here is a research clock that is wrong by that much.")
+        for g in sorted(drift_rows, key=lambda g: -(g.drift_seconds or 0)):
+            mark = "REFUSED" if g.refused else "ok     "
+            add(f"  {mark} {g.away} @ {g.home}")
+            add(f"          market   {g.kickoff_at.isoformat()}")
+            add(f"          schedule {g.schedule_kickoff_at.isoformat()}")
+            add(f"          drift    {g.drift_seconds}s")
+        worst = max(g.drift_seconds for g in drift_rows)
+        add(f"  worst drift: {worst}s across {len(drift_rows)} fixtures")
+
     for label, items in (
         ("REFUSED (not the requested week)", report.refused),
         ("CONFLICTS", report.conflicts),
@@ -446,7 +576,10 @@ def render(report: RegistrationReport) -> str:
     if report.applied:
         add("No quotes, no roster, no markets, no checkpoint rows were written.")
     else:
-        add("PREVIEW: no Game rows were written. Re-run with --apply to persist.")
+        add("PREVIEW: no Game or scope-observation rows were written.")
+        add("(Provider-call audit telemetry IS recorded -- a call we made is a call")
+        add(" we record, and the audit chain should not have holes.)")
+        add("Re-run with --apply to persist.")
     add("=" * 78)
     return "\n".join(out)
 

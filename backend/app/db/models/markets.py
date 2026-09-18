@@ -266,3 +266,80 @@ class CheckpointCycleLease(Base):
         UniqueConstraint("game_id", "checkpoint_type", name="one_lease_per_game_checkpoint"),
         CheckConstraint("expires_at > acquired_at", name="lease_expires_after_acquisition"),
     )
+
+
+class GameScopeObservation(Base):
+    """Append-only: WHY this game carries the season/week/teams it does.
+
+    `Game.week_number` is part of a permanent identity scope, and until
+    Phase 4A.6 nothing recorded where it came from. The Odds `/events`
+    call was persisted; the nflverse schedule fetch that actually DECIDED
+    the week was consumed and thrown away. So we could prove which event
+    we saw but not which schedule snapshot classified it -- for a field
+    treated as permanent, that is a hole.
+
+    One row per successful registration or revalidation. A later pass
+    appends another; it never rewrites the first, so the history of "what
+    did the schedule say each time we looked" stays readable.
+
+    Both provider calls are referenced, because the classification is a
+    JOIN of two sources: the market provider said this event exists, the
+    schedule provider said which week it is.
+    """
+
+    __tablename__ = "game_scope_observations"
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    game_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("games.id"), nullable=False)
+    market_provider_call_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("provider_calls.id"), nullable=False
+    )
+    schedule_provider_call_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("provider_calls.id"), nullable=False
+    )
+    season_year: Mapped[int] = mapped_column(Integer, nullable=False)
+    resolved_week_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    canonical_home: Mapped[str] = mapped_column(String, nullable=False)
+    canonical_away: Mapped[str] = mapped_column(String, nullable=False)
+    market_kickoff_at: Mapped[datetime] = mapped_column(nullable=False)
+    # NULL when the schedule had no published kickoff yet -- nflverse
+    # publishes future games with an empty gametime before the broadcast
+    # window is set, and inventing one would make a placeholder look real.
+    schedule_kickoff_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    kickoff_drift_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    resolver_version: Mapped[str] = mapped_column(String, nullable=False)
+    observed_at: Mapped[datetime] = mapped_column(nullable=False)
+    created_at: Mapped[datetime] = created_at_column()
+
+
+class GameScopeCorrection(Base):
+    """An EXPLICIT, audited correction to a game's scope attribute.
+
+    Silent repair is forbidden; audited correction is not. Leaving a known
+    false value in the durable research record forever is not better
+    integrity than correcting it in the open -- it is just a different
+    way to be wrong, with no paper trail either way.
+
+    This exists for exactly one known case: the Phase 4A.2 acceptance game
+    was assigned week 3 by hand before authoritative schedule verification
+    existed, and the schedule resolves that fixture to week 2.
+
+    What a correction may NEVER touch: `Game.id`, `external_ref`, the
+    teams, `kickoff_at`, or any PropMarket/PropQuote. Those are identity
+    and observation; this is a mislabelled attribute.
+    """
+
+    __tablename__ = "game_scope_corrections"
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    game_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("games.id"), nullable=False)
+    field_corrected: Mapped[str] = mapped_column(String, nullable=False)
+    old_value: Mapped[str] = mapped_column(String, nullable=False)
+    new_value: Mapped[str] = mapped_column(String, nullable=False)
+    schedule_provider_call_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("provider_calls.id"), nullable=True
+    )
+    resolver_version: Mapped[str] = mapped_column(String, nullable=False)
+    reason: Mapped[str] = mapped_column(String, nullable=False)
+    corrected_at: Mapped[datetime] = mapped_column(nullable=False)
+    created_at: Mapped[datetime] = created_at_column()
