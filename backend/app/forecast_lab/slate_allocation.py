@@ -49,6 +49,11 @@ class AllocationMethod:
     reproducible: bool
     """True when the output depends only on the fixture keys and kickoffs —
     not on input order, and not on any database identifier."""
+    approved: bool = False
+    """Reviewed and eligible to be frozen in `SeasonRules`. A method that is
+    implemented and comparable is not thereby approved; `defect` says why
+    when it is not."""
+    defect: str | None = None
 
 
 def _by_kickoff(fixtures: Sequence[PlannedFixture]) -> list[PlannedFixture]:
@@ -127,19 +132,32 @@ def _stable_hash(
 def _kickoff_block_stratified(
     fixtures: Sequence[PlannedFixture], slots: int
 ) -> tuple[PlannedFixture, ...]:
-    """Spread across DISTINCT kickoff blocks first, then hash within a block.
+    """NOT APPROVED — kept only so its defect stays visible and testable.
 
-    Blocks are distinct kickoff instants in time order. Slots are dealt
-    round-robin across blocks — one per block until every block has one,
-    then a second pass — and within a block the next fixture is taken by
-    the same versioned digest `STABLE_HASH` uses.
+    Intent: deal slots round-robin across distinct kickoff blocks, then
+    pick within a block by the same versioned digest `STABLE_HASH` uses.
 
-    The most NFL-aware of the three: a week with a Thursday game, three
-    Sunday blocks and a Monday game gets genuine temporal coverage rather
-    than five games from whichever block happens to be largest. It is also
-    the most methodology to defend, and it weights a one-game Thursday
-    block equally with a ten-game Sunday block, which is a real choice and
-    not obviously the right one.
+    **The defect.** It walks blocks in chronological order and stops the
+    moment `slots` selections exist. A real NFL week has six kickoff
+    blocks — Thursday, the early Sunday window, two late-afternoon
+    windows, Sunday night, Monday night — and five slots, so it fills
+    blocks one through five and STRUCTURALLY EXCLUDES the sixth. Monday
+    night can never be selected.
+
+    Its measured "5 of 6 blocks covered" therefore describes *always the
+    first five blocks*, not neutral temporal coverage. That number was
+    reported in the Phase 4A.7 comparison as if it were balance, which it
+    is not — the reviewer caught it, not the tests, because the test
+    asserted only that it beat V0.
+
+    A second objection stands regardless of the walk order: dealing one
+    slot per block weights a one-game Thursday block equally with a
+    ten-game Sunday block, which heavily over-represents rare primetime
+    windows relative to a neutral fixture sample.
+
+    Deliberately NOT repaired under this name. A method that was compared
+    and reported on has to keep meaning what it meant during the
+    comparison; a corrected version is a new name and a new review.
     """
 
     blocks: dict[object, list[PlannedFixture]] = {}
@@ -170,32 +188,54 @@ ALLOCATION_METHODS: dict[str, AllocationMethod] = {
     "ROUND_ROBIN_BY_KICKOFF_V0": AllocationMethod(
         name="ROUND_ROBIN_BY_KICKOFF_V0",
         summary="Inherited. Takes the first N fixtures by kickoff; not a round "
-                "robin when slots < fixtures. Kept for comparison only.",
+                "robin when slots < fixtures.",
         allocate=_legacy_round_robin,
         reproducible=True,
+        approved=False,
+        defect="Not a round robin when slots < fixtures: it takes the first N "
+               "by kickoff, a permanent bias toward Thursday night and the "
+               "early Sunday block. REJECTED in the Phase 4A.7 review.",
     ),
     "STRATIFIED_BY_KICKOFF_V1": AllocationMethod(
         name="STRATIFIED_BY_KICKOFF_V1",
         summary="Evenly spaced ranks across the kickoff-ordered week "
-                "(floor(i*n/slots)). Most explainable.",
+                "(floor(i*n/slots)).",
         allocate=_stratified_by_kickoff,
         reproducible=True,
+        approved=False,
+        defect="Samples POSITIONS rather than fixtures, so changing the pool "
+               "size moves every rank: removing two fixtures from a 16-game "
+               "week replaced three of five selections. Not selected.",
     ),
     "STABLE_HASH_V1": AllocationMethod(
         name="STABLE_HASH_V1",
         summary="Rank all fixture keys by a versioned digest, take the first N. "
-                "Strongest reproducibility, no time awareness.",
+                "Fixture-symmetric: no kickoff-time weighting of any kind.",
         allocate=_stable_hash,
         reproducible=True,
+        approved=True,
     ),
     "KICKOFF_BLOCK_STRATIFIED_V1": AllocationMethod(
         name="KICKOFF_BLOCK_STRATIFIED_V1",
-        summary="Deal slots round-robin across distinct kickoff blocks, then "
-                "pick within a block by digest. Most NFL-aware.",
+        summary="EXPERIMENTAL. Deals slots across distinct kickoff blocks in "
+                "chronological order.",
         allocate=_kickoff_block_stratified,
         reproducible=True,
+        approved=False,
+        defect="Stops once `slots` selections exist while walking blocks "
+               "chronologically, so with six blocks and five slots the LATEST "
+               "block (Monday night) is structurally excluded. Its reported "
+               "'5/6 blocks' is always the FIRST five. Also weights a one-game "
+               "Thursday block equally with a ten-game Sunday block.",
     ),
 }
+
+APPROVED_METHODS = frozenset(
+    name for name, m in ALLOCATION_METHODS.items() if m.approved
+)
+"""Eligible to be frozen in `SeasonRules`. Being implemented and
+comparable is not approval — every other method here was written to be
+measured against this one, and two of them have named defects."""
 
 
 def allocate(

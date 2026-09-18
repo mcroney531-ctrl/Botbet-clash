@@ -40,7 +40,7 @@ from typing import Sequence
 from sqlalchemy import select
 
 from app.db.models.forecast_lab import BenchmarkSlatePlan
-from app.db.models.season import Week
+from app.db.models.season import SeasonRules, Week
 from app.db.session import session_scope
 from app.forecast_lab.benchmark_slate_service import (
     PlanProvenance,
@@ -56,6 +56,7 @@ from app.forecast_lab.fixture_identity import (
 )
 from app.forecast_lab.slate_allocation import (
     ALLOCATION_METHODS,
+    APPROVED_METHODS,
     UnknownAllocationMethod,
     allocate,
 )
@@ -209,6 +210,16 @@ def propose_slate(
             f"{proposal.allocation_method!r}, which no reviewed allocator "
             "implements. Known: " + ", ".join(sorted(ALLOCATION_METHODS))
         )
+    # Implemented is not approved. Every other method in the registry was
+    # written to be MEASURED against the approved one, and two of them have
+    # named defects -- one of which structurally excludes Monday night.
+    if proposal.allocation_method not in APPROVED_METHODS:
+        method = ALLOCATION_METHODS[proposal.allocation_method]
+        raise MethodologyNotFrozen(
+            f"season {season_id} is pinned to {proposal.allocation_method}, which "
+            f"is implemented but NOT APPROVED: {method.defect} Approved: "
+            + ", ".join(sorted(APPROVED_METHODS))
+        )
     if not proposal.prop_types:
         raise MethodologyNotFrozen(f"season {season_id} has no supported_prop_types")
     if OPENING not in windows:
@@ -296,18 +307,62 @@ def commit_official_slate(
             "knowing what the market did. There is no override."
         )
 
-    # 7. One short transaction.
+    # 7. One short transaction. NOTHING observed before it is trusted.
+    #
+    # The proposal was built across a network call, so between step 1 and
+    # here: an allocation-method amendment could have landed, leaving the
+    # slate committed under a superseded rules_version; the clock could have
+    # crossed the deadline the pre-check just passed; and another committer
+    # could have taken this week. All three are re-checked under locks, and
+    # no network happens inside them.
     with session_scope() as session:
+        # The WEEK first, so two simultaneous committers serialize here and
+        # the loser refuses cleanly instead of colliding with the UNIQUE
+        # index and surfacing an IntegrityError.
         week = session.execute(
             select(Week).where(
                 Week.season_id == season_id, Week.week_number == week_number
-            )
+            ).with_for_update()
         ).scalar_one_or_none()
         if week is None:
             raise SlateCommitRefused(
                 f"season {season_id} has no Week row for week {week_number}; a plan "
                 "is keyed by week and cannot be committed without one"
             )
+
+        # The RULES, re-read under lock. rules_version is the complete
+        # methodology version, so a change to it is disqualifying whatever
+        # field moved -- but the allocation method is named explicitly
+        # because it is the one this commitment most obviously depends on.
+        _, live = _season_pins(session, season_id)
+        session.execute(
+            select(SeasonRules.id).where(SeasonRules.id == live.id).with_for_update()
+        ).scalar_one()
+        if live.rules_version != proposal.rules_version:
+            raise SlateCommitRefused(
+                f"the season's methodology changed while this slate was being "
+                f"prepared: proposed under rules {proposal.rules_version}, the "
+                f"active rules are now {live.rules_version}. Nothing committed — "
+                "re-run the preview against the current rules."
+            )
+        if live.benchmark_allocation_method != proposal.allocation_method:
+            raise SlateCommitRefused(
+                f"the frozen allocation method changed while this slate was being "
+                f"prepared: proposed {proposal.allocation_method}, the active rules "
+                f"now say {live.benchmark_allocation_method}. Nothing committed."
+            )
+
+        # The DEADLINE, on the clock at the write boundary. The post-fetch
+        # check is an early refusal; this one is the guarantee.
+        write_now = now or datetime.now(timezone.utc)
+        if write_now >= proposal.earliest_opening_at:
+            raise SlateCommitRefused(
+                f"the deadline passed between proposal and write: week "
+                f"{week_number}'s earliest OPENING window opened at "
+                f"{proposal.earliest_opening_at.isoformat()} and the write began "
+                f"at {write_now.isoformat()}. Nothing committed."
+            )
+
         existing = session.execute(
             select(BenchmarkSlatePlan).where(BenchmarkSlatePlan.week_id == week.id)
         ).scalar_one_or_none()

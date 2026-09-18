@@ -42,7 +42,7 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Iterable, Sequence
 
 from app.rosterdata.teams import CanonicalTeam
@@ -209,6 +209,49 @@ def _duplicate_keys(keys: Iterable[FixtureKey]) -> list[str]:
             duplicates.add(key.value)
         seen.add(key.value)
     return sorted(duplicates)
+
+
+PLANNING_INPUT_VERSION = "planning-input-v1"
+"""Serialization version for `planning_input_fingerprint`.
+
+Separate from `FIXTURE_KEY_VERSION` because the two can change
+independently: the key format could stay fixed while how a kickoff is
+rendered into the digest changes, and a digest whose format moved without
+a version bump would silently compare unequal to itself.
+"""
+
+
+def planning_input_fingerprint(fixtures: Sequence[PlannedFixture]) -> str:
+    """The COMPLETE planning input: fixture keys AND their kickoffs.
+
+    `pool_fingerprint` answers "which fixtures?" and deliberately ignores
+    kickoff, so a flexed broadcast time does not make every committed plan
+    look tampered with. But kickoff is not merely decorative at commit
+    time — it is what the commit DEADLINE is computed from, and a future
+    approved allocator may consume it for selection. Two plans over the
+    same fixtures at different kickoffs faced different deadlines and could
+    select differently, and one fingerprint cannot honestly say both
+    "same pool" and "same input".
+
+    So both exist, with different jobs: pool identity, and planning-input
+    integrity. Kickoffs are normalized to UTC first, because the same
+    instant expressed in two zones is the same input and must not produce
+    two digests.
+
+    Database ids and provider event refs are deliberately excluded, for the
+    same reason they are excluded from identity: they do not survive a
+    rebuild.
+    """
+
+    lines = [PLANNING_INPUT_VERSION, FIXTURE_KEY_VERSION]
+    for fixture in sorted(fixtures, key=lambda f: f.key.value):
+        kickoff = fixture.kickoff_at
+        stamp = (
+            kickoff.astimezone(timezone.utc).isoformat()
+            if kickoff is not None else "-"
+        )
+        lines.append(f"{fixture.key.value}\t{stamp}")
+    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
 
 
 def pool_fingerprint(fixtures: Sequence[PlannedFixture]) -> str:

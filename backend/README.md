@@ -1860,15 +1860,78 @@ schedule it draws all five from 2 of 6 kickoff blocks.
 | `STABLE_HASH_V1` | 3/6 | 5/5 |
 | `KICKOFF_BLOCK_STRATIFIED_V1` | 5/6 | 5/5 |
 
-All four are reproducible under 1,000 shuffled input orderings. **None is
-frozen** — that is a methodology decision, not an implementation one.
+All four are reproducible under 1,000 shuffled input orderings.
+
+### The kickoff-block "5/6" number was wrong, and so was my table
+
+`KICKOFF_BLOCK_STRATIFIED_V1` walks kickoff blocks in chronological order
+and stops the moment `slots` selections exist. A real NFL week has six
+blocks — Thursday, early Sunday, two late-afternoon windows, Sunday night,
+Monday night — and five slots, so it fills blocks one through five and
+**structurally excludes the sixth.** Monday night can never be selected.
+
+Its measured "5 of 6 blocks" is therefore always *the first five blocks*,
+and the table above reported that as if it were temporal balance. The
+review caught it; the tests did not, because the test asserted only that
+it beat V0. It is marked not-approved with the defect recorded, and
+deliberately **not repaired under the same name** — a method that was
+compared has to keep meaning what it meant during the comparison.
+
+### `STABLE_HASH_V1` is approved
+
+Fixture-symmetric: no weighting by kickoff time, block size, or primetime
+status. Database-independent, input-order-independent, no operator seed.
+Season is part of fixture identity, so rankings differ by season for free.
+Minimal pool perturbation: adding one fixture displaces at most one
+selection, removing a selected one replaces only that one.
+
+Approval is a property in the registry, not a comment. `APPROVED_METHODS`
+gates both the amendment and the official commit — a method that is merely
+implemented is refused by name, with its recorded defect quoted back.
+
+### The commit transaction trusts nothing observed before it
+
+The proposal is built across a network call, so three things can change in
+that gap. All three are now re-checked under locks, with no network inside
+them:
+
+- **an amendment landing mid-commit** — the active `SeasonRules` row is
+  re-read `FOR UPDATE` and both `rules_version` and the allocation method
+  must still match the proposal;
+- **the clock crossing the deadline** — re-checked against a clock read
+  immediately before the insert. The post-fetch check is an early refusal;
+  this one is the guarantee;
+- **a second committer** — the `Week` row is taken `FOR UPDATE`, so two
+  simultaneous commits give one plan and one clean refusal rather than an
+  unhandled UNIQUE-constraint error.
+
+### Two fingerprints, two jobs
+
+`fixture_pool_fingerprint` answers *which fixtures* and ignores kickoff, so
+a flexed broadcast time does not make every committed plan look tampered
+with. `planning_input_fingerprint` covers key **and** UTC-normalized
+kickoff, because kickoff is what the commit deadline is computed from and
+what a future kickoff-aware allocator would consume. One value cannot
+honestly mean both *same pool* and *same input*.
+
+The official-plan CHECK now also requires `resolver_version`,
+`fixture_key_version` and `planning_input_fingerprint`.
+
+### A narrow amendment, not a wider one
+
+`amend_allocation_method` may change exactly one column. Its guard list is
+*derived* from the capture amendment's — `METHODOLOGY_FIELDS` minus the one
+field, plus `POLICY_FIELDS` — so a column added to either list is guarded
+here without anyone remembering to copy it. Teaching `amend_capture_policy`
+a second mutable field would have weakened its own guard, and "which fields
+may this command change" is the entire safety property.
 
 ### Acceptance
 
-538 passed, 4 skipped. Migration `d16b83f9a4c2`. Twenty-five mutations
-across the phase; the four that survived the first pass each got a test
-and now fail — including binding writing a kickoff back, and an
-unversioned hash ranking.
+570 passed, 4 skipped. Fifteen closeout mutations; the three that survived
+the first pass — an unlocked `Week` row, a timezone-blind planning
+fingerprint, and a redundant-looking under-lock recheck — each got a test
+and now fail.
 
 ### Earlier acceptance
 

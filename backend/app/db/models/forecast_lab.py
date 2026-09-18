@@ -108,6 +108,11 @@ class BenchmarkSlatePlan(Base):
     # sha256 over the canonical ordered fixture keys -- never row ids, never
     # kickoff times. This is what survives a clean database rebuild.
     fixture_pool_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # The COMPLETE planning input: keys AND UTC-normalized kickoffs. The pool
+    # fingerprint answers "which fixtures"; this one answers "what did the
+    # allocator and the deadline actually see". Kickoff is not decorative at
+    # commit time -- it is what earliest_opening_at is computed from.
+    planning_input_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # The deadline this commitment was checked against, kept so the check
     # can be audited later rather than merely trusted.
     earliest_opening_at: Mapped[datetime | None] = mapped_column(nullable=True)
@@ -117,7 +122,10 @@ class BenchmarkSlatePlan(Base):
             "NOT is_official OR ("
             " rules_version IS NOT NULL"
             " AND schedule_provider_call_id IS NOT NULL"
+            " AND resolver_version IS NOT NULL"
+            " AND fixture_key_version IS NOT NULL"
             " AND fixture_pool_fingerprint IS NOT NULL"
+            " AND planning_input_fingerprint IS NOT NULL"
             " AND fixture_pool_count IS NOT NULL"
             " AND earliest_opening_at IS NOT NULL)",
             name="official_plan_requires_provenance",

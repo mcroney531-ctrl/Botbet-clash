@@ -314,11 +314,299 @@ def test_a_null_allocation_method_refuses_before_spending_a_fetch():
 
 
 def test_the_frozen_method_actually_selects_the_slate():
-    a = _season("method-a", method="STABLE_HASH_V1")
-    b = _season("method-b", method="KICKOFF_BLOCK_STRATIFIED_V1")
-    assert [f.key.value for f in _commit(a).chosen] != [
-        f.key.value for f in _commit(b).chosen
+    """The pinned name drives selection, not a default buried in the core."""
+
+    from app.forecast_lab.slate_allocation import allocate
+
+    season_id = _season("method-drives")
+    proposal = _commit(season_id)
+    expected = allocate(proposal.pool, slots=5, method="STABLE_HASH_V1")
+    assert [f.key.value for f in proposal.chosen] == [f.key.value for f in expected]
+    with session_scope() as session:
+        plan = session.get(BenchmarkSlatePlan, proposal.plan_id)
+        assert plan.allocation_method == "STABLE_HASH_V1"
+
+
+def test_an_implemented_but_unapproved_method_is_refused():
+    """Being in the registry is not approval. Every other method there was
+    written to be MEASURED against the approved one, and two have named
+    defects."""
+
+    season_id = _season("unapproved", method="KICKOFF_BLOCK_STRATIFIED_V1")
+    with pytest.raises(MethodologyNotFrozen, match="NOT APPROVED"):
+        _commit(season_id)
+    assert _count(BenchmarkSlatePlan) == 0
+
+
+def test_the_rejected_methods_each_carry_a_recorded_defect():
+    from app.forecast_lab.slate_allocation import ALLOCATION_METHODS, APPROVED_METHODS
+
+    assert APPROVED_METHODS == {"STABLE_HASH_V1"}
+    for name, method in ALLOCATION_METHODS.items():
+        if not method.approved:
+            assert method.defect, f"{name} is not approved but records no reason"
+
+
+def test_the_kickoff_block_candidate_structurally_excludes_the_last_block():
+    """Its measured "5 of 6 blocks" is always the FIRST five. It walks
+    blocks chronologically and stops at `slots`, so Monday night can never
+    be selected. Recorded here rather than repaired under the same name:
+    a method that was compared has to keep meaning what it meant."""
+
+    from app.forecast_lab.fixture_identity import FixtureKey, PlannedFixture
+    from app.forecast_lab.slate_allocation import allocate
+
+    def fx(away, home, offset_hours):
+        return PlannedFixture(
+            key=FixtureKey(season=2026, game_type="REG", week=3,
+                           away=CanonicalTeam(away), home=CanonicalTeam(home)),
+            kickoff_at=SUNDAY + timedelta(hours=offset_hours),
+        )
+
+    pool = [fx("ATL", "GB", -48)] + [
+        fx(a, h, 0) for a, h in (
+            ("CAR", "CLE"), ("CIN", "PIT"), ("HOU", "IND"), ("NE", "JAX"),
+            ("KC", "MIA"), ("LAC", "BUF"), ("NYJ", "DET"), ("SEA", "WAS"),
+        )
+    ] + [fx("ARI", "SF", 3), fx("MIN", "TB", 3.25), fx("LA", "DEN", 7),
+         fx("PHI", "CHI", 31)]
+
+    blocks = sorted({f.kickoff_at for f in pool})
+    assert len(blocks) == 6
+    chosen = allocate(pool, slots=5, method="KICKOFF_BLOCK_STRATIFIED_V1")
+    picked = {f.kickoff_at for f in chosen}
+    assert blocks[-1] not in picked, "the defect is gone; re-review the method"
+    assert picked == set(blocks[:5]), "it no longer takes exactly the first five"
+
+
+# --- the commit transaction trusts nothing observed before it ----------
+
+
+def test_an_amendment_landing_mid_commit_refuses_the_write():
+    """The proposal is built across a network call. An allocation-method
+    amendment can land in that gap, and a slate committed under a
+    superseded rules_version would claim methodology it never ran under."""
+
+    import app.forecast_lab.official_slate as module
+
+    season_id = _season("amended")
+    original = module.propose_slate
+
+    def amend_after_proposal(**kwargs):
+        # The gap the guard exists for: the proposal is complete, the
+        # write has not started, and an amendment lands.
+        proposal = original(**kwargs)
+        with session_scope() as session:
+            rules = session.execute(
+                select(SeasonRules).where(SeasonRules.season_id == season_id)
+            ).scalar_one()
+            rules.rules_version = f"{rules.rules_version}-amended"
+        return proposal
+
+    module.propose_slate = amend_after_proposal
+    try:
+        with pytest.raises(SlateCommitRefused, match="methodology changed"):
+            commit_official_slate(
+                season_id=season_id, week_number=3,
+                schedule_provider=StubSchedule(), now=IN_TIME,
+            )
+    finally:
+        module.propose_slate = original
+    assert _count(BenchmarkSlatePlan) == 0
+
+
+def test_an_allocation_method_change_mid_commit_refuses_the_write():
+    season_id = _season("method-swapped")
+    with session_scope() as session:
+        pass
+
+    import app.forecast_lab.official_slate as module
+
+    original = module.propose_slate
+
+    def swap_after_proposal(**kwargs):
+        proposal = original(**kwargs)
+        with session_scope() as session:
+            rules = session.execute(
+                select(SeasonRules).where(SeasonRules.season_id == season_id)
+            ).scalar_one()
+            rules.benchmark_allocation_method = "ROUND_ROBIN_BY_KICKOFF_V0"
+        return proposal
+
+    module.propose_slate = swap_after_proposal
+    try:
+        with pytest.raises(SlateCommitRefused, match="allocation method changed"):
+            commit_official_slate(
+                season_id=season_id, week_number=3,
+                schedule_provider=StubSchedule(), now=IN_TIME,
+            )
+    finally:
+        module.propose_slate = original
+    assert _count(BenchmarkSlatePlan) == 0
+
+
+def test_the_deadline_is_rechecked_at_the_write_boundary():
+    """The pre-transaction check is necessary and not sufficient: a process
+    can pass it and cross the deadline before the INSERT."""
+
+    import app.forecast_lab.official_slate as module
+
+    season_id = _season("boundary")
+    original = module.propose_slate
+
+    def propose_in_time(**kwargs):
+        kwargs["now"] = DEADLINE - timedelta(minutes=5)
+        proposal = original(**kwargs)
+        assert proposal.past_deadline is False, "the proposal was already late"
+        return proposal
+
+    module.propose_slate = propose_in_time
+    try:
+        with pytest.raises(SlateCommitRefused, match="passed between proposal and write"):
+            commit_official_slate(
+                season_id=season_id, week_number=3,
+                schedule_provider=StubSchedule(),
+                now=DEADLINE + timedelta(seconds=1),
+            )
+    finally:
+        module.propose_slate = original
+
+    assert _count(BenchmarkSlatePlan) == 0
+    assert _count(BenchmarkSlateFixture) == 0
+    assert _count(BenchmarkSlot) == 0
+
+
+def test_two_concurrent_committers_produce_one_plan_and_one_clean_refusal():
+    """Not one success plus an unhandled UNIQUE-constraint IntegrityError.
+    The Week row is taken FOR UPDATE, so the loser serializes behind it,
+    sees the committed plan and refuses."""
+
+    import threading
+
+    season_id = _season("race")
+    start = threading.Barrier(2)
+    outcomes: list[str] = []
+    lock = threading.Lock()
+
+    def worker():
+        try:
+            start.wait(timeout=10)
+            commit_official_slate(
+                season_id=season_id, week_number=3,
+                schedule_provider=StubSchedule(), now=IN_TIME,
+            )
+            result = "committed"
+        except SlateCommitRefused:
+            result = "refused"
+        except Exception as exc:  # pragma: no cover - diagnostic
+            result = f"error:{type(exc).__name__}"
+        with lock:
+            outcomes.append(result)
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+
+    assert sorted(outcomes) == ["committed", "refused"], outcomes
+    assert _count(BenchmarkSlatePlan) == 1
+
+
+def test_no_network_happens_inside_the_commit_transaction():
+    import ast
+    import inspect
+    import textwrap
+
+    from app.forecast_lab import official_slate
+
+    source = inspect.getsource(official_slate.commit_official_slate)
+    tree = ast.parse(textwrap.dedent(source))
+    blocks = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.With)
+        and "session_scope" in ast.dump(node.items[0].context_expr)
     ]
+    assert blocks, "commit_official_slate no longer opens a session_scope block"
+    names: set[str] = set()
+    for block in blocks:
+        names |= {
+            n.func.attr for n in ast.walk(block)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+        } | {
+            n.func.id for n in ast.walk(block)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+        }
+    for forbidden in ("fetch_schedule", "propose_slate", "planned_pool", "record_call"):
+        assert forbidden not in names, f"{forbidden} runs inside the commit lock"
+
+
+def test_the_commit_transaction_locks_the_week_and_the_rules():
+    """The concurrency test alone cannot prove this: two Python threads can
+    serialize by accident and still pass. The locks are asserted
+    structurally as well."""
+
+    import ast
+    import inspect
+    import textwrap
+
+    from app.forecast_lab import official_slate
+
+    tree = ast.parse(
+        textwrap.dedent(inspect.getsource(official_slate.commit_official_slate))
+    )
+    locked = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "with_for_update"
+    ]
+    assert len(locked) >= 2, (
+        "the commit transaction must lock BOTH the Week row (to serialize "
+        "committers) and the active SeasonRules row (to catch an amendment "
+        f"landing mid-commit); found {len(locked)} lock(s)"
+    )
+    sources = [ast.dump(node) for node in locked]
+    assert any("Week" in s for s in sources), "the Week row is not locked"
+    assert any("SeasonRules" in s for s in sources), "the rules row is not locked"
+
+
+def test_the_planning_input_fingerprint_is_persisted_and_distinct():
+    season_id = _season("planning-fp")
+    proposal = _commit(season_id)
+    with session_scope() as session:
+        plan = session.get(BenchmarkSlatePlan, proposal.plan_id)
+        assert plan.planning_input_fingerprint
+        assert len(plan.planning_input_fingerprint) == 64
+        assert plan.planning_input_fingerprint != plan.fixture_pool_fingerprint, (
+            "one fingerprint cannot honestly mean both same-pool and same-input"
+        )
+        assert plan.resolver_version and plan.fixture_key_version
+
+
+def test_an_official_plan_without_the_new_provenance_is_refused_by_the_database():
+    from sqlalchemy.exc import IntegrityError
+
+    from app.forecast_lab.fixture_identity import FIXTURE_KEY_VERSION
+
+    season_id = _season("new-prov")
+    with session_scope() as session:
+        week_id = session.execute(
+            select(Week.id).where(Week.season_id == season_id)
+        ).scalar_one()
+    # Everything the OLD check required, and nothing more.
+    with pytest.raises(IntegrityError):
+        with session_scope() as session:
+            session.add(BenchmarkSlatePlan(
+                week_id=week_id, target_slot_count=5,
+                allocation_method="STABLE_HASH_V1", committed_at=IN_TIME,
+                is_official=True, rules_version="x",
+                schedule_provider_call_id=None,
+                fixture_pool_fingerprint="a" * 64, fixture_pool_count=10,
+                earliest_opening_at=DEADLINE,
+                fixture_key_version=FIXTURE_KEY_VERSION,
+                resolver_version="r",
+            ))
 
 
 def test_the_official_entry_point_takes_no_methodology_arguments():

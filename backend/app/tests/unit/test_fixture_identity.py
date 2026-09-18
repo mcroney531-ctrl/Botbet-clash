@@ -207,6 +207,46 @@ def test_the_fingerprint_ignores_kickoff_drift():
     assert pool_fingerprint(a) == pool_fingerprint(b)
 
 
+def test_the_planning_fingerprint_normalizes_timezones():
+    """The same instant expressed in two zones is the same planning input.
+    Without normalization a schedule that started reporting Eastern instead
+    of UTC would make every plan compare unequal to itself."""
+
+    from zoneinfo import ZoneInfo
+
+    from app.forecast_lab.fixture_identity import planning_input_fingerprint
+
+    utc = datetime(2026, 9, 25, 0, 15, tzinfo=timezone.utc)
+    eastern = utc.astimezone(ZoneInfo("America/New_York"))
+    assert eastern.utcoffset() != timedelta(0), "the fixture stopped testing zones"
+
+    a = _fixture("ATL", "GB", kickoff=utc)
+    b = _fixture("ATL", "GB", kickoff=eastern)
+    assert planning_input_fingerprint([a]) == planning_input_fingerprint([b])
+
+
+def test_the_planning_fingerprint_moves_when_a_kickoff_moves():
+    """Unlike the pool fingerprint. Kickoff is what the commit DEADLINE is
+    computed from, so a plan over the same fixtures at different kickoffs
+    faced a different deadline and is a different planning input."""
+
+    from app.forecast_lab.fixture_identity import planning_input_fingerprint
+
+    a = _fixture("ATL", "GB", kickoff=SUNDAY)
+    b = _fixture("ATL", "GB", kickoff=SUNDAY + timedelta(hours=3))
+    assert planning_input_fingerprint([a]) != planning_input_fingerprint([b])
+    assert pool_fingerprint([a]) == pool_fingerprint([b]), (
+        "the POOL fingerprint must still ignore kickoff drift"
+    )
+
+
+def test_the_two_fingerprints_are_never_the_same_value():
+    from app.forecast_lab.fixture_identity import planning_input_fingerprint
+
+    fixtures = [_fixture("ATL", "GB"), _fixture("NE", "JAX")]
+    assert planning_input_fingerprint(fixtures) != pool_fingerprint(fixtures)
+
+
 def test_the_fingerprint_changes_when_the_pool_changes():
     a = [_fixture("ATL", "GB"), _fixture("NE", "JAX")]
     assert pool_fingerprint(a) != pool_fingerprint(a[:1])

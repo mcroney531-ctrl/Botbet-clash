@@ -52,6 +52,7 @@ from app.forecast_lab.fixture_identity import (
     REGULAR_SEASON,
     FixtureKey,
     PlannedFixture,
+    planning_input_fingerprint,
     pool_fingerprint,
 )
 from app.forecast_lab.slate_allocation import allocate
@@ -118,6 +119,7 @@ def commit_from_planned_fixtures(
         fixture_key_version=FIXTURE_KEY_VERSION,
         fixture_pool_count=len(ordered),
         fixture_pool_fingerprint=pool_fingerprint(ordered),
+        planning_input_fingerprint=planning_input_fingerprint(ordered),
         earliest_opening_at=provenance.earliest_opening_at if provenance else None,
     ))
 
