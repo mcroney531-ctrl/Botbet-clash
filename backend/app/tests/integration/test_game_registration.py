@@ -1,0 +1,572 @@
+"""Phase 4A.6 — event registration and checkpoint-state inspection.
+
+Registration exists because `official_capture` deliberately will not
+rediscover an event: it rebuilds the provider identity from
+`Game.external_ref`, so a capture can never be pointed at the wrong game
+by a typo. Something still has to create those rows, and mixing that with
+paid quote ingestion would make it neither repeatable nor free.
+
+Every provider call here is a stub. Zero credits.
+"""
+
+from __future__ import annotations
+
+import uuid
+from datetime import datetime, timedelta, timezone
+
+import pytest
+from sqlalchemy import func, select
+
+from app.db.models.markets import CheckpointRun, Game
+from app.db.models.season import Season, SeasonRules
+from app.db.session import session_scope
+from app.marketdata.base import ProviderCallMetadata, ProviderFetchResult
+from app.marketdata.dto import ProviderEvent, ProviderEventRef
+from app.marketdata.game_registration import (
+    EventScopeConflict,
+    register_game,
+    register_week_events,
+    render,
+    verify_game_scope,
+)
+from app.rosterdata.teams import CanonicalTeam
+
+PROVIDER = "THE_ODDS_API"
+NOW = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
+KICKOFF = NOW + timedelta(days=4)
+WINDOW = {
+    "OPENING": {"start_hours_before_kickoff": 144, "end_hours_before_kickoff": 96},
+    "MID": {"start_hours_before_kickoff": 60, "end_hours_before_kickoff": 36},
+    "FINAL": {"start_hours_before_kickoff": 6, "end_hours_before_kickoff": 2},
+}
+
+
+def _event(event_id: str, *, home="Buffalo Bills", away="Detroit Lions", kickoff=KICKOFF):
+    return ProviderEvent(
+        ref=ProviderEventRef(provider=PROVIDER, external_event_id=event_id),
+        sport_key="americanfootball_nfl",
+        kickoff_at=kickoff,
+        home_team=home,
+        away_team=away,
+    )
+
+
+class StubOdds:
+    """Returns a fixed event list. Records how many times it was called, so
+    a test can prove registration is free AND that a repeat pass does not
+    quietly re-fetch."""
+
+    def __init__(self, events, *, ok=True, error=None, quota_cost=0):
+        self.events = events
+        self.ok = ok
+        self.error = error
+        self.quota_cost = quota_cost
+        self.calls = 0
+
+    def list_events(self, *, sport, window_start, window_end):
+        self.calls += 1
+        meta = ProviderCallMetadata(
+            endpoint_capability="LIST_EVENTS",
+            requested_at=NOW,
+            responded_at=NOW,
+            http_status=200 if self.ok else 500,
+            raw_response_body=b"[]",
+            raw_response_sha256="f" * 64,
+            raw_response_bytes=2,
+            quota_cost=self.quota_cost,
+            quota_remaining=497,
+        )
+        if not self.ok:
+            from app.marketdata.base import error_result
+
+            return error_result(
+                category=self.error or "PROVIDER_UNAVAILABLE",
+                message="stub failure",
+                call_metadata=meta,
+            )
+        # `ok` is a derived property (error is None AND payload is not
+        # None), not a constructor argument.
+        return ProviderFetchResult(payload=list(self.events), error=None, call_metadata=meta)
+
+
+def _season(tag: str, *, provider=PROVIDER) -> uuid.UUID:
+    with session_scope() as session:
+        season = Season(year=2026, name=f"reg-{tag}", status="ACTIVE")
+        session.add(season)
+        session.flush()
+        session.add(SeasonRules(
+            season_id=season.id, rules_version=f"reg-{tag}-{uuid.uuid4()}",
+            starting_bankroll_cents=1500, canonical_sportsbook="DRAFTKINGS",
+            market_data_provider=provider, roster_data_provider="NFLVERSE",
+            research_settlement_provider="NFLVERSE", research_settlement_delay_hours=24,
+            supported_prop_types=["receiving_yards"], devig_method="PROPORTIONAL_V1",
+            benchmark_slate_size=5, batch_methodology="SINGLE_BATCH",
+            checkpoint_windows=WINDOW,
+            kelly_fraction="0.20", standard_max_bankroll_fraction="0.20",
+            exceptional_max_bankroll_fraction="0.30",
+            minimum_stake_cents=25, stake_increment_cents=25, pounce_limit=1,
+            attribution_confidence_threshold="0.700",
+            effective_from=datetime(2026, 9, 1, tzinfo=timezone.utc),
+        ))
+        return season.id
+
+
+def _register(season_id, events, **kw):
+    stub = kw.pop("stub", None) or StubOdds(events)
+    report = register_week_events(
+        season_id=season_id, week_number=4,
+        window_start=NOW, window_end=NOW + timedelta(days=8),
+        odds_provider=stub, **kw,
+    )
+    report._stub = stub  # for call-count assertions
+    return report
+
+
+# --- the happy path ---------------------------------------------------
+
+
+def test_registration_creates_games_from_provider_events():
+    season_id = _season("create")
+    report = _register(season_id, [_event("e1"), _event("e2", home="Kansas City Chiefs", away="Denver Broncos")])
+
+    assert report.events_observed == 2
+    assert len(report.created) == 2
+    assert report.reused == []
+    assert report.conflicts == []
+
+    with session_scope() as session:
+        games = session.execute(select(Game).where(Game.season_id == season_id)).scalars().all()
+    assert {g.external_ref for g in games} == {"THE_ODDS_API:e1", "THE_ODDS_API:e2"}
+    assert {g.week_number for g in games} == {4}
+    assert {(g.home_team_canonical, g.away_team_canonical) for g in games} == {
+        ("BUF", "DET"), ("KC", "DEN"),
+    }
+
+
+def test_registration_is_free_and_says_so():
+    season_id = _season("free")
+    report = _register(season_id, [_event("e1")])
+    assert report.quota_cost == 0
+    assert "/events is free" in render(report)
+
+
+def test_the_provider_call_is_recorded_even_though_it_is_free():
+    """A free call is still a call we made. The audit chain should not have
+    holes just because a row happens to cost nothing."""
+
+    from app.db.models.ingestion import ProviderCall
+
+    season_id = _season("provenance")
+    _register(season_id, [_event("e1")])
+
+    with session_scope() as session:
+        calls = session.execute(
+            select(ProviderCall).where(ProviderCall.endpoint_capability == "LIST_EVENTS")
+        ).scalars().all()
+    assert len(calls) == 1
+    assert calls[0].success is True
+
+
+# --- idempotency and concurrency --------------------------------------
+
+
+def test_registering_the_same_event_twice_reuses_the_same_game():
+    season_id = _season("idem")
+    first = _register(season_id, [_event("e1")])
+    second = _register(season_id, [_event("e1")])
+
+    assert len(first.created) == 1
+    assert len(second.created) == 0 and len(second.reused) == 1
+    assert first.created[0].game_id == second.reused[0].game_id
+
+    with session_scope() as session:
+        count = session.execute(
+            select(func.count()).select_from(Game).where(Game.season_id == season_id)
+        ).scalar()
+    assert count == 1
+
+
+def test_a_partially_registered_week_can_be_re_run_safely():
+    """A conflict on one game must not roll back the registrations that
+    already succeeded, and the retry must pick up only what is missing."""
+
+    season_id = _season("partial")
+    first = _register(season_id, [_event("e1")])
+    assert len(first.created) == 1
+
+    second = _register(season_id, [_event("e1"), _event("e2", home="Kansas City Chiefs", away="Denver Broncos")])
+    assert len(second.reused) == 1
+    assert len(second.created) == 1
+
+    with session_scope() as session:
+        count = session.execute(
+            select(func.count()).select_from(Game).where(Game.season_id == season_id)
+        ).scalar()
+    assert count == 2
+
+
+def test_concurrent_registration_cannot_duplicate_an_external_ref():
+    """Two passes racing both see no row and both INSERT. The unique index
+    decides; the loser re-reads and verifies the winner's row rather than
+    failing, because the outcome a caller wants is "this event is
+    registered" -- and it is."""
+
+    import threading
+
+    # Eight workers, not two. With two, one routinely finished before the
+    # other began and the loser took the ordinary "already exists" branch --
+    # so the IntegrityError recovery path went unexercised and a mutation
+    # that removed it still passed. Real contention is the point of the
+    # test, so make contention likely.
+    WORKERS = 8
+
+    season_id = _season("race")
+    barrier = threading.Barrier(WORKERS)
+    results: dict = {}
+    lock = threading.Lock()
+
+    def worker(name):
+        barrier.wait()
+        try:
+            outcome = _register(season_id, [_event("e-race")])
+        except Exception as exc:  # recorded, not swallowed
+            outcome = exc
+        with lock:
+            results[name] = outcome
+
+    threads = [threading.Thread(target=worker, args=(str(i),)) for i in range(WORKERS)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+
+    for name, outcome in results.items():
+        assert not isinstance(outcome, Exception), f"{name} raised: {outcome}"
+
+    with session_scope() as session:
+        games = session.execute(
+            select(Game).where(Game.external_ref == "THE_ODDS_API:e-race")
+        ).scalars().all()
+    assert len(games) == 1
+
+    created = sum(len(r.created) for r in results.values())
+    assert created == 1, "exactly one worker created it"
+
+
+def test_no_transaction_is_held_across_the_provider_call():
+    """The same rule the capture cycle follows: a network wait must never
+    sit inside an open transaction."""
+
+    import ast
+    import inspect
+
+    from app.marketdata import game_registration
+
+    tree = ast.parse(inspect.getsource(game_registration))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.With):
+            continue
+        rendered = ast.unparse(node)
+        if "session_scope()" not in rendered:
+            continue
+        assert "list_events" not in rendered, "a provider call inside a transaction"
+
+
+# --- fail closed on scope conflict ------------------------------------
+
+
+def test_a_scope_mismatch_fails_loudly_and_does_not_relocate_the_row():
+    season_id = _season("conflict")
+    _register(season_id, [_event("e1")])
+
+    # Same external_ref, different kickoff: the provider moved the game, or
+    # we are about to attach a permanent identity to the wrong thing.
+    moved = _event("e1", kickoff=KICKOFF + timedelta(days=1))
+    report = _register(season_id, [moved])
+
+    assert len(report.conflicts) == 1
+    assert "EVENT_SCOPE_CONFLICT" in report.conflicts[0]
+    assert "kickoff" in report.conflicts[0]
+
+    with session_scope() as session:
+        game = session.execute(
+            select(Game).where(Game.external_ref == "THE_ODDS_API:e1")
+        ).scalar_one()
+    assert game.kickoff_at == KICKOFF, "the existing row was silently moved"
+
+
+def test_every_scope_field_is_verified_not_just_the_external_ref():
+    """Checking only the ref would make the protection cover the FIRST
+    write and nothing after it: a row attached to the wrong season would
+    then be found and reused by every later, correct run."""
+
+    season_id = _season("scope")
+    other_season = _season("scope-other")
+    _register(season_id, [_event("e1")])
+
+    with session_scope() as session:
+        game = session.execute(
+            select(Game).where(Game.external_ref == "THE_ODDS_API:e1")
+        ).scalar_one()
+
+        for kwargs in (
+            dict(season_id=other_season, week_number=4, home=CanonicalTeam.BUF, away=CanonicalTeam.DET, kickoff_at=KICKOFF),
+            dict(season_id=season_id, week_number=5, home=CanonicalTeam.BUF, away=CanonicalTeam.DET, kickoff_at=KICKOFF),
+            dict(season_id=season_id, week_number=4, home=CanonicalTeam.KC, away=CanonicalTeam.DET, kickoff_at=KICKOFF),
+            dict(season_id=season_id, week_number=4, home=CanonicalTeam.BUF, away=CanonicalTeam.KC, kickoff_at=KICKOFF),
+            dict(season_id=season_id, week_number=4, home=CanonicalTeam.BUF, away=CanonicalTeam.DET, kickoff_at=KICKOFF + timedelta(hours=1)),
+        ):
+            with pytest.raises(EventScopeConflict):
+                verify_game_scope(game, **kwargs)
+
+        # The matching scope is accepted, so the guard is not passing by
+        # rejecting everything.
+        verify_game_scope(
+            game, season_id=season_id, week_number=4,
+            home=CanonicalTeam.BUF, away=CanonicalTeam.DET, kickoff_at=KICKOFF,
+        )
+
+
+def test_week_zero_is_refused_before_any_row_is_written():
+    season_id = _season("week0")
+    stub = StubOdds([_event("e1")])
+    with pytest.raises(ValueError, match="real NFL week"):
+        register_week_events(
+            season_id=season_id, week_number=0,
+            window_start=NOW, window_end=NOW + timedelta(days=8),
+            odds_provider=stub,
+        )
+    assert stub.calls == 0, "week 0 was refused only after spending a call"
+
+
+def test_an_unmapped_team_is_reported_not_guessed():
+    season_id = _season("unmapped")
+    report = _register(season_id, [_event("e1", home="Atlantis Krakens")])
+
+    assert len(report.unmapped_teams) == 1
+    assert report.created == []
+
+
+def test_the_provider_comes_from_season_rules_not_a_flag():
+    """A registration run using a different feed from the one the season is
+    pinned to would create Game rows no capture could ever refresh."""
+
+    import inspect
+
+    from app.marketdata import game_registration
+
+    source = inspect.getsource(game_registration)
+    for flag in ("--market-data-provider", "--canonical-sportsbook", "--provider"):
+        assert flag not in source
+
+    season_id = _season("wrong-pin", provider="SOME_OTHER_PROVIDER")
+    with pytest.raises(ValueError, match="pinned to"):
+        _register(season_id, [_event("e1")])
+
+
+# --- scope: identity only ---------------------------------------------
+
+
+def test_registration_writes_nothing_but_games_and_provenance():
+    """Registration must not become a second ingestion path. Mixing it with
+    paid quote work would make it neither repeatable nor free."""
+
+    from app.db.models.forecast_lab import EvidenceSnapshot
+    from app.db.models.markets import MarketSnapshot, Player, PropMarket, PropQuote
+    from app.db.models.roster import GamePlayer
+
+    season_id = _season("identity-only")
+    _register(season_id, [_event("e1")])
+
+    with session_scope() as session:
+        for model in (Player, PropMarket, PropQuote, MarketSnapshot, EvidenceSnapshot, GamePlayer, CheckpointRun):
+            count = session.execute(select(func.count()).select_from(model)).scalar()
+            assert count == 0, f"registration created {model.__name__} rows"
+
+
+def test_registration_never_reaches_a_roster_or_quote_path():
+    import ast
+    import inspect
+
+    from app.marketdata import game_registration
+
+    tree = ast.parse(inspect.getsource(game_registration))
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.FunctionDef, ast.ClassDef)):
+            body = node.body
+            if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+                node.body = body[1:] or [ast.Pass()]
+    code = ast.unparse(tree)
+    for forbidden in (
+        "fetch_quotes", "fetch_current_roster", "persist_quote", "resolve_and_record",
+        "capture_checkpoint", "MarketSnapshotService", "CheckpointRun",
+    ):
+        assert forbidden not in code, f"registration must not use {forbidden}"
+
+
+def test_the_registration_helper_has_one_implementation():
+    """live_ingest shares it. Two copies of permanent-identity verification
+    is exactly the drift this phase keeps removing."""
+
+    import ast
+    import inspect
+
+    from app.marketdata import live_ingest
+
+    code = ast.unparse(ast.parse(inspect.getsource(live_ingest)))
+    assert "register_game" in code
+    assert "EVENT_SCOPE_CONFLICT" not in code, "live_ingest re-implements scope verification"
+
+
+# --- checkpoint-state inspection --------------------------------------
+
+
+def test_the_inspector_reports_checkpoint_state():
+    """Added after a wrong claim: the inspector reported identity, quotes
+    and movement but nothing about CheckpointRun."""
+
+    import io
+    from contextlib import redirect_stdout
+
+    from app.marketdata import inspect_ingestion
+
+    season_id = _season("inspect")
+    report = _register(season_id, [_event("e1")])
+    game_id = report.created[0].game_id
+
+    buffer = io.StringIO()
+    with redirect_stdout(buffer):
+        inspect_ingestion.main(["--game-id", str(game_id)])
+    text = buffer.getvalue()
+
+    assert "checkpoint state" in text
+    for checkpoint_type in ("OPENING", "MID", "FINAL"):
+        assert checkpoint_type in text
+
+
+def test_a_missing_checkpoint_reports_NONE_not_MISSED():
+    """Historical absence and a recorded MISSED outcome are different
+    facts. Collapsing them would let a gap in the record look like a logged
+    decision."""
+
+    import io
+    from contextlib import redirect_stdout
+
+    from app.marketdata import inspect_ingestion
+
+    season_id = _season("none-vs-missed")
+    report = _register(season_id, [_event("e1")])
+    game_id = report.created[0].game_id
+
+    buffer = io.StringIO()
+    with redirect_stdout(buffer):
+        inspect_ingestion.main(["--game-id", str(game_id)])
+    text = buffer.getvalue()
+
+    # Asserted on the STATUS LINE, not on substring presence anywhere in
+    # the output: the NONE branch's own explanation says "NOT a recorded
+    # MISSED outcome", so a bare `"MISSED" not in text` matches the prose
+    # rather than the state. Match the rendered shape instead.
+    for checkpoint_type in ("OPENING", "MID", "FINAL"):
+        assert f"{checkpoint_type:8} NONE — no CheckpointRun row exists" in text
+        assert f"{checkpoint_type:8} MISSED" not in text
+    assert "historical absence" in text
+
+
+def test_the_inspector_reports_a_real_missed_row_as_MISSED():
+    """The counterpart: a recorded MISSED must not read as absence."""
+
+    import io
+    from contextlib import redirect_stdout
+
+    from app.marketdata import inspect_ingestion
+
+    season_id = _season("real-missed")
+    report = _register(season_id, [_event("e1")])
+    game_id = report.created[0].game_id
+
+    with session_scope() as session:
+        session.add(CheckpointRun(
+            game_id=game_id, checkpoint_type="FINAL",
+            window_start=KICKOFF - timedelta(hours=6),
+            window_end=KICKOFF - timedelta(hours=2),
+            target_time=KICKOFF - timedelta(hours=3),
+            status="MISSED",
+        ))
+
+    buffer = io.StringIO()
+    with redirect_stdout(buffer):
+        inspect_ingestion.main(["--game-id", str(game_id)])
+    text = buffer.getvalue()
+
+    assert "FINAL    MISSED" in text
+    assert "OPENING  NONE" in text
+
+
+def test_the_inspector_is_still_read_only():
+    import ast
+    import inspect
+
+    from app.marketdata import inspect_ingestion
+
+    tree = ast.parse(inspect.getsource(inspect_ingestion))
+    writes = [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Call)
+        and getattr(n.func, "attr", None) in {"add", "add_all", "delete", "commit", "flush"}
+        and getattr(getattr(n.func, "value", None), "id", None) == "session"
+    ]
+    assert writes == [], "the inspector must never write"
+
+
+def test_the_duplicate_recovery_branch_works_deterministically():
+    """The threaded test above proves the INVARIANT (never two rows) but
+    not this BRANCH: with the GIL, two workers routinely fail to collide
+    inside the SELECT->INSERT window, so a mutation removing the
+    IntegrityError handler still passed two runs in three.
+
+    Forced deterministically instead of hoped for. Under REPEATABLE READ a
+    transaction's snapshot is fixed at its first read, so:
+
+        A reads  -> sees nothing, snapshot frozen
+        B writes -> commits
+        A writes -> A still sees nothing, INSERTs, hits the unique index
+
+    That is exactly the interleaving the handler exists for, and it is
+    reproducible rather than lucky.
+    """
+
+    from app.db.session import get_session_factory
+
+    season_id = _season("dup-branch")
+    event = _event("e-dup")
+    ref = event.ref.as_external_ref()
+
+    session_a = get_session_factory()()
+    try:
+        session_a.connection(execution_options={"isolation_level": "REPEATABLE READ"})
+        # A's snapshot is frozen here, before B exists.
+        assert session_a.execute(select(Game).where(Game.external_ref == ref)).scalar_one_or_none() is None
+
+        with session_scope() as session_b:
+            register_game(
+                session_b, event=event, season_id=season_id, week_number=4,
+                home=CanonicalTeam.BUF, away=CanonicalTeam.DET,
+            )
+
+        # A still cannot see B's row, so it INSERTs and collides.
+        game, created = register_game(
+            session_a, event=event, season_id=season_id, week_number=4,
+            home=CanonicalTeam.BUF, away=CanonicalTeam.DET,
+        )
+        assert created is False, "A recovered by adopting the winner's row"
+        assert game.external_ref == ref
+        session_a.commit()
+    finally:
+        session_a.close()
+
+    with session_scope() as session:
+        count = session.execute(
+            select(func.count()).select_from(Game).where(Game.external_ref == ref)
+        ).scalar()
+    assert count == 1

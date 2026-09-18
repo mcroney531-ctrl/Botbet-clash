@@ -1390,3 +1390,76 @@ is. The retry tests move the kickoff instead of the clock.
 | allow an unwired provider | the fail-closed test |
 | count one ProviderCall per attempt | the multi-call accounting test |
 | ignore the expected amendment parent | both amendment-race tests |
+
+---
+
+## Phase 4A.6 — registration, and a claim I got wrong
+
+### The correction
+
+I said `inspect_ingestion` could tell us whether the DET@BUF checkpoints
+captured. It couldn't: the file had zero mentions of `CheckpointRun`. It
+reported identity rows, quotes, observation times and market movement, and
+nothing about checkpoint state. That was a claim about code I wrote and
+didn't check.
+
+It now reports, per checkpoint type: row existence, status, window,
+target, `captured_at`, scheduler offset, and the `EvidenceSnapshot` /
+`MarketSnapshot` counts reachable from that run. Plus any open cycle
+leases.
+
+**NONE is reported as NONE.** A checkpoint that was never created and one
+explicitly marked MISSED are different facts — the first is historical
+absence, the second is a decision the system recorded — and collapsing
+them would let a gap in the record look like a logged outcome. There are
+tests for both directions.
+
+### Registration: the gap the official runner's strictness created
+
+`official_capture` deliberately won't rediscover an event — it rebuilds
+the provider identity from `Game.external_ref`, so a capture can never be
+pointed at the wrong game by a typo. Good for capture integrity, but it
+means something else has to create the `Game` rows.
+
+`register_week_events` does that and nothing else:
+
+```
+MAY       call /events, canonicalize teams, create Game rows,
+          verify existing Game rows against their full scope
+MUST NOT  fetch props or roster, create Player/GamePlayer,
+          PropMarket/PropQuote, MarketSnapshot/EvidenceSnapshot,
+          CheckpointRun, or call a model
+```
+
+That list is enforced by a structural test and by a test asserting the
+tables stay empty. `/events` is free on this provider, so registration is
+re-runnable as the schedule changes — but the provider call is still
+recorded, because a free call is still a call we made and the audit chain
+shouldn't have holes just because a row costs nothing.
+
+The provider comes from the season's active `SeasonRules`, never a flag: a
+registration run using a different feed from the one the season is pinned
+to would create `Game` rows no capture could ever refresh.
+
+Scope verification is now shared with `live_ingest` rather than copied —
+same argument as quote selection and the resolution loop. A test asserts
+`live_ingest` no longer contains its own `EVENT_SCOPE_CONFLICT`.
+
+### On testing a race honestly
+
+The threaded concurrency test proves the invariant — never two rows for
+one `external_ref`. It did **not** prove the `IntegrityError` recovery
+branch: with the GIL, two workers routinely finished sequentially, so a
+mutation deleting that handler still passed. Raising it to eight workers
+helped but stayed flaky — 1 failure in 3.
+
+So the branch now has its own deterministic test using REPEATABLE READ: a
+transaction's snapshot is fixed at its first read, so A reads nothing, B
+commits, and A's insert collides for certain rather than by luck. 3/3 pass
+clean, 3/3 fail under mutation.
+
+Worth stating because the first version looked like coverage and wasn't.
+
+### Test count
+
+**388 passed, 4 skipped.** No migration.

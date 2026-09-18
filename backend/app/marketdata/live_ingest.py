@@ -38,6 +38,7 @@ from app.db.session import session_scope
 from app.domain.enums import StatFamily
 from app.forecast_lab.market_snapshot_service import MarketSnapshotService
 from app.marketdata.game_refresh import PersistCounts, persist_resolved_quotes
+from app.marketdata.game_registration import EventScopeConflict, register_game
 from app.marketdata.ingestion import partition_ambiguous_lines
 from app.marketdata.providers.the_odds_api import (
     API_KEY_ENV_VAR,
@@ -326,45 +327,17 @@ def run(
 
     # --- 4. persist ---------------------------------------------------
     with session_scope() as session:
-        repo = MarketRepository(session)
-        game = session.execute(
-            select(Game).where(Game.external_ref == event.ref.as_external_ref())
-        ).scalar_one_or_none()
-        if game is not None:
-            # Reusing by external_ref alone would make the poisoned-event
-            # protection cover only the FIRST write. Verify the whole scope.
-            mismatches = []
-            if game.season_id != season_id:
-                mismatches.append(f"season_id {game.season_id} != {season_id}")
-            if game.week_number != week_number:
-                mismatches.append(f"week_number {game.week_number} != {week_number}")
-            if game.home_team_canonical != home.value:
-                mismatches.append(f"home {game.home_team_canonical} != {home.value}")
-            if game.away_team_canonical != away.value:
-                mismatches.append(f"away {game.away_team_canonical} != {away.value}")
-            if game.kickoff_at != event.kickoff_at:
-                mismatches.append(
-                    f"kickoff {game.kickoff_at.isoformat()} != {event.kickoff_at.isoformat()}"
-                )
-            if mismatches:
-                raise PreflightFailure(
-                    f"EVENT_SCOPE_CONFLICT for {event.ref.as_external_ref()}: "
-                    + "; ".join(mismatches)
-                    + ".\nThe existing row is NOT being repaired or moved "
-                    "automatically -- an external_ref is a permanent identity and "
-                    "silently relocating it would hide whichever write was wrong."
-                )
-        if game is None:
-            game = repo.create_game(
-                external_ref=event.ref.as_external_ref(),
-                season_id=season_id,
-                week_number=week_number,
-                home_team=event.home_team,
-                away_team=event.away_team,
-                home_team_canonical=home.value,
-                away_team_canonical=away.value,
-                kickoff_at=event.kickoff_at,
+        # Get-or-create and full scope verification are SHARED with the
+        # production registration job, not copied. Checking only the
+        # external_ref would make the poisoned-event protection cover the
+        # FIRST write and nothing after it.
+        try:
+            game, _created = register_game(
+                session, event=event, season_id=season_id,
+                week_number=week_number, home=home, away=away,
             )
+        except EventScopeConflict as exc:
+            raise PreflightFailure(str(exc)) from exc
         report.game_id = str(game.id)
 
         run_row = session.get(IngestionRun, odds_run_id)

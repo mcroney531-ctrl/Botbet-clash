@@ -23,7 +23,16 @@ from typing import Sequence
 from sqlalchemy import func, select
 
 from app.db.models.ingestion import ProviderCall
-from app.db.models.markets import Game, Player, PropMarket, PropQuote
+from app.db.models.forecast_lab import EvidenceSnapshot
+from app.db.models.markets import (
+    CheckpointCycleLease,
+    CheckpointRun,
+    Game,
+    MarketSnapshot,
+    Player,
+    PropMarket,
+    PropQuote,
+)
 from app.db.models.roster import GamePlayer, GamePlayerObservation
 from app.db.session import session_scope
 
@@ -170,10 +179,75 @@ def main(argv: Sequence[str] | None = None) -> int:
                 add("    (none moved — every shared quote was an identical")
                 add("     re-observation, which still produced a new row)")
         add("")
+        _add_checkpoint_state(session, game, add)
+        add("")
         add("=" * 72)
 
     print("\n".join(out))
     return 0
+
+
+def _add_checkpoint_state(session, game, add) -> None:
+    """What research state this game actually holds.
+
+    Added after a wrong claim: this inspector reported identity, quotes and
+    market movement but nothing about CheckpointRun, so "run the inspector
+    to see whether the checkpoints captured" was advice it could not
+    follow.
+
+    NONE is reported as NONE. A checkpoint that was never created and one
+    explicitly marked MISSED are different facts -- the first is historical
+    absence, the second is a decision the system recorded -- and collapsing
+    them would let a gap in the record look like a logged outcome.
+    """
+
+    add("--- checkpoint state -----------------------------------------------")
+    add(f"  kickoff  {game.kickoff_at.isoformat()}")
+    runs = {
+        r.checkpoint_type: r
+        for r in session.execute(
+            select(CheckpointRun).where(CheckpointRun.game_id == game.id)
+        ).scalars()
+    }
+    for checkpoint_type in ("OPENING", "MID", "FINAL"):
+        run = runs.get(checkpoint_type)
+        add("")
+        if run is None:
+            add(f"  {checkpoint_type:8} NONE — no CheckpointRun row exists")
+            add("           (historical absence, NOT a recorded MISSED outcome)")
+            continue
+        add(f"  {checkpoint_type:8} {run.status}")
+        add(f"           window   {run.window_start.isoformat()}")
+        add(f"                 .. {run.window_end.isoformat()}")
+        add(f"           target   {run.target_time.isoformat()}")
+        add(f"           captured {run.captured_at.isoformat() if run.captured_at else '—'}")
+        if run.captured_at is not None:
+            offset = (run.captured_at - run.target_time).total_seconds()
+            add(f"           scheduler offset {offset:+.0f}s  (captured_at - target_time)")
+
+        evidence_count = session.execute(
+            select(func.count()).select_from(EvidenceSnapshot)
+            .where(EvidenceSnapshot.checkpoint_run_id == run.id)
+        ).scalar()
+        snapshot_count = session.execute(
+            select(func.count(func.distinct(MarketSnapshot.id)))
+            .select_from(MarketSnapshot)
+            .join(EvidenceSnapshot, EvidenceSnapshot.market_snapshot_id == MarketSnapshot.id)
+            .where(EvidenceSnapshot.checkpoint_run_id == run.id)
+        ).scalar()
+        add(f"           EvidenceSnapshot rows  {evidence_count}")
+        add(f"           MarketSnapshot rows    {snapshot_count}")
+
+    leases = session.execute(
+        select(CheckpointCycleLease).where(CheckpointCycleLease.game_id == game.id)
+    ).scalars().all()
+    add("")
+    if leases:
+        add(f"  open cycle leases  {len(leases)}")
+        for lease in leases:
+            add(f"    {lease.checkpoint_type:8} owner={lease.owner} expires={lease.expires_at.isoformat()}")
+    else:
+        add("  open cycle leases  none")
 
 
 if __name__ == "__main__":
