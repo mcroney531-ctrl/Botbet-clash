@@ -238,16 +238,28 @@ def _add_checkpoint_state(session, game, add) -> None:
         add(f"           EvidenceSnapshot rows  {evidence_count}")
         add(f"           MarketSnapshot rows    {snapshot_count}")
 
+    # ACTIVE vs EXPIRED, not "open". A successful cycle deletes its lease,
+    # but a crashed worker leaves one behind until the next claim reclaims
+    # it -- and describing that abandoned row as currently blocking work
+    # would send someone hunting a worker that is not running.
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
     leases = session.execute(
         select(CheckpointCycleLease).where(CheckpointCycleLease.game_id == game.id)
     ).scalars().all()
     add("")
-    if leases:
-        add(f"  open cycle leases  {len(leases)}")
-        for lease in leases:
-            add(f"    {lease.checkpoint_type:8} owner={lease.owner} expires={lease.expires_at.isoformat()}")
-    else:
-        add("  open cycle leases  none")
+    if not leases:
+        add("  cycle leases  none")
+        return
+    active = [l for l in leases if l.expires_at > now]
+    expired = [l for l in leases if l.expires_at <= now]
+    add(f"  cycle leases  {len(active)} ACTIVE, {len(expired)} EXPIRED  (as of {now.isoformat()})")
+    for lease in sorted(leases, key=lambda l: l.checkpoint_type):
+        state = "ACTIVE " if lease.expires_at > now else "EXPIRED"
+        note = "" if lease.expires_at > now else "  (abandoned; reclaimable, not blocking)"
+        add(f"    {state} {lease.checkpoint_type:8} owner={lease.owner} "
+            f"expires={lease.expires_at.isoformat()}{note}")
 
 
 if __name__ == "__main__":

@@ -240,3 +240,132 @@ class NflverseRosterProvider:
                 message=f"no roster entries published for {season} week {week}",
             )
         return RosterFetchResult(payload=snapshot, error=error, call_metadata=meta)
+
+
+# ---------------------------------------------------------------------
+# Schedule (Phase 4A.6)
+#
+# Registration needs an AUTHORITATIVE answer to "which NFL week does this
+# provider event belong to". The first version answered it with "whichever
+# week the operator typed", which is not an answer: `Game.week_number` is
+# part of a permanent identity scope, and the Phase 4A.2 run had already
+# recorded DET @ BUF as week 3 when the schedule says week 2.
+#
+# Same free release base as the rosters, so this costs nothing and adds no
+# new vendor relationship.
+# ---------------------------------------------------------------------
+
+SCHEDULE_COLUMNS = ("season", "game_type", "week", "gameday", "gametime", "away_team", "home_team")
+"""Asserted on every load. A missing column is a contract break."""
+
+SCHEDULE_TIMEZONE = "America/New_York"
+"""nflverse publishes `gametime` as US Eastern wall-clock, not UTC. Parsing
+it as UTC would shift every kickoff by four or five hours and silently
+break kickoff agreement checks."""
+
+
+class NflverseScheduleProvider(NflverseRosterProvider):
+    """The schedule half of the same nflverse release feed.
+
+    Subclasses the roster provider purely to reuse its download/telemetry
+    transport -- the URL base, timeout handling and ProviderCallMetadata
+    construction are identical, and a second copy of them would be the same
+    duplication this phase keeps removing.
+    """
+
+    def fetch_schedule(self, *, season: int):
+        from app.scheduledata.base import (
+            ScheduleDataError,
+            ScheduledGame,
+            ScheduleFetchResult,
+            ScheduleSnapshot,
+        )
+
+        body, meta, failure = self._download(
+            capability="FETCH_SCHEDULE", path="schedules/games.csv"
+        )
+        if failure is not None:
+            return ScheduleFetchResult(
+                payload=None,
+                error=ScheduleDataError(category=failure[0], message=failure[1]),
+                call_metadata=meta,
+            )
+
+        try:
+            reader = csv.DictReader(io.StringIO(body.decode("utf-8-sig")))
+            header = set(reader.fieldnames or ())
+        except (UnicodeDecodeError, csv.Error):
+            return ScheduleFetchResult(
+                payload=None,
+                error=ScheduleDataError(
+                    category="MALFORMED_ROSTER_RESPONSE",
+                    message="schedule asset was not readable CSV",
+                ),
+                call_metadata=meta,
+            )
+
+        missing = [c for c in SCHEDULE_COLUMNS if c not in header]
+        if missing:
+            return ScheduleFetchResult(
+                payload=None,
+                error=ScheduleDataError(
+                    category="MALFORMED_ROSTER_RESPONSE",
+                    message=f"schedule asset is missing column(s): {', '.join(missing)}",
+                ),
+                call_metadata=meta,
+            )
+
+        games = []
+        for row in reader:
+            if row.get("season") != str(season):
+                continue
+            try:
+                home = canonical_from_nflverse(row["home_team"])
+                away = canonical_from_nflverse(row["away_team"])
+            except TeamMappingError:
+                # An unmappable team in the schedule is reported by its
+                # ABSENCE from the snapshot, which makes the event
+                # unresolvable and therefore unregisterable. Silently
+                # guessing a code here would be the one thing worse.
+                continue
+            games.append(
+                ScheduledGame(
+                    season=season,
+                    week=int(row["week"]),
+                    game_type=row["game_type"],
+                    home=home,
+                    away=away,
+                    kickoff_at=_schedule_kickoff(row.get("gameday"), row.get("gametime")),
+                )
+            )
+
+        return ScheduleFetchResult(
+            payload=ScheduleSnapshot(
+                provider=PROVIDER_NAME,
+                season=season,
+                retrieved_at=meta.responded_at or _utcnow(),
+                games=tuple(games),
+            ),
+            error=None,
+            call_metadata=meta,
+        )
+
+
+def _schedule_kickoff(gameday: str | None, gametime: str | None) -> datetime | None:
+    """`gameday` + `gametime` (US Eastern wall clock) -> aware UTC.
+
+    Returns None rather than guessing when either field is blank: nflverse
+    publishes future games with an empty `gametime` before the broadcast
+    window is set, and inventing 00:00 would make a placeholder look like a
+    real midnight kickoff.
+    """
+
+    from zoneinfo import ZoneInfo
+
+    if not gameday or not gametime:
+        return None
+    try:
+        naive = datetime.strptime(f"{gameday} {gametime}", "%Y-%m-%d %H:%M")
+    except ValueError:
+        return None
+    return naive.replace(tzinfo=ZoneInfo(SCHEDULE_TIMEZONE)).astimezone(timezone.utc)

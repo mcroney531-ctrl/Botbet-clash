@@ -112,14 +112,43 @@ def _season(tag: str, *, provider=PROVIDER) -> uuid.UUID:
 
 
 def _register(season_id, events, **kw):
+    """Register with a schedule that places every supplied fixture in the
+    requested week.
+
+    These tests are about get-or-create, scope verification, idempotency
+    and concurrency -- not about week verification, which has its own
+    section below. Handing them a matching schedule keeps each test about
+    one thing.
+    """
+
     stub = kw.pop("stub", None) or StubOdds(events)
+    schedule = kw.pop("schedule", None)
+    if schedule is None:
+        schedule = _schedule_for(events)
     report = register_week_events(
         season_id=season_id, week_number=4,
-        window_start=NOW, window_end=NOW + timedelta(days=8),
-        odds_provider=stub, **kw,
+        window_start=NOW, window_end=NOW + timedelta(days=21),
+        odds_provider=stub, schedule_provider=StubSchedule(schedule),
+        apply=kw.pop("apply", True), **kw,
     )
     report._stub = stub  # for call-count assertions
     return report
+
+
+def _schedule_for(events, *, week=4):
+    """A week-`week` schedule entry for every mappable fixture in `events`."""
+
+    from app.rosterdata.teams import canonical_from_odds_api
+
+    games = []
+    for event in events:
+        try:
+            home = canonical_from_odds_api(event.home_team)
+            away = canonical_from_odds_api(event.away_team)
+        except Exception:
+            continue  # unmappable: the job refuses it before week resolution
+        games.append(_scheduled(away.value, home.value, week=week, kickoff=KICKOFF))
+    return _schedule(*games)
 
 
 # --- the happy path ---------------------------------------------------
@@ -279,9 +308,11 @@ def test_a_scope_mismatch_fails_loudly_and_does_not_relocate_the_row():
     season_id = _season("conflict")
     _register(season_id, [_event("e1")])
 
-    # Same external_ref, different kickoff: the provider moved the game, or
-    # we are about to attach a permanent identity to the wrong thing.
-    moved = _event("e1", kickoff=KICKOFF + timedelta(days=1))
+    # Same external_ref, different kickoff. Two hours, deliberately: a
+    # bigger move is now refused by week verification (KICKOFF_DISAGREEMENT)
+    # before it ever reaches the scope check, and this test is about the
+    # scope check.
+    moved = _event("e1", kickoff=KICKOFF + timedelta(hours=2))
     report = _register(season_id, [moved])
 
     assert len(report.conflicts) == 1
@@ -570,3 +601,359 @@ def test_the_duplicate_recovery_branch_works_deterministically():
             select(func.count()).select_from(Game).where(Game.external_ref == ref)
         ).scalar()
     assert count == 1
+
+
+# =====================================================================
+# WEEK VERIFICATION (Phase 4A.6 correction)
+# =====================================================================
+#
+# The bug: --week-number + --days-ahead stamped every event in a calendar
+# window with the operator's week. Run on 2026-09-18 with the arguments
+# actually suggested, that would have labelled 15 Week 2 games and 1 Week 3
+# game as Week 4 -- and caught ZERO real Week 4 games, since Week 4 runs
+# 2026-10-01..10-05.
+
+from app.marketdata.week_resolution import WeekOutcome, resolve_event_week
+from app.scheduledata.base import ScheduledGame, ScheduleFetchResult, ScheduleSnapshot
+
+
+def _schedule(*games, season=2026, provider="NFLVERSE"):
+    return ScheduleSnapshot(
+        provider=provider, season=season, retrieved_at=NOW, games=tuple(games),
+    )
+
+
+def _scheduled(away, home, week, *, kickoff=KICKOFF, game_type="REG", season=2026):
+    return ScheduledGame(
+        season=season, week=week, game_type=game_type,
+        home=CanonicalTeam(home), away=CanonicalTeam(away), kickoff_at=kickoff,
+    )
+
+
+class StubSchedule:
+    provider_name = "NFLVERSE"
+
+    def __init__(self, snapshot=None, *, ok=True):
+        self.snapshot = snapshot
+        self.ok = ok
+        self.calls = 0
+
+    def fetch_schedule(self, *, season):
+        self.calls += 1
+        if not self.ok:
+            from app.scheduledata.base import ScheduleDataError
+
+            return ScheduleFetchResult(
+                payload=None,
+                error=ScheduleDataError(category="ROSTER_SOURCE_UNAVAILABLE", message="stub down"),
+                call_metadata=None,
+            )
+        return ScheduleFetchResult(payload=self.snapshot, error=None, call_metadata=None)
+
+
+# --- the pure rule ----------------------------------------------------
+
+
+def test_the_requested_week_never_overrides_the_schedule():
+    """The whole bug in one assertion: asking for week 4 must not make a
+    week 2 fixture week 4."""
+
+    schedule = _schedule(_scheduled("DET", "BUF", week=2))
+    resolution = resolve_event_week(
+        home=CanonicalTeam.BUF, away=CanonicalTeam.DET, kickoff_at=KICKOFF,
+        requested_week=4, schedule=schedule,
+    )
+    assert resolution.outcome is WeekOutcome.OTHER_WEEK
+    assert resolution.resolved is False
+    assert resolution.week == 2, "the real week is reported, not the requested one"
+
+
+def test_a_matching_week_resolves():
+    schedule = _schedule(_scheduled("DET", "BUF", week=4))
+    resolution = resolve_event_week(
+        home=CanonicalTeam.BUF, away=CanonicalTeam.DET, kickoff_at=KICKOFF,
+        requested_week=4, schedule=schedule,
+    )
+    assert resolution.outcome is WeekOutcome.MATCHED
+    assert resolution.resolved is True
+    assert resolution.week == 4
+
+
+def test_an_unknown_fixture_is_refused_not_guessed():
+    schedule = _schedule(_scheduled("KC", "DEN", week=4))
+    resolution = resolve_event_week(
+        home=CanonicalTeam.BUF, away=CanonicalTeam.DET, kickoff_at=KICKOFF,
+        requested_week=4, schedule=schedule,
+    )
+    assert resolution.outcome is WeekOutcome.UNKNOWN_FIXTURE
+    assert resolution.week is None
+
+
+def test_an_ambiguous_fixture_is_refused():
+    """An ordered (away, home) pair should be unique within a season.
+    Division rivals meet twice but once at each venue."""
+
+    schedule = _schedule(
+        _scheduled("DET", "BUF", week=4),
+        _scheduled("DET", "BUF", week=9),
+    )
+    resolution = resolve_event_week(
+        home=CanonicalTeam.BUF, away=CanonicalTeam.DET, kickoff_at=KICKOFF,
+        requested_week=4, schedule=schedule,
+    )
+    assert resolution.outcome is WeekOutcome.AMBIGUOUS_FIXTURE
+
+
+def test_the_reverse_fixture_is_a_different_game():
+    """DET @ BUF and BUF @ DET are different fixtures. Matching on an
+    unordered pair would collapse a division rivalry's two meetings."""
+
+    schedule = _schedule(_scheduled("BUF", "DET", week=4))  # at DETROIT
+    resolution = resolve_event_week(
+        home=CanonicalTeam.BUF, away=CanonicalTeam.DET, kickoff_at=KICKOFF,
+        requested_week=4, schedule=schedule,
+    )
+    assert resolution.outcome is WeekOutcome.UNKNOWN_FIXTURE
+
+
+def test_a_large_kickoff_disagreement_is_refused():
+    schedule = _schedule(_scheduled("DET", "BUF", week=4, kickoff=KICKOFF))
+    resolution = resolve_event_week(
+        home=CanonicalTeam.BUF, away=CanonicalTeam.DET,
+        kickoff_at=KICKOFF + timedelta(hours=30),
+        requested_week=4, schedule=schedule,
+    )
+    assert resolution.outcome is WeekOutcome.KICKOFF_DISAGREEMENT
+
+
+def test_a_small_kickoff_difference_is_tolerated():
+    """Wide enough for a rounded or provisional broadcast time."""
+
+    schedule = _schedule(_scheduled("DET", "BUF", week=4, kickoff=KICKOFF))
+    resolution = resolve_event_week(
+        home=CanonicalTeam.BUF, away=CanonicalTeam.DET,
+        kickoff_at=KICKOFF + timedelta(hours=2),
+        requested_week=4, schedule=schedule,
+    )
+    assert resolution.outcome is WeekOutcome.MATCHED
+
+
+def test_a_scheduled_game_with_no_kickoff_still_resolves():
+    """nflverse publishes future games with an empty gametime before the
+    broadcast window is set. That must not block week verification."""
+
+    schedule = _schedule(_scheduled("DET", "BUF", week=4, kickoff=None))
+    resolution = resolve_event_week(
+        home=CanonicalTeam.BUF, away=CanonicalTeam.DET, kickoff_at=KICKOFF,
+        requested_week=4, schedule=schedule,
+    )
+    assert resolution.outcome is WeekOutcome.MATCHED
+
+
+# --- the job ----------------------------------------------------------
+
+
+def _register_verified(season_id, events, schedule, *, apply=False, week=4):
+    stub = StubOdds(events)
+    return register_week_events(
+        season_id=season_id, week_number=week,
+        window_start=NOW, window_end=NOW + timedelta(days=21),
+        odds_provider=stub, schedule_provider=StubSchedule(schedule), apply=apply,
+    )
+
+
+def test_the_original_poisoning_scenario_writes_nothing():
+    """The exact shape of the bug: a discovery window full of other weeks'
+    games, with week 4 requested."""
+
+    season_id = _season("poison")
+    events = [
+        _event("wk2-a", home="Buffalo Bills", away="Detroit Lions"),
+        _event("wk2-b", home="Kansas City Chiefs", away="Denver Broncos"),
+        _event("wk3-a", home="Philadelphia Eagles", away="Dallas Cowboys"),
+    ]
+    schedule = _schedule(
+        _scheduled("DET", "BUF", week=2),
+        _scheduled("DEN", "KC", week=2),
+        _scheduled("DAL", "PHI", week=3),
+    )
+
+    report = _register_verified(season_id, events, schedule, apply=True)
+
+    assert report.created == [] and report.reused == []
+    assert len(report.refused) == 3
+    assert all("OTHER_WEEK" in r for r in report.refused)
+
+    with session_scope() as session:
+        count = session.execute(
+            select(func.count()).select_from(Game).where(Game.season_id == season_id)
+        ).scalar()
+    assert count == 0, "an event from another week was written"
+
+
+def test_a_mixed_window_registers_only_the_requested_week():
+    season_id = _season("mixed")
+    events = [
+        _event("wk2", home="Buffalo Bills", away="Detroit Lions"),
+        _event("wk4", home="Kansas City Chiefs", away="Denver Broncos"),
+    ]
+    schedule = _schedule(
+        _scheduled("DET", "BUF", week=2),
+        _scheduled("DEN", "KC", week=4),
+    )
+
+    report = _register_verified(season_id, events, schedule, apply=True)
+
+    assert len(report.created) == 1
+    assert report.created[0].external_ref == "THE_ODDS_API:wk4"
+    assert report.created[0].week == 4
+    assert len(report.refused) == 1
+
+    with session_scope() as session:
+        games = session.execute(select(Game).where(Game.season_id == season_id)).scalars().all()
+    assert len(games) == 1 and games[0].week_number == 4
+
+
+def test_the_week_written_comes_from_the_schedule_not_the_request():
+    """Belt and braces: even for a matching week, the persisted value is
+    the resolved one."""
+
+    season_id = _season("from-schedule")
+    schedule = _schedule(_scheduled("DET", "BUF", week=4))
+    report = _register_verified(season_id, [_event("e1")], schedule, apply=True)
+
+    with session_scope() as session:
+        game = session.execute(
+            select(Game).where(Game.external_ref == "THE_ODDS_API:e1")
+        ).scalar_one()
+    assert game.week_number == 4 == report.created[0].week
+
+
+def test_preview_is_the_default_and_writes_nothing():
+    season_id = _season("preview")
+    schedule = _schedule(_scheduled("DET", "BUF", week=4))
+    report = _register_verified(season_id, [_event("e1")], schedule)  # apply omitted
+
+    assert report.applied is False
+    assert report.created == []
+    assert len(report.eligible) == 1
+    assert report.eligible[0].game_id is None
+    assert report.eligible[0].previewed is True
+    assert "PREVIEW" in render(report)
+
+    with session_scope() as session:
+        count = session.execute(
+            select(func.count()).select_from(Game).where(Game.season_id == season_id)
+        ).scalar()
+    assert count == 0
+
+
+def test_apply_is_explicit():
+    season_id = _season("explicit")
+    schedule = _schedule(_scheduled("DET", "BUF", week=4))
+
+    _register_verified(season_id, [_event("e1")], schedule, apply=False)
+    with session_scope() as session:
+        assert session.execute(
+            select(func.count()).select_from(Game).where(Game.season_id == season_id)
+        ).scalar() == 0
+
+    _register_verified(season_id, [_event("e1")], schedule, apply=True)
+    with session_scope() as session:
+        assert session.execute(
+            select(func.count()).select_from(Game).where(Game.season_id == season_id)
+        ).scalar() == 1
+
+
+def test_an_unusable_schedule_registers_nothing():
+    """Without an authoritative week there is nothing to verify against,
+    and the only safe behaviour is to write nothing -- which is exactly
+    what the old code did not do."""
+
+    season_id = _season("no-schedule")
+    stub_odds = StubOdds([_event("e1")])
+    report = register_week_events(
+        season_id=season_id, week_number=4,
+        window_start=NOW, window_end=NOW + timedelta(days=21),
+        odds_provider=stub_odds, schedule_provider=StubSchedule(None, ok=False), apply=True,
+    )
+
+    assert report.failures and "schedule" in report.failures[0]
+    assert stub_odds.calls == 0, "the events call ran before the schedule was known"
+    with session_scope() as session:
+        assert session.execute(
+            select(func.count()).select_from(Game).where(Game.season_id == season_id)
+        ).scalar() == 0
+
+
+def test_repeated_apply_stays_idempotent_with_verification():
+    season_id = _season("idem-verified")
+    schedule = _schedule(_scheduled("DET", "BUF", week=4))
+
+    first = _register_verified(season_id, [_event("e1")], schedule, apply=True)
+    second = _register_verified(season_id, [_event("e1")], schedule, apply=True)
+
+    assert len(first.created) == 1 and len(second.reused) == 1
+    assert first.created[0].game_id == second.reused[0].game_id
+
+
+# --- inspector lease labelling ----------------------------------------
+
+
+def test_an_expired_lease_is_not_reported_as_active():
+    """A successful cycle deletes its lease, but a crashed worker leaves
+    one behind until the next claim reclaims it. Calling that abandoned row
+    'open' would send someone hunting a worker that is not running."""
+
+    import io
+    from contextlib import redirect_stdout
+
+    from app.marketdata import inspect_ingestion
+    from app.marketdata.checkpoint_lease import claim_cycle
+
+    season_id = _season("lease-label")
+    schedule = _schedule(_scheduled("DET", "BUF", week=4))
+    report = _register_verified(season_id, [_event("e1")], schedule, apply=True)
+    game_id = report.created[0].game_id
+
+    claim_cycle(
+        game_id=game_id, checkpoint_type="FINAL",
+        now=datetime.now(timezone.utc) - timedelta(hours=2),
+        duration_seconds=60, owner="crashed-worker",
+    )
+
+    buffer = io.StringIO()
+    with redirect_stdout(buffer):
+        inspect_ingestion.main(["--game-id", str(game_id)])
+    text = buffer.getvalue()
+
+    assert "1 EXPIRED" in text
+    assert "0 ACTIVE" in text
+    assert "EXPIRED FINAL" in text
+    assert "not blocking" in text
+
+
+def test_an_active_lease_is_reported_as_active():
+    import io
+    from contextlib import redirect_stdout
+
+    from app.marketdata import inspect_ingestion
+    from app.marketdata.checkpoint_lease import claim_cycle
+
+    season_id = _season("lease-active")
+    schedule = _schedule(_scheduled("DET", "BUF", week=4))
+    report = _register_verified(season_id, [_event("e1")], schedule, apply=True)
+    game_id = report.created[0].game_id
+
+    claim_cycle(
+        game_id=game_id, checkpoint_type="FINAL",
+        now=datetime.now(timezone.utc), duration_seconds=3600, owner="live-worker",
+    )
+
+    buffer = io.StringIO()
+    with redirect_stdout(buffer):
+        inspect_ingestion.main(["--game-id", str(game_id)])
+    text = buffer.getvalue()
+
+    assert "1 ACTIVE" in text
+    assert "ACTIVE  FINAL" in text

@@ -1463,3 +1463,90 @@ Worth stating because the first version looked like coverage and wasn't.
 ### Test count
 
 **388 passed, 4 skipped.** No migration.
+
+---
+
+## Phase 4A.6 correction — "week 4" meant "whatever's in the next 8 days"
+
+The registration CLI said `--week-number 4`. The selection rule said
+"every event between now and eight days from now". Those are not the same
+thing, and `Game.week_number` is part of a permanent identity scope.
+
+### What the command I handed over would actually have done
+
+Run on 2026-09-18 with `--week-number 4 --days-ahead 8`:
+
+| | |
+| --- | --- |
+| discovery window | 2026-09-18 .. 2026-09-26 |
+| real Week 4 | 2026-10-01 .. 2026-10-05 |
+| games it would have swept | 15 × Week 2, 1 × Week 3 |
+| real Week 4 games captured | **0** |
+
+Sixteen events, all permanently stamped Week 4, none of them Week 4.
+
+### The same mistake had already been made by hand
+
+Checking the schedule turned up something else: our own README records
+DET @ BUF as **week 3**. nflverse says that fixture (2026-09-17) is
+**week 2** — week 3 runs 2026-09-24..09-28. The Phase 4A.2 acceptance run
+passed `--week-number 3` and nothing verified it.
+
+So the durable research record already contains a mis-scoped game. I have
+**not** touched it: `Game.external_ref` is permanent and silently
+rewriting `week_number` is exactly the repair this design forbids. It
+needs a decision, not a patch.
+
+### The fix
+
+`app/scheduledata/` defines a provider-neutral schedule seam;
+`NflverseScheduleProvider` implements it from the same free release base
+the rosters already use (`schedules/games.csv`), so no new vendor and no
+cost.
+
+`resolve_event_week` is pure and matches on the **ordered** (away, home)
+pair within a season. Division rivals meet twice but once at each venue,
+so the ordered pair identifies a fixture while the unordered pair would
+collapse both meetings. Five outcomes, one of which may persist:
+
+```
+MATCHED               the schedule says this IS the requested week
+OTHER_WEEK            refused; the real week is reported
+UNKNOWN_FIXTURE       refused
+AMBIGUOUS_FIXTURE     refused
+KICKOFF_DISAGREEMENT  refused beyond a 3h tolerance
+```
+
+The tolerance is wide enough for a rounded or provisional broadcast time
+and narrow enough that a flex move to another slot or day is refused —
+which is right, because a disagreement that large means either a stale
+schedule or a mismatched fixture, and both deserve a human.
+
+An unusable schedule is fatal: without an authoritative week there is
+nothing to verify against, so nothing is written. The schedule is fetched
+**before** the events call, and a test asserts the events call never ran.
+
+**Preview is now the default.** `--apply` is required to persist. A
+discovery mistake must never be able to create an immutable row.
+
+The discovery window default moved 8 → 21 days, but that is not the fix
+and must not be read as one: the window only decides which events we ask
+about. Anything outside the requested week is refused, not relabelled.
+
+### Also fixed
+
+The inspector called every `CheckpointCycleLease` row an "open cycle
+lease" without checking expiry. A crashed worker leaves one behind until
+the next claim reclaims it, and describing that as blocking would send
+someone hunting a worker that isn't running. Now `ACTIVE` vs `EXPIRED`,
+with the expired ones marked reclaimable.
+
+### Acceptance
+
+405 passed, 4 skipped. Mutation-tested four ways — deleting the week
+guard, ignoring the resolution, making preview write, and reporting
+expired leases as active — each turned the intended tests red.
+
+The headline test reconstructs the original poisoning scenario directly:
+a window full of other weeks' games with week 4 requested, and asserts
+zero rows written.
