@@ -437,10 +437,17 @@ def test_two_concurrent_opens_emit_exactly_one_event():
 
 def test_concurrent_opens_on_an_ABSENT_week_also_produce_one_event():
     """The earlier concurrency test prepared the week first, so it only
-    proved the row lock works once a row EXISTS. `prepare_week`'s lookup is
-    necessarily unlocked -- there is nothing to lock yet -- so two callers
-    can both miss and both insert, and the unique index decides. The loser
-    must recover into the winner's row, not surface an IntegrityError."""
+    proved the row lock works once a row EXISTS.
+
+    With no week row there is nothing to lock, so week creation serializes
+    on the SEASON row instead: the loser blocks behind the winner's lock,
+    and by the time it runs its existence check the winner's row is
+    committed and visible. It returns that row.
+
+    It does not RECOVER from a unique violation -- an earlier version did,
+    and was rejected: recovery cannot work under a snapshot that will never
+    see the winner's row. The index is a backstop here, not control flow.
+    """
 
     import threading
 
