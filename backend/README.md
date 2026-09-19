@@ -2106,7 +2106,48 @@ exactly one sees `PENDING`. Relying on Python call ordering would have made
 the duplicate event a race rather than a bug. A `CLOSED` week never
 reopens — its results are already part of the season record.
 
+### The open race was only closed once the row existed
+
+`open_week` takes the `Week` row `FOR UPDATE` — but `prepare_week` runs
+first, and its existence check has no row to lock yet. Two callers opening
+an **absent** week both missed and both inserted, and one took a raw
+`IntegrityError` from the unique `(season_id, week_number)` index. The
+concurrency test prepared the week first, so it proved the existing-row
+case and nothing else.
+
+Reproduced before fixing: `UniqueViolation`, two threads, absent row.
+
+The fix locks the **durable parent** — the `Season` row `FOR UPDATE`,
+*before* the existence check — so week creation for a season serializes and
+the collision cannot happen. That is prevention, not recovery: an earlier
+attempt caught the violation inside a savepoint, which works under READ
+COMMITTED but cannot work under a snapshot that will never see the winner's
+row. The unique index stays the hard backstop and nothing depends on
+catching it; a test asserts `IntegrityError` appears nowhere in the method.
+
+Serialization is proved **deterministically** rather than by thread luck:
+one session holds the `Season` lock while another calls `prepare_week`, and
+the test asserts it blocks until release. Six concurrent `open_week` calls
+on an absent week now give one row, one `WEEK_OPENED`, zero errors.
+Conflicting concurrent profiles leave exactly one reviewed profile
+persisted — no interleaving can produce a `NONSTANDARD` week.
+
+### A test that passed by the calendar
+
+`test_the_cli_preview_writes_no_plan` called `main()` on the real clock
+against a fixture week whose OPENING window opened on a fixed date. It was
+green on the 18th and PAST DEADLINE on the 19th. `main` now takes a
+keyword-only `now` seam — no argv flag reaches it, asserted — so the test
+is about the code rather than about today.
+
 ### Acceptance
+
+618 passed, 4 skipped. Five mutations on this pass: removing the parent
+lock, moving the existence check before it, treating conflicting
+concurrent profiles as idempotent, publishing on both concurrent openers,
+and dropping the week-row lock.
+
+### Earlier acceptance
 
 611 passed, 4 skipped. Ten mutations on this pass; the two that survived
 first — idempotency comparing only the money flag, and readiness printing

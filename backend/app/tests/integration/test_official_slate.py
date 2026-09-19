@@ -932,7 +932,7 @@ def test_the_cli_preview_writes_no_plan(capsys):
     season_id = _season("cli-preview")
     code = main(
         ["--season-id", str(season_id), "--week-number", "3"],
-        schedule_provider=StubSchedule(),
+        schedule_provider=StubSchedule(), now=IN_TIME,
     )
     out = capsys.readouterr().out
     assert code == 0
@@ -943,7 +943,7 @@ def test_the_cli_preview_writes_no_plan(capsys):
 def test_the_cli_preview_shows_the_complete_pool_and_the_slots(capsys):
     season_id = _season("cli-pool")
     main(["--season-id", str(season_id), "--week-number", "3"],
-         schedule_provider=StubSchedule())
+         schedule_provider=StubSchedule(), now=IN_TIME)
     out = capsys.readouterr().out
     for away, home, _ in FIXTURES:
         assert f"2026:REG:W03:{away}@{home}" in out
@@ -954,7 +954,7 @@ def test_the_cli_preview_shows_the_complete_pool_and_the_slots(capsys):
 def test_the_cli_refuses_cleanly(capsys):
     season_id = _season("cli-refuse", method=None)
     code = main(["--season-id", str(season_id), "--week-number", "3"],
-                schedule_provider=StubSchedule())
+                schedule_provider=StubSchedule(), now=IN_TIME)
     out = capsys.readouterr().out
     assert code == 1
     assert "REFUSED" in out
@@ -1272,3 +1272,18 @@ def test_readiness_reports_an_opened_week_distinctly():
     assert report.week_status == "OPENED"
     assert report.week_opened_at is not None
     assert "the competition week has begun" in report.render()
+
+
+
+def test_the_cli_takes_no_clock_override_from_the_command_line():
+    """A deadline an operator can move is not a deadline. The `now` seam is
+    keyword-only and no argv flag reaches it."""
+
+    import inspect
+
+    signature = inspect.signature(main)
+    assert signature.parameters["now"].kind is inspect.Parameter.KEYWORD_ONLY
+    for flag in ("--now", "--as-of", "--clock", "--force"):
+        with pytest.raises(SystemExit):
+            main(["--season-id", str(uuid.uuid4()), "--week-number", "3", flag,
+                  "2026-01-01T00:00:00Z"], schedule_provider=StubSchedule())

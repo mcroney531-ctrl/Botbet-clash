@@ -417,7 +417,19 @@ def commit_official_slate(
     return proposal
 
 
-def main(argv: Sequence[str] | None = None, *, schedule_provider=None) -> int:
+def main(
+    argv: Sequence[str] | None = None, *, schedule_provider=None,
+    now: datetime | None = None,
+) -> int:
+    """`now` is a TEST SEAM only -- no CLI flag reaches it.
+
+    A deadline an operator can move is not a deadline. But a test that
+    calls this on the real clock passes or fails by the calendar: the
+    fixture week's OPENING window opened on a fixed date, so the same test
+    was green one day and PAST DEADLINE the next. The seam makes the test
+    about the code rather than about today.
+    """
+
     parser = argparse.ArgumentParser(
         description="Commit a week's benchmark slate from the authoritative "
                     "schedule. Methodology comes from frozen SeasonRules only.",
@@ -435,12 +447,12 @@ def main(argv: Sequence[str] | None = None, *, schedule_provider=None) -> int:
         if args.apply:
             proposal = commit_official_slate(
                 season_id=args.season_id, week_number=args.week_number,
-                schedule_provider=schedule_provider,
+                schedule_provider=schedule_provider, now=now,
             )
         else:
             proposal = propose_slate(
                 season_id=args.season_id, week_number=args.week_number,
-                schedule_provider=schedule_provider,
+                schedule_provider=schedule_provider, now=now,
             )
     except (SlateCommitRefused, UnknownAllocationMethod, IncompletePool,
             ScheduleSourceUnavailable, LookupError) as exc:

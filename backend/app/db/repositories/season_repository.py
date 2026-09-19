@@ -117,9 +117,30 @@ class SeasonRepository:
         row that agrees about money but disagrees about standings is not
         the same week, and adjusting it in place would rewrite what the
         season already agreed to.
+
+        **The SEASON row is locked first.** The existence check has to
+        happen under a lock, and there is no week row to lock yet -- so two
+        concurrent callers would both miss and both insert, and one would
+        take a raw `IntegrityError` from the unique
+        `(season_id, week_number)` index. Locking the durable parent
+        serializes week creation for this season and removes the race
+        rather than recovering from it. The unique index remains the hard
+        backstop; nothing here depends on catching its violation.
+
+        The lock is held for two local statements and no network call.
         """
 
         flags = flags_for(profile)
+
+        # The parent, FOR UPDATE, BEFORE the existence check. Order is the
+        # whole point: checking first and locking after would leave exactly
+        # the window this closes.
+        season = self.session.execute(
+            select(SeasonRow).where(SeasonRow.id == season_id).with_for_update()
+        ).scalar_one_or_none()
+        if season is None:
+            raise LookupError(f"season {season_id} not found")
+
         existing = self.session.execute(
             select(WeekRow).where(
                 WeekRow.season_id == season_id, WeekRow.week_number == week_number

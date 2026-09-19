@@ -435,6 +435,229 @@ def test_two_concurrent_opens_emit_exactly_one_event():
     assert _week(season_id).status == "OPENED"
 
 
+def test_concurrent_opens_on_an_ABSENT_week_also_produce_one_event():
+    """The earlier concurrency test prepared the week first, so it only
+    proved the row lock works once a row EXISTS. `prepare_week`'s lookup is
+    necessarily unlocked -- there is nothing to lock yet -- so two callers
+    can both miss and both insert, and the unique index decides. The loser
+    must recover into the winner's row, not surface an IntegrityError."""
+
+    import threading
+
+    from app.services.season_commissioner import SeasonCommissioner
+
+    season_id = _season("open-race-absent")
+    assert _week(season_id) is None, "the fixture prepared the week; nothing is proved"
+
+    start = threading.Barrier(6)
+    errors: list[str] = []
+
+    def worker():
+        try:
+            start.wait(timeout=10)
+            SeasonCommissioner(season_id=season_id).open_week(
+                week_number=4, profile=WeekProfile.REHEARSAL
+            )
+        except Exception as exc:  # pragma: no cover - diagnostic
+            errors.append(f"{type(exc).__name__}: {exc}")
+
+    threads = [threading.Thread(target=worker) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+
+    assert errors == [], errors
+    with session_scope() as session:
+        assert session.execute(
+            select(func.count()).select_from(Week).where(Week.season_id == season_id)
+        ).scalar() == 1
+    assert _week_opened(season_id) == 1
+    assert _week(season_id).status == "OPENED"
+
+
+def test_week_creation_serializes_on_the_season_row():
+    """DETERMINISTIC, not thread-luck. One session takes the Season lock
+    and holds it; a second preparation must BLOCK until it is released.
+
+    The existence check has no week row to lock yet, so without this the
+    two callers both miss and both insert. Locking the durable parent
+    removes the race rather than recovering from a unique violation."""
+
+    import threading
+    import time
+
+    from sqlalchemy import select as sa_select
+
+    from app.db.models.season import Season
+    from app.db.repositories.season_repository import SeasonRepository
+
+    season_id = _season("serialize")
+    holder_ready = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    def holder():
+        with session_scope() as session:
+            session.execute(
+                sa_select(Season).where(Season.id == season_id).with_for_update()
+            ).scalar_one()
+            holder_ready.set()
+            release.wait(timeout=20)
+
+    def preparer():
+        with session_scope() as session:
+            SeasonRepository(session).prepare_week(
+                season_id=season_id, week_number=4, profile=WeekProfile.REHEARSAL
+            )
+        finished.set()
+
+    h = threading.Thread(target=holder)
+    h.start()
+    assert holder_ready.wait(timeout=10), "the holder never took the lock"
+
+    pthread = threading.Thread(target=preparer)
+    pthread.start()
+    time.sleep(1.0)
+    assert not finished.is_set(), (
+        "preparation completed while the Season row was locked -- it is not "
+        "serializing on the parent"
+    )
+
+    release.set()
+    h.join(timeout=20)
+    assert finished.wait(timeout=20), "preparation never completed after release"
+    pthread.join(timeout=20)
+    assert _week(season_id) is not None
+
+
+def test_concurrent_identical_preparations_converge_on_one_row():
+    for mode in (WeekProfile.REHEARSAL, WeekProfile.COMPETITIVE):
+        season_id = _season(f"same-{mode}")
+        ids = _prepare_concurrently(season_id, [mode] * 6)
+        assert ids["errors"] == [], ids["errors"]
+        assert len(set(ids["week_ids"])) == 1, "callers got different week rows"
+        with session_scope() as session:
+            assert session.execute(
+                select(func.count()).select_from(Week).where(Week.season_id == season_id)
+            ).scalar() == 1
+
+
+def test_concurrent_conflicting_preparations_leave_one_reviewed_profile():
+    """One coherent profile wins; the losers get a clean conflict. No
+    interleaving may produce a NONSTANDARD combination."""
+
+    from app.domain.week_profile import profile_of as _profile_of
+
+    season_id = _season("conflicting")
+    result = _prepare_concurrently(
+        season_id,
+        [WeekProfile.REHEARSAL, WeekProfile.COMPETITIVE] * 3,
+    )
+    assert all("WeekConfigurationConflict" in e for e in result["errors"]), result["errors"]
+    assert result["errors"], "no caller was refused; both profiles cannot both win"
+
+    week = _week(season_id)
+    flags = WeekFlags(
+        week.is_real_money, week.counts_toward_standings, week.counts_toward_awards
+    )
+    assert _profile_of(flags) is not None, (
+        f"a concurrent race produced a NONSTANDARD week: {flags.describe()}"
+    )
+    with session_scope() as session:
+        assert session.execute(
+            select(func.count()).select_from(Week).where(Week.season_id == season_id)
+        ).scalar() == 1
+
+
+def _prepare_concurrently(season_id, profiles):
+    import threading
+
+    from app.db.repositories.season_repository import SeasonRepository
+
+    start = threading.Barrier(len(profiles))
+    week_ids: list[uuid.UUID] = []
+    errors: list[str] = []
+    lock = threading.Lock()
+
+    def worker(profile):
+        try:
+            start.wait(timeout=15)
+            with session_scope() as session:
+                row = SeasonRepository(session).prepare_week(
+                    season_id=season_id, week_number=4, profile=profile
+                )
+                got = row.id
+            with lock:
+                week_ids.append(got)
+        except Exception as exc:
+            with lock:
+                errors.append(f"{type(exc).__name__}: {exc}")
+
+    threads = [threading.Thread(target=worker, args=(p,)) for p in profiles]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+    return {"week_ids": week_ids, "errors": errors}
+
+
+def test_preparation_locks_the_parent_before_checking_existence():
+    """Order is the whole point: checking first and locking after would
+    leave exactly the window this closes."""
+
+    import ast
+    import inspect
+    import textwrap
+
+    from app.db.repositories.season_repository import SeasonRepository
+
+    source = textwrap.dedent(inspect.getsource(SeasonRepository.prepare_week))
+    tree = ast.parse(source)
+    locked_line = next(
+        (n.lineno for n in ast.walk(tree)
+         if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+         and n.func.attr == "with_for_update"),
+        None,
+    )
+    assert locked_line is not None, "prepare_week does not lock anything"
+    assert "SeasonRow" in source, "prepare_week no longer locks the durable parent"
+
+    week_lookup = source.index("WeekRow.week_number == week_number")
+    lock_at = source.index("with_for_update")
+    assert lock_at < week_lookup, (
+        "the existence check happens BEFORE the lock, which leaves the race open"
+    )
+
+
+def test_preparation_does_not_rely_on_catching_a_unique_violation():
+    """The unique index stays the hard backstop, but the guarantee comes
+    from serialization -- not from recovering after a collision."""
+
+    import ast
+    import inspect
+    import textwrap
+
+    from app.db.repositories.season_repository import SeasonRepository
+
+    # The DOCSTRING names IntegrityError -- it explains the race this
+    # replaced. Strip it, or this asserts against its own prose.
+    tree = ast.parse(
+        textwrap.dedent(inspect.getsource(SeasonRepository.prepare_week))
+    )
+    function = tree.body[0]
+    if (function.body and isinstance(function.body[0], ast.Expr)
+            and isinstance(function.body[0].value, ast.Constant)):
+        function.body = function.body[1:]
+    code = ast.unparse(function)
+
+    assert "IntegrityError" not in code, (
+        "prepare_week recovers from a unique violation instead of "
+        "serializing to prevent it"
+    )
+    assert "begin_nested" not in code
+
+
 def test_a_closed_week_never_reopens():
     from app.db.repositories.season_repository import (
         SeasonRepository,
