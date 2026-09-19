@@ -143,9 +143,16 @@ class SlatePlanProposal:
             out.append(
                 f"      {fixture.key.value:24} {fixture.kickoff_at.isoformat()}{mark}"
             )
+        # "proposed" is a claim about what has NOT happened yet. Once the
+        # plan is committed these rows are the frozen slate, and calling
+        # them proposed invites someone to think they are still negotiable.
         out += [
             "",
-            "  --- proposed slots ---------------------------------------------",
+            (
+                "  --- committed slots --------------------------------------------"
+                if self.committed
+                else "  --- proposed slots ---------------------------------------------"
+            ),
         ]
         for i, fixture in enumerate(self.chosen, start=1):
             stat = self.prop_types[(i - 1) % len(self.prop_types)] if self.prop_types else "?"

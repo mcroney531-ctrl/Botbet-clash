@@ -59,10 +59,32 @@ class TicketStatus(StrEnum):
 
 class WagerExecutionStatus(StrEnum):
     PLACED = "PLACED"
+    """A REAL wager was executed at a sportsbook. Debits the bankroll."""
+
+    SIMULATED = "SIMULATED"
+    """A rehearsal execution: every validator the real path runs, none of
+    the money. Deliberately a distinct value rather than PLACED-with-a-flag,
+    because `execution_status == "PLACED"` is already the condition
+    downstream bankroll and settlement logic keys on -- reusing it would
+    mean every one of those call sites had to remember the flag, and one
+    that forgot would move real money on a rehearsal."""
+
     MARKET_MOVED = "MARKET_MOVED"
     UNAVAILABLE = "UNAVAILABLE"
     MISSED_WINDOW = "MISSED_WINDOW"
     SKIPPED = "SKIPPED"
+
+    @property
+    def executes(self) -> bool:
+        """Whether this status means the wager was actually taken -- really
+        or in rehearsal. Both run the SAME validation; they differ only in
+        side effects."""
+
+        return self in {WagerExecutionStatus.PLACED, WagerExecutionStatus.SIMULATED}
+
+    @property
+    def moves_money(self) -> bool:
+        return self is WagerExecutionStatus.PLACED
 
 
 class SportsbookResult(StrEnum):
@@ -88,6 +110,26 @@ class CompetitionEventType(StrEnum):
     TICKET_LOCKED = "TICKET_LOCKED"
     TICKET_EXPIRED = "TICKET_EXPIRED"
     BET_EXECUTED = "BET_EXECUTED"
+
+    # Rehearsal counterparts. DISTINCT event types rather than a flag on the
+    # competitive ones: a consumer that has never heard of rehearsal will
+    # ignore an unknown type, whereas it would happily act on a BET_EXECUTED
+    # whose payload carried a mode field it does not read. (Every payload
+    # carries `week_mode` as well -- see SeasonCommissioner._publish -- but
+    # that is the second line of defence, not the first.)
+    #
+    # The line is drawn at ACTIONABILITY. These four types each assert
+    # something a downstream consumer could act on with real money: a locked
+    # ticket and a Pounce both read as "place this bet", an execution reads
+    # as "a wager exists at a book", and a settlement reads as "collect".
+    # PASS_DECLARED and the week/bankroll lifecycle events assert no such
+    # thing -- a pass is the ABSENCE of a wager, and there is nothing to
+    # misread as an instruction -- so those keep one type and are
+    # distinguished by `week_mode` alone.
+    SIMULATED_TICKET_LOCKED = "SIMULATED_TICKET_LOCKED"
+    SIMULATED_POUNCE_ISSUED = "SIMULATED_POUNCE_ISSUED"
+    SIMULATED_BET_EXECUTED = "SIMULATED_BET_EXECUTED"
+    SIMULATED_SETTLED = "SIMULATED_SETTLED"
     PASS_DECLARED = "PASS_DECLARED"
     PROP_WON = "PROP_WON"
     PROP_LOST = "PROP_LOST"

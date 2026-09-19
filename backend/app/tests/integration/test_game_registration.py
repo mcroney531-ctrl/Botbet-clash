@@ -1673,8 +1673,16 @@ def _forecast(session, market_id, evidence_id, season_competitor_id):
 
 
 def _week(game_id, number):
-    """A real Week row in the game's own season, so a committed artifact can
-    name a week that contradicts the correction."""
+    """A real COMPETITIVE Week row in the game's own season, so a committed
+    artifact can name a week that contradicts the correction.
+
+    Competitive on purpose. These fixtures exist to prove the repair census
+    sees committed artifacts, and one of them commits a PLACED wager and a
+    STAKE transaction -- which only a real-money week may carry. The row
+    used to set `is_real_money=False` while leaving standings and awards at
+    their `True` default, which is not a rehearsal and not a competitive
+    week but a combination nobody approved.
+    """
 
     from app.db.models.season import Week
 
@@ -1685,7 +1693,10 @@ def _week(game_id, number):
         ).scalar_one_or_none()
         if existing is not None:
             return existing.id
-        week = Week(season_id=season_id, week_number=number, is_real_money=False)
+        week = Week(
+            season_id=season_id, week_number=number, is_real_money=True,
+            counts_toward_standings=True, counts_toward_awards=True,
+        )
         session.add(week)
         session.flush()
         return week.id

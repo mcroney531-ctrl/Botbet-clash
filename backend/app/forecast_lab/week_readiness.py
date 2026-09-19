@@ -245,9 +245,18 @@ class WeekReadiness:
                 "not a state anyone approved."
             )
         elif self.week_status == "PENDING":
+            # The verdict has to know whether a slate ALREADY exists. It
+            # used to say "a slate may be committed against it" and then,
+            # two lines later, name the committed plan -- two statements
+            # about the same week that cannot both be acted on.
             lines.append(
                 f"Week row {self.week_id} is PENDING {self.week_profile} — "
-                "prepared, not opened. A slate may be committed against it."
+                "prepared, not opened. "
+                + (
+                    "Its official slate is already committed."
+                    if self.plan_committed
+                    else "A slate may be committed against it."
+                )
             )
         elif self.week_status == "OPENED":
             lines.append(

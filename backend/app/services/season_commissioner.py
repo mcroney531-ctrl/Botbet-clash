@@ -48,6 +48,15 @@ from app.db.repositories.competitor_repository import CompetitorRepository
 from app.db.repositories.competition_repository import CompetitionRepository
 from app.db.repositories.event_repository import EventRepository
 from app.db.repositories.ledger_repository import LedgerRepository
+from app.db.repositories.season_repository import week_flags
+from app.domain.rehearsal import (
+    REHEARSAL_SETTLEMENT_ADVISORY,
+    REHEARSAL_TICKET_ADVISORY,
+    RehearsalBoundaryViolation,
+    execution_status_allowed,
+    may_move_money,
+)
+from app.domain.week_profile import WeekProfile, profile_of
 from app.db.repositories.market_repository import MarketRepository
 from app.db.repositories.season_repository import SeasonRepository
 from app.db.session import session_scope
@@ -235,7 +244,7 @@ class SeasonCommissioner:
                 self._publish(
                     session, week_id=week.id, season_competitor_id=None,
                     event_type=CompetitionEventType.WEEK_OPENED,
-                    payload={"week_number": week_number, "profile": str(profile)},
+                    payload={"week_number": week_number},
                 )
             return str(week.id)
 
@@ -298,6 +307,7 @@ class SeasonCommissioner:
             self._require_competitor_in_season(session, competitor_uuid)
             self._require_market_in_week(session, market_uuid, week)
             self._require_week_open(week)
+            profile = self._require_profile(week)
             self._lock_competitor_week(session, competitor_uuid, week_uuid)
 
             self._ensure_solvent(session, competitor_uuid, week_uuid)
@@ -361,18 +371,39 @@ class SeasonCommissioner:
             )
             comp_repo.add_ticket(ticket_row)
 
-            event_type = CompetitionEventType.POUNCE_ISSUED if urgency is Urgency.POUNCE else CompetitionEventType.TICKET_LOCKED
+            # A rehearsal ticket is issued through the SAME path with the
+            # SAME validation -- candidate selection, Kelly, caps, Pounce
+            # limit and weekly-decision uniqueness are what the rehearsal
+            # exists to exercise. What changes is how it is ANNOUNCED. A
+            # locked ticket reads, to anything downstream, as "place this
+            # bet", so a rehearsal one must not be byte-indistinguishable
+            # from a competitive one.
+            if profile is WeekProfile.REHEARSAL:
+                event_type = (
+                    CompetitionEventType.SIMULATED_POUNCE_ISSUED
+                    if urgency is Urgency.POUNCE
+                    else CompetitionEventType.SIMULATED_TICKET_LOCKED
+                )
+            else:
+                event_type = (
+                    CompetitionEventType.POUNCE_ISSUED
+                    if urgency is Urgency.POUNCE
+                    else CompetitionEventType.TICKET_LOCKED
+                )
+            payload = {
+                "ticket_id": str(ticket_row.id),
+                "market_id": market_id,
+                "final_allowed_stake_cents": final_allowed.cents,
+                "kelly_reference_stake_cents": kelly_stake.cents,
+            }
+            if profile is WeekProfile.REHEARSAL:
+                payload["advisory"] = REHEARSAL_TICKET_ADVISORY
             self._publish(
                 session,
                 week_id=week_uuid,
                 season_competitor_id=competitor_uuid,
                 event_type=event_type,
-                payload={
-                    "ticket_id": str(ticket_row.id),
-                    "market_id": market_id,
-                    "final_allowed_stake_cents": final_allowed.cents,
-                    "kelly_reference_stake_cents": kelly_stake.cents,
-                },
+                payload=payload,
             )
             return str(ticket_row.id)
 
@@ -465,9 +496,28 @@ class SeasonCommissioner:
             rules = season_rules_to_domain(SeasonRepository(session).get_active_rules(self.season_id))
             ledger_repo = LedgerRepository(session)
 
-            if status is WagerExecutionStatus.PLACED:
+            # WHICH OPERATION DID THE CALLER ASK FOR, and does this week
+            # permit it? A rehearsal may not PLACE and a competitive week
+            # may not SIMULATE, and neither is silently translated: a
+            # service that quietly turned PLACED into SIMULATED would leave
+            # a competitive week believing it had a real wager on.
+            ticket_week = SeasonRepository(session).get_week(ticket.week_id)
+            profile = self._require_profile(ticket_week)
+            if not execution_status_allowed(profile, status):
+                raise RehearsalBoundaryViolation(
+                    f"week {ticket.week_id} is {profile} and cannot record a "
+                    f"{status.value} execution. A rehearsal records SIMULATED; "
+                    "a competitive week records PLACED. Ask for the one you mean."
+                )
+
+            # EVERY validator below runs for BOTH. They were all inside
+            # `if status is PLACED`, so a simulated execution would have
+            # skipped the stake cap, the increment, the line boundary and
+            # the price boundary -- and a rehearsal that skips the checks
+            # proves nothing about the checks.
+            if status.executes:
                 self._lock_competitor_week(session, competitor_uuid, ticket.week_id)
-                week = SeasonRepository(session).get_week(ticket.week_id)
+                week = ticket_week
                 self._require_week_open(week)
                 self._ensure_solvent(session, competitor_uuid, ticket.week_id)
                 if ticket.valid_until is not None and self.clock.now() > ticket.valid_until:
@@ -477,7 +527,10 @@ class SeasonCommissioner:
                         f"competitor {competitor_uuid} already has an official decision for week {ticket.week_id}"
                     )
                 if actual_stake is None or actual_line is None or actual_price is None:
-                    raise ValueError("actual_stake, actual_line, and actual_price are all required when status is PLACED")
+                    raise ValueError(
+                        "actual_stake, actual_line, and actual_price are all "
+                        f"required when status is {status.value}"
+                    )
 
                 available_before = ledger_repo.available_balance(competitor_uuid)
                 final_allowed = Money(ticket.final_allowed_stake_cents)
@@ -517,12 +570,19 @@ class SeasonCommissioner:
                 actual_price=actual_price,
                 actual_stake_cents=(actual_stake.cents if actual_stake is not None else None),
                 execution_timestamp=self.clock.now(),
+                # Recorded for a SIMULATED execution too. The rehearsal DID
+                # consult this number -- it is what the stake cap was
+                # checked against a few lines up -- so leaving it NULL would
+                # lose the one figure an audit needs to reconstruct why the
+                # rehearsal accepted the stake it accepted.
+                bankroll_at_execution_cents=(
+                    available_before.cents if status.executes else None
+                ),
             )
             comp_repo.add_wager(wager_row)
 
-            if status is WagerExecutionStatus.PLACED:
+            if status.moves_money:
                 assert actual_stake is not None
-                wager_row.bankroll_at_execution_cents = available_before.cents
                 ledger_repo.record(
                     BankrollTransactionRow(
                         season_competitor_id=competitor_uuid,
@@ -540,7 +600,34 @@ class SeasonCommissioner:
                     week_id=ticket.week_id,
                     season_competitor_id=competitor_uuid,
                     event_type=CompetitionEventType.BET_EXECUTED,
-                    payload={"wager_id": str(wager_row.id), "actual_stake_cents": actual_stake.cents},
+                    payload={
+                        "wager_id": str(wager_row.id),
+                        "actual_stake_cents": actual_stake.cents,
+                        "execution_status": status.value,
+                    },
+                )
+            elif status is WagerExecutionStatus.SIMULATED:
+                # The ticket still resolves -- the lifecycle is what the
+                # rehearsal exists to exercise -- and no ledger row is
+                # written, so the official bankroll is byte-for-byte
+                # unchanged by everything above.
+                assert actual_stake is not None
+                ticket.status = "EXECUTED"
+                self._publish(
+                    session,
+                    week_id=ticket.week_id,
+                    season_competitor_id=competitor_uuid,
+                    # A DISTINCT type, not BET_EXECUTED with a mode field: a
+                    # consumer that has never heard of rehearsal ignores an
+                    # unknown type, but would act on a BET_EXECUTED whose
+                    # payload carried a field it does not read.
+                    event_type=CompetitionEventType.SIMULATED_BET_EXECUTED,
+                    payload={
+                        "wager_id": str(wager_row.id),
+                        "simulated_stake_cents": actual_stake.cents,
+                        "execution_status": status.value,
+                        "advisory": REHEARSAL_TICKET_ADVISORY,
+                    },
                 )
             elif status is WagerExecutionStatus.MISSED_WINDOW:
                 ticket.status = "EXPIRED"
@@ -569,8 +656,18 @@ class SeasonCommissioner:
             wager = comp_repo.get_wager(wager_uuid)
             self._require_competitor_in_season(session, wager.season_competitor_id)
 
-            if wager.execution_status != "PLACED":
-                raise InvalidStateTransition(f"wager {wager_id} was never PLACED; nothing to settle")
+            execution = WagerExecutionStatus(wager.execution_status)
+            if not execution.executes:
+                raise InvalidStateTransition(
+                    f"wager {wager_id} was never executed (status="
+                    f"{wager.execution_status}); nothing to settle"
+                )
+            # The week decides whether settling moves money, not the caller
+            # and not the wager row. One settlement computation; the side
+            # effects below are chosen from the frozen profile.
+            settle_week = SeasonRepository(session).get_week(wager.week_id)
+            profile = self._require_profile(settle_week)
+            credits_money = execution.moves_money and may_move_money(profile)
             # Defense in depth: the DB UNIQUE(wager_id) constraint on
             # settlements is the hard backstop; this check exists so the
             # failure is DuplicateSettlement, not a raw IntegrityError.
@@ -590,7 +687,7 @@ class SeasonCommissioner:
                 SportsbookResult.PUSH: "PUSH_RETURN",
                 SportsbookResult.VOID: "VOID_RETURN",
             }.get(result)
-            if credit_type is not None and payout.cents > 0:
+            if credit_type is not None and payout.cents > 0 and credits_money:
                 LedgerRepository(session).record(
                     BankrollTransactionRow(
                         season_competitor_id=wager.season_competitor_id,
@@ -602,6 +699,26 @@ class SeasonCommissioner:
                         created_at=self.clock.now(),
                     )
                 )
+
+            if not credits_money:
+                # The result is computed, validated and PERSISTED exactly as
+                # a real one -- that is the point of rehearsing settlement --
+                # and then nothing financial happens: no return credit, no
+                # BANKROLL_CHANGED, no bankruptcy check. A rehearsal must not
+                # be able to bust a competitor.
+                self._publish(
+                    session,
+                    week_id=wager.week_id,
+                    season_competitor_id=wager.season_competitor_id,
+                    event_type=CompetitionEventType.SIMULATED_SETTLED,
+                    payload={
+                        "wager_id": wager_id,
+                        "result": result.value,
+                        "simulated_payout_cents": payout.cents,
+                        "advisory": REHEARSAL_SETTLEMENT_ADVISORY,
+                    },
+                )
+                return str(settlement_row.id)
 
             outcome_event = {
                 SportsbookResult.WIN: CompetitionEventType.PROP_WON,
@@ -654,7 +771,45 @@ class SeasonCommissioner:
 
     # -- internals ---------------------------------------------------------
 
+    def _require_profile(self, week) -> WeekProfile:
+        """The week's reviewed profile, or a refusal. Never a guess.
+
+        `profile_of` returns None for a flag combination nobody approved --
+        "no real money but it still counts toward awards" is not a rehearsal
+        with a typo. Naming it after the nearest profile would decide, on
+        behalf of the season, whether real money may move. Refusing puts
+        that back in front of an operator.
+        """
+
+        profile = profile_of(week_flags(week))
+        if profile is None:
+            raise RehearsalBoundaryViolation(
+                f"week {week.id} matches no reviewed profile "
+                f"({week_flags(week).describe()}); refusing to guess whether "
+                "real money may move"
+            )
+        return profile
+
     def _publish(self, session, *, week_id, season_competitor_id, event_type: CompetitionEventType, payload: dict) -> None:
+        """Write one competition event, ALWAYS stamped with the week mode.
+
+        The stamp is injected here rather than at each call site on
+        purpose. A rehearsal event that is byte-identical to a competitive
+        one is the hazard this phase exists to remove, and "remember to add
+        week_mode" is exactly the kind of instruction a future event type
+        forgets. Centralizing it means a new event cannot be introduced
+        without the mode, because no call site sets it.
+
+        A week whose flags match no reviewed profile is stamped
+        NONSTANDARD, not left blank: an absent field reads as "competitive
+        by default" to any consumer, which is the wrong way to fail.
+        """
+
+        stamped = dict(payload)
+        if week_id is not None:
+            profile = profile_of(week_flags(SeasonRepository(session).get_week(week_id)))
+            stamped["week_mode"] = str(profile) if profile is not None else "NONSTANDARD"
+
         EventRepository(session).add(
             CompetitionEventRow(
                 timestamp=self.clock.now(),
@@ -662,7 +817,7 @@ class SeasonCommissioner:
                 week_id=week_id,
                 season_competitor_id=season_competitor_id,
                 event_type=event_type.value,
-                payload=payload,
+                payload=stamped,
             )
         )
 

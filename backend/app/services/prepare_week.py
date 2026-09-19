@@ -87,12 +87,28 @@ class WeekPreparation:
                 "  number.",
             ]
         else:
+            # Past tense once the write has happened. The header already
+            # said APPLIED while this line still said WOULD CREATE, which
+            # left an operator reading a report that contradicted itself
+            # about whether the row now exists.
             out += [
-                "  WOULD CREATE    status PENDING, opened_at NULL",
+                (
+                    f"  CREATED         {self.week_id}  status PENDING, opened_at NULL"
+                    if self.applied
+                    else "  WOULD CREATE    status PENDING, opened_at NULL"
+                ),
                 "",
-                "  This does NOT open the competition week. No WEEK_OPENED event,",
+                (
+                    "  This did NOT open the competition week. No WEEK_OPENED event,"
+                    if self.applied
+                    else "  This does NOT open the competition week. No WEEK_OPENED event,"
+                ),
                 "  no bankroll transaction, no competitor state, no provider call.",
-                "  It creates the row a precommitted benchmark slate points at.",
+                (
+                    "  It created the row a precommitted benchmark slate points at."
+                    if self.applied
+                    else "  It creates the row a precommitted benchmark slate points at."
+                ),
             ]
         out.append("=" * 74)
         return "\n".join(out)
