@@ -25,7 +25,6 @@ from app.db.models.forecast_lab import (
 from app.db.models.markets import Game
 from app.db.models.season import Season, SeasonRules, Week
 from app.db.session import session_scope
-from app.tests.integration.backstops import force_week
 from app.domain.week_profile import WeekProfile, flags_for
 from app.forecast_lab.benchmark_slate_service import (
     SlateBindingRefused,
@@ -1250,15 +1249,12 @@ def test_readiness_reports_a_half_rehearsal_week_as_nonstandard():
     it, still counting toward standings and awards. Not a rehearsal with a
     typo -- a combination nobody approved."""
 
-    # The database now refuses this combination outright (migration
-    # b7c249e0f3a1), so the row has to be planted with the constraint
-    # down. The REPORT still has to name it, because a database restored
-    # from before that revision can hold one.
     season_id = _season("nonstandard-week", week_number=None)
-    force_week(
-        season_id, 3, is_real_money=False, counts_toward_standings=True,
-        counts_toward_awards=True,
-    )
+    with session_scope() as session:
+        session.add(Week(
+            season_id=season_id, week_number=3, is_real_money=False,
+            counts_toward_standings=True, counts_toward_awards=True,
+        ))
 
     report = _readiness(season_id)
     assert report.week_profile == "NONSTANDARD"

@@ -87,20 +87,6 @@ class WagerExecutionStatus(StrEnum):
         return self is WagerExecutionStatus.PLACED
 
 
-# The statuses that constitute a TERMINAL weekly BET decision. DERIVED
-# from `.executes` rather than written out again: a second hand-maintained
-# list is how `has_placed_wager` came to mean "PLACED" while the code
-# around it had learned about SIMULATED. One source, one place to be wrong.
-#
-# MARKET_MOVED, UNAVAILABLE, MISSED_WINDOW and SKIPPED are deliberately
-# absent. Those wager rows record that the competitor TRIED and the market
-# did not cooperate; the week is not spent and a replacement decision is
-# still allowed. Only an execution is terminal.
-EXECUTED_STATUSES: frozenset[str] = frozenset(
-    status.value for status in WagerExecutionStatus if status.executes
-)
-
-
 class SportsbookResult(StrEnum):
     WIN = "WIN"
     LOSS = "LOSS"

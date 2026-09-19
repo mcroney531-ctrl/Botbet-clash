@@ -115,20 +115,7 @@ class Week(Base):
     research_locked_at: Mapped[datetime | None] = mapped_column(nullable=True)
     created_at: Mapped[datetime] = created_at_column()
 
-    __table_args__ = (
-        UniqueConstraint("season_id", "week_number", name="season_week_number"),
-        # Three free booleans is eight combinations, of which the governing
-        # documents describe exactly two. NONSTANDARD is unrepresentable
-        # here rather than merely refused by application code -- see
-        # migration b7c249e0f3a1, which also freezes these three columns
-        # against UPDATE.
-        CheckConstraint(
-            "(is_real_money AND counts_toward_standings AND counts_toward_awards)"
-            " OR (NOT is_real_money AND NOT counts_toward_standings"
-            " AND NOT counts_toward_awards)",
-            name="reviewed_profile",
-        ),
-    )
+    __table_args__ = (UniqueConstraint("season_id", "week_number", name="season_week_number"),)
 
 
 class Competitor(Base):
