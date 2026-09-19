@@ -18,6 +18,7 @@ The lettered tests below are the acceptance list from the phase brief.
 """
 
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -40,6 +41,7 @@ from app.domain.enums import (
     WagerExecutionStatus,
 )
 from app.domain.errors import (
+    DuplicateWeeklyDecision,
     DuplicateSettlement,
     InvalidStakeIncrement,
     InvalidStateTransition,
@@ -52,6 +54,7 @@ from app.domain.models import SeasonRules
 from app.domain.rehearsal import RehearsalBoundaryViolation
 from app.domain.week_profile import WeekProfile
 from app.services.season_commissioner import SeasonCommissioner
+from app.tests.integration.backstops import backstops_down, corrupt_profile, force_week
 
 # Anything Postgres raises out of a plpgsql RAISE EXCEPTION. SQLAlchemy
 # wraps `raise_exception` as ProgrammingError; the broader bases are listed
@@ -625,20 +628,21 @@ def test_the_ledger_guard_covers_every_type_the_balance_sums():
 def test_the_ledger_guard_refuses_a_week_that_matches_no_profile():
     """A half-rehearsal is not a rehearsal with a typo. The guard refuses
     rather than resolving it to the nearest profile, because resolving
-    would decide, on the season's behalf, that money may move."""
+    would decide, on the season's behalf, that money may move.
 
-    from app.db.models.season import Week as WeekRow
+    The database now makes such a week unrepresentable, so this has to
+    take the backstops down to build one. That is the point: the service
+    guard is what remains if the schema is ever wrong, and a layer nobody
+    tests without the layer above it is a layer nobody has tested.
+    """
 
     fix = Fixture()
-    with session_scope() as session:
-        week = WeekRow(
-            season_id=fix.season_id, week_number=9, status="OPENED",
-            is_real_money=False, counts_toward_standings=True,
-            counts_toward_awards=False,
-        )
-        session.add(week)
-        session.flush()
-        nonstandard = week.id
+    with backstops_down():
+        pass  # proves the constraint is installed; force_week arms it again
+    nonstandard = force_week(
+        fix.season_id, 9, is_real_money=False, counts_toward_standings=True,
+        counts_toward_awards=False, status='OPENED',
+    )
 
     with pytest.raises(RehearsalBoundaryViolation):
         with session_scope() as session:
@@ -980,78 +984,225 @@ def test_no_module_decides_standings_or_awards_without_reading_the_flags():
     assert audit.clean, "\n" + audit.render()
 
 
+
+
 # ======================================================================
-# The week can be RECLASSIFIED underneath a wager
+# The week profile is FROZEN -- enforced by the database
 # ======================================================================
 #
-# Every test above assumes the week's flags are what they were when the
-# wager was executed. Nothing in the services changes them -- but the
-# columns are ordinary booleans and an operator with psql can. These three
-# cover the gap, and they are the reason `settle_wager` asks the WEEK
-# whether money may move instead of trusting the wager row: a PLACED wager
-# is evidence of what was true at execution time, not of what is true now.
+# The previous pass built its guards around the idea that an operator can
+# flip these three booleans later, and had a test where a COMPETITIVE week
+# with a real $2 stake already debited was flipped to REHEARSAL, after
+# which settlement suppressed the payout. Nothing was credited, which is
+# safe, and the competitor was permanently down two dollars with the
+# settlement record calling it a rehearsal, which is not. That is
+# impossible state, not supported state, and the database now says so.
 
 
-def _reclassify(week_id: str, *, real_money: bool, standings: bool, awards: bool) -> None:
+@pytest.mark.parametrize(
+    "real_money, standings, awards",
+    [
+        pytest.param(False, False, False, id="competitive to rehearsal"),
+        pytest.param(True, True, False, id="one flag: awards"),
+        pytest.param(True, False, True, id="one flag: standings"),
+        pytest.param(False, True, True, id="one flag: money"),
+    ],
+)
+def test_a_competitive_week_profile_cannot_be_changed(real_money, standings, awards):
     from app.db.models.season import Week as WeekRow
 
+    fix = Fixture()
+    with pytest.raises(DB_REFUSAL) as excinfo:
+        with session_scope() as session:
+            week = session.get(WeekRow, uuid.UUID(fix.competitive_week))
+            week.is_real_money = real_money
+            week.counts_toward_standings = standings
+            week.counts_toward_awards = awards
+
+    assert "frozen at preparation" in str(excinfo.value)
+
+
+def test_a_rehearsal_week_cannot_be_promoted_to_competitive():
+    """The direction that matters most: a rehearsal whose whole point is
+    that nothing counts must not be able to become the week that counts,
+    retroactively, over artifacts already written against it."""
+
+    from app.db.models.season import Week as WeekRow
+
+    fix = Fixture()
+    with pytest.raises(DB_REFUSAL):
+        with session_scope() as session:
+            week = session.get(WeekRow, uuid.UUID(fix.rehearsal_week))
+            week.is_real_money = True
+            week.counts_toward_standings = True
+            week.counts_toward_awards = True
+
+
+def test_the_freeze_does_not_touch_the_rest_of_the_week_lifecycle():
+    """A blanket "weeks are immutable" would break opening and closing
+    them, so the trigger has to be exactly as narrow as the claim."""
+
+    from datetime import datetime as dt
+
+    from app.db.models.season import Week as WeekRow
+
+    fix = Fixture()
+    now = dt.now(timezone.utc)
     with session_scope() as session:
-        week = session.get(WeekRow, uuid.UUID(week_id))
-        week.is_real_money = real_money
-        week.counts_toward_standings = standings
-        week.counts_toward_awards = awards
+        week = session.get(WeekRow, uuid.UUID(fix.rehearsal_week))
+        week.status = "CLOSED"
+        week.closed_at = now
+        week.research_locked_at = now
+
+    with session_scope() as session:
+        week = session.get(WeekRow, uuid.UUID(fix.rehearsal_week))
+        assert week.status == "CLOSED"
+        assert week.closed_at is not None
+        assert week.research_locked_at is not None
+        assert week.is_real_money is False
 
 
-def test_settling_a_placed_wager_whose_week_became_a_rehearsal_credits_nothing():
+def test_opening_and_closing_a_week_through_the_service_still_works():
     fix = Fixture()
-    wager_id = fix.execute(fix.ticket(rehearsal=False), rehearsal=False)
-    assert fix.balance() == Money.from_dollars_str("13.00")
-
-    _reclassify(fix.competitive_week, real_money=False, standings=False, awards=False)
-
-    fix.commissioner.settle_wager(
-        wager_id=wager_id, result=SportsbookResult.WIN,
-        payout=Money.from_dollars_str("3.74"),
-    )
-
-    assert fix.transactions("WIN_RETURN") == [], (
-        "the wager row said PLACED, so the credit was taken on the wager's "
-        "word rather than the week's"
-    )
-    assert fix.balance() == Money.from_dollars_str("13.00")
-    assert "SIMULATED_SETTLED" in fix.event_types(rehearsal=False)
+    reopened = fix.commissioner.open_week(week_number=0, profile=WeekProfile.REHEARSAL)
+    assert reopened == fix.rehearsal_week  # idempotent, not refused
 
 
-def test_issuing_a_ticket_against_a_reclassified_nonstandard_week_is_refused():
-    """A week that is half rehearsal and half competitive is a state nobody
-    approved. The Commissioner refuses it rather than resolving it to the
-    nearest profile -- and note that the database triggers cannot help
-    here, because this week still has `is_real_money = true`."""
+@pytest.mark.parametrize(
+    "real_money, standings, awards",
+    [
+        pytest.param(False, True, True, id="no money but it still counts"),
+        pytest.param(True, False, False, id="real money that counts for nothing"),
+        pytest.param(True, True, False, id="counts for standings only"),
+        pytest.param(False, False, True, id="awards only"),
+    ],
+)
+def test_the_database_refuses_to_create_a_nonstandard_week(real_money, standings, awards):
+    """Three free booleans is eight combinations; the governing documents
+    describe two. The other six are now unrepresentable."""
+
+    from app.db.models.season import Week as WeekRow
 
     fix = Fixture()
-    _reclassify(fix.competitive_week, real_money=True, standings=True, awards=False)
+    with pytest.raises(IntegrityError) as excinfo:
+        with session_scope() as session:
+            session.add(WeekRow(
+                season_id=fix.season_id, week_number=7,
+                is_real_money=real_money, counts_toward_standings=standings,
+                counts_toward_awards=awards,
+            ))
 
-    with pytest.raises(RehearsalBoundaryViolation) as excinfo:
-        fix.ticket(rehearsal=False)
-
-    assert "no reviewed profile" in str(excinfo.value)
+    assert "ck_weeks_reviewed_profile" in str(excinfo.value)
 
 
-def test_executing_against_a_reclassified_nonstandard_week_is_refused():
+@pytest.mark.parametrize(
+    "real_money", [pytest.param(True, id="competitive"), pytest.param(False, id="rehearsal")],
+)
+def test_both_reviewed_profiles_are_still_creatable(real_money):
+    from app.db.models.season import Week as WeekRow
+
+    fix = Fixture()
+    with session_scope() as session:
+        session.add(WeekRow(
+            season_id=fix.season_id, week_number=8,
+            is_real_money=real_money, counts_toward_standings=real_money,
+            counts_toward_awards=real_money,
+        ))
+
+
+# ======================================================================
+# The wager backstop is symmetric
+# ======================================================================
+
+
+def test_the_database_refuses_a_simulated_wager_on_a_competitive_week():
+    """The other direction, which the first pass left open. The statuses
+    are deliberately symmetric, so the backstop has to be too -- a raw
+    writer could otherwise park a SIMULATED wager on the week that counts,
+    where it would read as a competitor who never executed."""
+
     fix = Fixture()
     ticket_id = fix.ticket(rehearsal=False)
-    _reclassify(fix.competitive_week, real_money=True, standings=False, awards=True)
 
-    with pytest.raises(RehearsalBoundaryViolation):
-        fix.execute(ticket_id, rehearsal=False)
+    with pytest.raises(DB_REFUSAL) as excinfo:
+        with session_scope() as session:
+            from app.db.models.competition import Ticket as TicketRow
 
-    assert fix.balance() == Money.from_dollars_str("15.00")
+            ticket = session.get(TicketRow, uuid.UUID(ticket_id))
+            session.add(WagerRow(
+                ticket_id=ticket.id, season_competitor_id=ticket.season_competitor_id,
+                week_id=ticket.week_id, market_id=ticket.market_id,
+                requested_stake_cents=200, execution_status="SIMULATED",
+            ))
+
+    assert "competitive week" in str(excinfo.value)
 
 
-def test_settling_against_a_reclassified_nonstandard_week_is_refused():
+def test_the_database_still_permits_the_non_execution_statuses_on_either_week():
+    """MARKET_MOVED and friends are not executions and belong to both
+    kinds of week. A backstop that refused them would break the ordinary
+    "the market moved before we could act" path."""
+
+    from app.db.models.competition import Ticket as TicketRow
+
+    for rehearsal in (True, False):
+        fix = Fixture()
+        ticket_id = fix.ticket(rehearsal=rehearsal)
+        with session_scope() as session:
+            ticket = session.get(TicketRow, uuid.UUID(ticket_id))
+            session.add(WagerRow(
+                ticket_id=ticket.id, season_competitor_id=ticket.season_competitor_id,
+                week_id=ticket.week_id, market_id=ticket.market_id,
+                requested_stake_cents=200, execution_status="MARKET_MOVED",
+            ))
+
+
+# ======================================================================
+# Settlement REFUSES corruption rather than reinterpreting it
+# ======================================================================
+
+
+def test_settling_a_placed_wager_whose_week_was_corrupted_to_rehearsal_refuses():
+    """This replaces a test that accepted the opposite behaviour.
+
+    It used to assert that such a settlement quietly became a simulated
+    one: no credit, no event of the real kind, and a real $2 stake left
+    debited forever. Suppressing the payout is safe about ADDING money and
+    wrong about everything else -- it rewrites what happened to match the
+    contradiction. Refusing leaves both the stake and the settlement
+    exactly as they were, for a human to repair deliberately.
+    """
+
     fix = Fixture()
     wager_id = fix.execute(fix.ticket(rehearsal=False), rehearsal=False)
-    _reclassify(fix.competitive_week, real_money=True, standings=False, awards=False)
+    assert fix.balance() == Money.from_dollars_str("13.00")
+
+    corrupt_profile(fix.competitive_week, is_real_money=False, counts_toward_standings=False, counts_toward_awards=False)
+
+    with pytest.raises(RehearsalBoundaryViolation) as excinfo:
+        fix.commissioner.settle_wager(
+            wager_id=wager_id, result=SportsbookResult.WIN,
+            payout=Money.from_dollars_str("3.74"),
+        )
+
+    assert "impossible state" in str(excinfo.value)
+    # Nothing settled, nothing credited, nothing announced.
+    from app.db.models.settlement import Settlement as SettlementRow
+
+    with session_scope() as session:
+        assert session.execute(
+            select(SettlementRow).where(SettlementRow.wager_id == uuid.UUID(wager_id))
+        ).scalars().all() == []
+    assert fix.transactions("WIN_RETURN") == []
+    assert fix.balance() == Money.from_dollars_str("13.00")
+    assert "SIMULATED_SETTLED" not in fix.event_types(rehearsal=False)
+
+
+def test_settling_a_simulated_wager_whose_week_was_corrupted_to_competitive_refuses():
+    fix = Fixture()
+    wager_id = _simulated_wager(fix)
+
+    corrupt_profile(fix.rehearsal_week, is_real_money=True, counts_toward_standings=True, counts_toward_awards=True)
 
     with pytest.raises(RehearsalBoundaryViolation):
         fix.commissioner.settle_wager(
@@ -1059,4 +1210,224 @@ def test_settling_against_a_reclassified_nonstandard_week_is_refused():
             payout=Money.from_dollars_str("3.74"),
         )
 
-    assert fix.balance() == Money.from_dollars_str("13.00")
+    assert fix.transactions("WIN_RETURN") == []
+    assert fix.balance() == Money.from_dollars_str("15.00")
+
+
+def test_the_commissioner_refuses_a_nonstandard_week_it_should_never_meet():
+    """Defense in depth for legacy or restored data. The schema makes this
+    unreachable now; the service is what is left if it ever is not."""
+
+    fix = Fixture()
+    corrupt_profile(fix.competitive_week, is_real_money=True, counts_toward_standings=True, counts_toward_awards=False)
+
+    with pytest.raises(RehearsalBoundaryViolation) as excinfo:
+        fix.ticket(rehearsal=False)
+    assert "no reviewed profile" in str(excinfo.value)
+
+
+def test_executing_against_a_nonstandard_week_is_refused():
+    fix = Fixture()
+    ticket_id = fix.ticket(rehearsal=False)
+    corrupt_profile(fix.competitive_week, is_real_money=True, counts_toward_standings=False, counts_toward_awards=True)
+
+    with pytest.raises(RehearsalBoundaryViolation):
+        fix.execute(ticket_id, rehearsal=False)
+
+    assert fix.balance() == Money.from_dollars_str("15.00")
+
+
+# ======================================================================
+# The weekly decision is TERMINAL -- in both weeks, by the same rule
+# ======================================================================
+#
+# `_has_weekly_decision` asked `has_placed_wager`, which matched
+# `execution_status == "PLACED"` and nothing else. A rehearsal's official
+# wager is SIMULATED, so after executing it the derived weekly-decision
+# state read as "nothing decided yet": a second ticket could be issued, a
+# second wager executed, and a PASS recorded after the bet. The rehearsal
+# would have exercised a DIFFERENT state machine from the one competition
+# uses -- which is the one thing a rehearsal must not do.
+#
+# The fix is NOT to make SIMULATED mean PLACED. The two stay distinct,
+# because only one of them means money left the bankroll. What is shared
+# is the concept above them: an EXECUTED wager.
+
+
+def test_a_simulated_execution_spends_the_weekly_bet_decision():
+    fix = Fixture()
+    fix.execute(fix.ticket(rehearsal=True), rehearsal=True)
+
+    with pytest.raises(DuplicateWeeklyDecision):
+        fix.ticket(rehearsal=True)
+
+
+def test_a_pass_cannot_follow_a_simulated_execution():
+    fix = Fixture()
+    fix.execute(fix.ticket(rehearsal=True), rehearsal=True)
+
+    with pytest.raises(DuplicateWeeklyDecision):
+        fix.commissioner.record_pass(
+            week_id=fix.rehearsal_week, season_competitor_id=fix.competitor,
+            reason_for_pass="after the simulated bet",
+        )
+
+
+def test_a_second_already_issued_ticket_cannot_also_execute_as_simulated():
+    """The narrower race: both tickets were issued BEFORE either executed,
+    so the issuance guard never saw a decision. The execution guard is
+    what has to catch this one."""
+
+    fix = Fixture()
+    first = fix.ticket(rehearsal=True)
+    second = fix.ticket(rehearsal=True)
+    fix.execute(first, rehearsal=True)
+
+    with pytest.raises(DuplicateWeeklyDecision):
+        fix.execute(second, rehearsal=True)
+
+    with session_scope() as session:
+        executed = session.execute(
+            select(WagerRow).where(
+                WagerRow.week_id == uuid.UUID(fix.rehearsal_week),
+                WagerRow.execution_status.in_(("PLACED", "SIMULATED")),
+            )
+        ).scalars().all()
+    assert len(executed) == 1
+
+
+def test_a_ticket_cannot_follow_a_rehearsal_pass():
+    fix = Fixture()
+    fix.commissioner.record_pass(
+        week_id=fix.rehearsal_week, season_competitor_id=fix.competitor,
+        reason_for_pass="no edge",
+    )
+
+    with pytest.raises(DuplicateWeeklyDecision):
+        fix.ticket(rehearsal=True)
+
+
+def test_competitive_terminal_decision_semantics_are_unchanged():
+    fix = Fixture()
+    fix.execute(fix.ticket(rehearsal=False), rehearsal=False)
+
+    with pytest.raises(DuplicateWeeklyDecision):
+        fix.ticket(rehearsal=False)
+    with pytest.raises(DuplicateWeeklyDecision):
+        fix.commissioner.record_pass(
+            week_id=fix.competitive_week, season_competitor_id=fix.competitor,
+            reason_for_pass="after the real bet",
+        )
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        WagerExecutionStatus.MARKET_MOVED,
+        WagerExecutionStatus.UNAVAILABLE,
+        WagerExecutionStatus.MISSED_WINDOW,
+        WagerExecutionStatus.SKIPPED,
+    ],
+)
+def test_a_non_execution_does_not_spend_the_week(status):
+    """A wager row exists, but the competitor never executed -- the market
+    moved, the book pulled the line, the window closed. The week is not
+    spent and a replacement decision is still allowed. Counting these as
+    terminal merely because a row exists would strand a competitor with no
+    decision for the week through no fault of its own."""
+
+    fix = Fixture()
+    fix.execute(
+        fix.ticket(rehearsal=True), rehearsal=True, status=status,
+        actual_stake=None, actual_line=None, actual_price=None,
+    )
+
+    replacement = fix.ticket(rehearsal=True)
+    assert fix.commissioner.get_ticket(replacement).status.value == "ISSUED"
+
+
+def test_the_terminal_decision_rule_reads_the_enum_rather_than_a_second_list():
+    """`EXECUTED_STATUSES` is DERIVED from `.executes`. A second
+    hand-maintained list is exactly how `has_placed_wager` came to mean
+    PLACED while the code around it had learned about SIMULATED."""
+
+    from app.domain.enums import EXECUTED_STATUSES, WagerExecutionStatus as W
+
+    assert EXECUTED_STATUSES == {"PLACED", "SIMULATED"}
+    assert EXECUTED_STATUSES == {s.value for s in W if s.executes}
+    assert not any(W(s).executes is False for s in EXECUTED_STATUSES)
+
+
+def test_the_full_rehearsal_bet_lifecycle():
+    """End to end, in order: the state machine competition will run, with
+    every financial effect removed and nothing else changed."""
+
+    fix = Fixture()
+    ticket_id = fix.ticket(rehearsal=True)
+    wager_id = fix.execute(ticket_id, rehearsal=True)
+
+    assert fix.commissioner.get_ticket(ticket_id).status.value == "EXECUTED"
+    with session_scope() as session:
+        assert len(session.execute(
+            select(WagerRow).where(WagerRow.week_id == uuid.UUID(fix.rehearsal_week))
+        ).scalars().all()) == 1
+
+    with pytest.raises(DuplicateWeeklyDecision):
+        fix.ticket(rehearsal=True)
+    with pytest.raises(DuplicateWeeklyDecision):
+        fix.commissioner.record_pass(
+            week_id=fix.rehearsal_week, season_competitor_id=fix.competitor,
+            reason_for_pass="x",
+        )
+
+    settlement_id = fix.commissioner.settle_wager(
+        wager_id=wager_id, result=SportsbookResult.WIN,
+        payout=Money.from_dollars_str("3.74"),
+    )
+    assert settlement_id
+    with pytest.raises(DuplicateSettlement):
+        fix.commissioner.settle_wager(
+            wager_id=wager_id, result=SportsbookResult.WIN,
+            payout=Money.from_dollars_str("3.74"),
+        )
+
+    assert fix.transactions() == fix.transactions("SEASON_START")
+    assert fix.balance() == Money.from_dollars_str("15.00")
+    assert fix.commissioner.competitor_status(fix.competitor) is CompetitorStatus.ACTIVE
+    assert fix.event_types(rehearsal=True) == {
+        "WEEK_OPENED", "SIMULATED_TICKET_LOCKED", "SIMULATED_BET_EXECUTED",
+        "SIMULATED_SETTLED",
+    }
+
+
+def test_the_full_competitive_bet_lifecycle_is_the_same_shape():
+    fix = Fixture()
+    ticket_id = fix.ticket(rehearsal=False)
+    wager_id = fix.execute(ticket_id, rehearsal=False)
+
+    assert fix.commissioner.get_ticket(ticket_id).status.value == "EXECUTED"
+    with pytest.raises(DuplicateWeeklyDecision):
+        fix.ticket(rehearsal=False)
+
+    fix.commissioner.settle_wager(
+        wager_id=wager_id, result=SportsbookResult.WIN,
+        payout=Money.from_dollars_str("3.74"),
+    )
+    assert fix.balance() == Money.from_dollars_str("16.74")
+    assert fix.event_types(rehearsal=False) == {
+        "WEEK_OPENED", "TICKET_LOCKED", "BET_EXECUTED", "PROP_WON",
+        "BANKROLL_CHANGED",
+    }
+
+
+def test_the_full_rehearsal_pass_lifecycle():
+    fix = Fixture()
+    fix.commissioner.record_pass(
+        week_id=fix.rehearsal_week, season_competitor_id=fix.competitor,
+        reason_for_pass="no edge anywhere on the slate",
+    )
+
+    with pytest.raises(DuplicateWeeklyDecision):
+        fix.ticket(rehearsal=True)
+    assert fix.balance() == Money.from_dollars_str("15.00")
+    assert fix.event_types(rehearsal=True) == {"WEEK_OPENED", "PASS_DECLARED"}

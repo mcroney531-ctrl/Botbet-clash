@@ -15,6 +15,8 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from alembic import command
+from alembic.config import Config
 from sqlalchemy import text
 
 from app.db import models  # noqa: F401 -- registers all mapped classes
@@ -35,8 +37,32 @@ def pytest_collection_modifyitems(items):
 
 @pytest.fixture(scope="session", autouse=True)
 def _create_schema():
+    """Build the test schema BY RUNNING THE MIGRATIONS, not create_all.
+
+    `Base.metadata.create_all` builds tables and constraints and nothing
+    else. Everything a migration installs imperatively -- the rehearsal
+    money triggers from a3f81c6b57e9, the week-profile freeze from
+    b7c249e0f3a1 -- is simply absent. Those triggers were installed by
+    hand while they were being written, which meant the database-backstop
+    tests passed on one machine and would have failed on a fresh checkout,
+    and the schema under test was not the schema in production.
+
+    Running the real chain costs a few seconds once per session and makes
+    the two identical, which is the only version of this worth trusting.
+    """
+
     engine = get_engine()
-    Base.metadata.create_all(engine)
+    root = Path(__file__).resolve().parents[3]
+    config = Config(str(root / "alembic.ini"))
+    config.set_main_option("script_location", str(root / "alembic"))
+
+    with engine.begin() as conn:
+        # From zero every session: a database left at an older revision by
+        # a previous checkout would otherwise be upgraded from whatever it
+        # happened to hold, which is not a state production ever has.
+        conn.execute(text("DROP SCHEMA public CASCADE"))
+        conn.execute(text("CREATE SCHEMA public"))
+    command.upgrade(config, "head")
     yield
 
 

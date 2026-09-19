@@ -20,6 +20,7 @@ from app.db.models.markets import Game
 from app.db.models.season import Season, SeasonRules, Week
 from app.db.session import session_scope
 from app.domain.week_profile import WEEK_PROFILES, WeekFlags, WeekProfile, profile_of
+from app.tests.integration.backstops import force_week
 from app.services.prepare_week import (
     WeekPreparationRefused,
     apply_preparation,
@@ -157,13 +158,14 @@ def test_idempotency_checks_all_three_flags_not_just_the_money():
     )
 
     season_id = _season("same-money-different-week")
-    with session_scope() as session:
-        # A half-rehearsal planted directly: no money, but it counts.
-        session.add(Week(
-            season_id=season_id, week_number=4, is_real_money=False,
-            counts_toward_standings=True, counts_toward_awards=True,
-            status="PENDING",
-        ))
+    # A half-rehearsal planted directly: no money, but it counts. The
+    # database refuses this now (b7c249e0f3a1), so it is planted with the
+    # constraint down -- the repository guard is what a database restored
+    # from before that revision would still be relying on.
+    force_week(
+        season_id, 4, is_real_money=False, counts_toward_standings=True,
+        counts_toward_awards=True,
+    )
 
     with pytest.raises(WeekConfigurationConflict, match="not adjusted in place"):
         with session_scope() as session:
@@ -179,12 +181,10 @@ def test_idempotency_checks_all_three_flags_not_just_the_money():
 
 def test_the_service_also_refuses_a_money_matching_profile_mismatch():
     season_id = _season("service-same-money")
-    with session_scope() as session:
-        session.add(Week(
-            season_id=season_id, week_number=4, is_real_money=False,
-            counts_toward_standings=True, counts_toward_awards=False,
-            status="PENDING",
-        ))
+    force_week(
+        season_id, 4, is_real_money=False, counts_toward_standings=True,
+        counts_toward_awards=False,
+    )
     with pytest.raises(WeekPreparationRefused, match="NONSTANDARD"):
         plan_preparation(
             season_id=season_id, week_number=4, profile=WeekProfile.REHEARSAL
