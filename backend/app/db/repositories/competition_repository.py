@@ -12,6 +12,7 @@ from app.db.models.competition import PassDecision as PassDecisionRow
 from app.db.models.competition import Ticket as TicketRow
 from app.db.models.competition import Wager as WagerRow
 from app.db.models.settlement import Settlement as SettlementRow
+from app.domain.enums import EXECUTED_STATUSES
 
 
 class CompetitionRepository:
@@ -63,11 +64,27 @@ class CompetitionRepository:
         stmt = select(WagerRow).where(WagerRow.ticket_id == ticket_id)
         return self.session.execute(stmt).scalar_one_or_none()
 
-    def has_placed_wager(self, season_competitor_id: uuid.UUID, week_id: uuid.UUID) -> bool:
+    def has_executed_wager(self, season_competitor_id: uuid.UUID, week_id: uuid.UUID) -> bool:
+        """Whether this competitor's weekly BET decision is already spent.
+
+        Renamed from `has_placed_wager`, which asked a narrower question
+        than its only caller needed. It matched `execution_status ==
+        "PLACED"` alone, so once a rehearsal executed its official wager as
+        SIMULATED the derived weekly-decision state read as "nothing
+        decided yet": a second ticket could be issued, a second wager
+        executed, and a PASS recorded after the bet. The rehearsal would
+        then have exercised a DIFFERENT state machine from the one
+        competition uses, which defeats the point of rehearsing.
+
+        SIMULATED is not folded into PLACED to fix this -- the two stay
+        distinct, because only one of them means money left the bankroll.
+        What is shared is the concept above them: an EXECUTED wager.
+        """
+
         stmt = select(WagerRow.id).where(
             WagerRow.season_competitor_id == season_competitor_id,
             WagerRow.week_id == week_id,
-            WagerRow.execution_status == "PLACED",
+            WagerRow.execution_status.in_(EXECUTED_STATUSES),
         )
         return self.session.execute(stmt).first() is not None
 

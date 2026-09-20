@@ -64,5 +64,30 @@ def may_move_money(profile: WeekProfile) -> bool:
     return profile is WeekProfile.COMPETITIVE
 
 
+def execution_coheres_with_profile(
+    profile: WeekProfile, status: WagerExecutionStatus
+) -> bool:
+    """Whether an executed wager and its week AGREE about what happened.
+
+    PLACED belongs to a COMPETITIVE week and SIMULATED to a REHEARSAL one,
+    and the pairing is a biconditional, not a permission.
+
+    The distinction matters at settlement. Asking only "may this week move
+    money?" and answering no for a PLACED wager REINTERPRETS the wager: a
+    real $2 stake that already left the bankroll settles as a simulation,
+    the payout is suppressed, and the money is permanently gone with no
+    record saying why. That is safe in the narrow sense that nothing is
+    credited, and wrong in every other sense -- it edits economic history
+    to match a contradiction instead of refusing the contradiction.
+
+    A PLACED wager on a rehearsal week is not a rehearsal. It is corrupt
+    state, and the only correct response is to stop.
+    """
+
+    if not status.executes:
+        return False
+    return status.moves_money is may_move_money(profile)
+
+
 def alters_official_bankroll(transaction_type: str) -> bool:
     return transaction_type in BANKROLL_ALTERING_TYPES

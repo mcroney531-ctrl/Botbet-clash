@@ -53,8 +53,8 @@ from app.domain.rehearsal import (
     REHEARSAL_SETTLEMENT_ADVISORY,
     REHEARSAL_TICKET_ADVISORY,
     RehearsalBoundaryViolation,
+    execution_coheres_with_profile,
     execution_status_allowed,
-    may_move_money,
 )
 from app.domain.week_profile import WeekProfile, profile_of
 from app.db.repositories.market_repository import MarketRepository
@@ -662,12 +662,29 @@ class SeasonCommissioner:
                     f"wager {wager_id} was never executed (status="
                     f"{wager.execution_status}); nothing to settle"
                 )
-            # The week decides whether settling moves money, not the caller
-            # and not the wager row. One settlement computation; the side
-            # effects below are chosen from the frozen profile.
+            # The wager and its week must AGREE about what happened. This
+            # used to compute `execution.moves_money and
+            # may_move_money(profile)`, which quietly resolved a
+            # contradiction in the safe direction: a PLACED wager whose
+            # week had been flipped to REHEARSAL settled as a simulation,
+            # suppressing the payout while the real stake stayed debited.
+            # Nothing was credited, and the competitor was permanently
+            # down the stake with the settlement record calling it a
+            # rehearsal. Refusing is the only response that does not edit
+            # economic history to match corrupt state.
             settle_week = SeasonRepository(session).get_week(wager.week_id)
             profile = self._require_profile(settle_week)
-            credits_money = execution.moves_money and may_move_money(profile)
+            if not execution_coheres_with_profile(profile, execution):
+                raise RehearsalBoundaryViolation(
+                    f"wager {wager_id} is {execution.value} but week "
+                    f"{wager.week_id} is {profile}. A {execution.value} wager "
+                    f"belongs to a "
+                    f"{'COMPETITIVE' if execution.moves_money else 'REHEARSAL'} "
+                    "week; this pairing is impossible state, not a rehearsal. "
+                    "Nothing settled, nothing credited. Repair the week or the "
+                    "wager explicitly."
+                )
+            credits_money = execution.moves_money
             # Defense in depth: the DB UNIQUE(wager_id) constraint on
             # settlements is the hard backstop; this check exists so the
             # failure is DuplicateSettlement, not a raw IntegrityError.
@@ -822,7 +839,14 @@ class SeasonCommissioner:
         )
 
     def _has_weekly_decision(self, comp_repo: CompetitionRepository, competitor_uuid: uuid.UUID, week_uuid: uuid.UUID) -> bool:
-        return comp_repo.has_pass_decision(competitor_uuid, week_uuid) or comp_repo.has_placed_wager(competitor_uuid, week_uuid)
+        # An EXECUTED wager, not a PLACED one. A rehearsal's official
+        # wager is SIMULATED, and while this asked for PLACED alone the
+        # rehearsal's weekly decision never became terminal -- so the
+        # rehearsal exercised a different state machine from the one
+        # competition uses, which is the one thing it must not do.
+        return comp_repo.has_pass_decision(competitor_uuid, week_uuid) or comp_repo.has_executed_wager(
+            competitor_uuid, week_uuid
+        )
 
     def _require_week_in_season(self, session, week_uuid: uuid.UUID) -> WeekRow:
         """Every consequential operation is scoped to `self.season_id` —
